@@ -58,6 +58,9 @@ LocalConfig.json
 Docs/*.md
 WebWallpaperDemo/
 # Temp
+
+# Linux 壁纸引擎 CLI（macOS 项目无用，死文件）
+linux-wallpaperengine-cli
 *.tmp
 .gstack/
 
