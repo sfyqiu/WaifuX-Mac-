@@ -484,6 +484,31 @@ private final class RendererBridge {
         CGImageDestinationAddImage(destination, cgImage, nil)
         return CGImageDestinationFinalize(destination)
     }
+
+    /// 获取动态文本 JSON（dlsym 弱引用，渲染器未实现时返回 nil）
+    func getDynamicTextsJson() -> String? {
+        rendererLock.lock()
+        guard let h = handle else {
+            rendererLock.unlock()
+            return nil
+        }
+        rendererLock.unlock()
+
+        typealias FuncType = @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+        let symName = "lw_renderer_get_dynamic_texts_json"
+        // RTLD_DEFAULT = -2（搜索所有已加载的 dylib）
+        guard let ptr = dlsym(UnsafeMutableRawPointer(bitPattern: -2), symName) else {
+            dlog("[RendererBridge] Symbol \(symName) not available in dylib (renderer may not support dynamic texts yet)")
+            return nil
+        }
+        let fn = unsafeBitCast(ptr, to: FuncType.self)
+        guard let cStr = fn(h) else {
+            dlog("[RendererBridge] getDynamicTextsJson returned NULL")
+            return nil
+        }
+        defer { lw_renderer_free_buffer(cStr) }
+        return String(cString: cStr)
+    }
 }
 
 // MARK: - Original Wallpaper Persistence Models
@@ -2468,6 +2493,20 @@ private func sceneBakePerform(_ cfg: SceneOfflineBakeConfig) throws {
             sceneBakeOnMain { RendererBridge.shared.destroy() }
             throw SceneOfflineBakeError.loadFailed
         }
+    }
+
+    // 尝试获取动态文本 JSON 并保存到输出目录旁（.web 生成时使用）
+    let textsJSON: String? = sceneBakeOnMain { RendererBridge.shared.getDynamicTextsJson() }
+    if let json = textsJSON {
+        let textsURL = cfg.outputURL.deletingLastPathComponent().appendingPathComponent(cfg.outputURL.deletingPathExtension().lastPathComponent + "_dynamic_texts.json")
+        do {
+            try json.write(to: textsURL, atomically: true, encoding: .utf8)
+            print("[Bake] Saved dynamic texts JSON to \(textsURL.path)")
+        } catch {
+            print("[Bake] Failed to save dynamic texts JSON: \(error)")
+        }
+    } else {
+        print("[Bake] Dynamic texts JSON not available (renderer may not support it)")
     }
 
     let frameCount = max(1, Int(Double(cfg.fps) * cfg.durationSeconds))

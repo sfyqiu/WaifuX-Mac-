@@ -63,6 +63,13 @@ struct MediaExploreContentView: View {
     @State private var workshopURLInput = ""
     @State private var isResolvingWorkshopURL = false
     @State private var workshopURLError: String?
+
+    // Dynamic Wallpaper (DongTai) 筛选
+    @State private var selectedDongTaiCategories: Set<DynamicWallpaperCategory> = []
+    @State private var selectedDongTaiListType: DynamicWallpaperListType = .all
+    @State private var selectedDongTaiSort: DynamicWallpaperSortOption = .popular
+    @State private var dongtaiFilterAudio: Bool? = nil
+    @State private var dongtaiFilterFourK: Bool? = nil
     private var workshopService: WorkshopService {
         WorkshopService.shared
     }
@@ -136,6 +143,7 @@ struct MediaExploreContentView: View {
         }
         .onChange(of: selectedHotTag) { _, _ in handleFilterChange() }
         .onChange(of: selectedWorkshopSort) { _, _ in handleWorkshopSortChange() }
+        .onChange(of: selectedDongTaiSort) { _, _ in handleDongTaiSortChange() }
         .onChange(of: searchText) { _, newValue in
             translationBridge.detectLanguage(for: newValue)
             handleFilterChange()
@@ -262,10 +270,16 @@ struct MediaExploreContentView: View {
         VStack(alignment: .leading, spacing: 16) {
             heroSection
             categorySection
-            if workshopSourceManager.activeSource == .wallpaperEngine {
+            switch workshopSourceManager.activeSource {
+            case .wallpaperEngine:
                 filterSection
                 workshopTagsSection
                 activeFiltersSection
+            case .dongtai:
+                dongtaiFilterSection
+                dongtaiActiveFiltersSection
+            default:
+                EmptyView()
             }
             contentHeader.padding(.top, 12)
         }
@@ -294,7 +308,7 @@ struct MediaExploreContentView: View {
         VStack(alignment: .leading, spacing: 18) {
             headerTitle
             searchRow
-            if workshopSourceManager.activeSource != .wallpaperEngine {
+            if workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai {
                 hotTagsRow
             }
         }
@@ -349,9 +363,9 @@ struct MediaExploreContentView: View {
                 tint: exploreAtmosphere.tint.primary,
                 onSubmit: { submitSearch() },
                 onClear: { searchText = ""; translationBridge.reset(); submitSearch(with: "") },
-                translatedText: workshopSourceManager.activeSource != .wallpaperEngine ? translationBridge.translatedText : nil,
-                isTranslating: workshopSourceManager.activeSource != .wallpaperEngine ? translationBridge.isTranslating : false,
-                onDismissTranslation: workshopSourceManager.activeSource != .wallpaperEngine ? {
+                translatedText: (workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai) ? translationBridge.translatedText : nil,
+                isTranslating: (workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai) ? translationBridge.isTranslating : false,
+                onDismissTranslation: (workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai) ? {
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
                         translationBridge.dismiss()
                     }
@@ -414,9 +428,12 @@ struct MediaExploreContentView: View {
 
     @ViewBuilder
     private var categorySection: some View {
-        if workshopSourceManager.activeSource == .wallpaperEngine {
+        switch workshopSourceManager.activeSource {
+        case .wallpaperEngine:
             workshopTypeSection
-        } else {
+        case .dongtai:
+            dongtaiCategorySection
+        default:
             FlowLayout(spacing: 12) {
                 ForEach(MediaCategory.allCases) { category in
                     CategoryChip(
@@ -662,6 +679,234 @@ struct MediaExploreContentView: View {
         Task { await applyWorkshopFilters() }
     }
 
+    // MARK: - DongTai 分类
+
+    private var dongtaiCategorySection: some View {
+        FlowLayout(spacing: 12) {
+            // 列表类型切换（隐藏普通视频选项）
+            ForEach(DynamicWallpaperListType.allCases.filter { $0 != .collection }) { listType in
+                CategoryChip(
+                    icon: listTypeIcon(listType),
+                    title: listType.displayName,
+                    accentColors: ["FF5E98", "FF9A5B"],
+                    isSelected: selectedDongTaiListType == listType
+                ) {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        selectedDongTaiListType = listType
+                        Task { await applyDongTaiFilters() }
+                    }
+                }
+            }
+            // 分类标签
+            ForEach(DynamicWallpaperCategory.allCases) { category in
+                CategoryChip(
+                    icon: category.icon,
+                    title: category.title,
+                    accentColors: category.accentColors,
+                    isSelected: selectedDongTaiCategories.contains(category)
+                ) {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        if selectedDongTaiCategories.contains(category) {
+                            selectedDongTaiCategories.remove(category)
+                        } else {
+                            selectedDongTaiCategories.insert(category)
+                        }
+                        Task { await applyDongTaiFilters() }
+                    }
+                }
+            }
+        }
+    }
+
+    private func listTypeIcon(_ type: DynamicWallpaperListType) -> String {
+        switch type {
+        case .all: return "square.grid.2x2"
+        case .collection: return "film.stack.fill"
+        case .exclusive: return "star.fill"
+        }
+    }
+
+    // MARK: - DongTai 筛选区
+
+    @ViewBuilder
+    private var dongtaiFilterSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(t("dongtai.filters"))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(arcSettings.secondaryText.opacity(0.46))
+            FlowLayout(spacing: 10) {
+                // 音频筛选
+                dongtaiAudioFilterChip
+                // 4K 筛选
+                dongtaiFourKFilterChip
+            }
+        }
+    }
+
+    private var dongtaiAudioFilterChip: some View {
+        FilterChip(
+            title: t("dongtai.filter.hasAudio"),
+            subtitle: "",
+            isSelected: dongtaiFilterAudio == true,
+            tint: LiquidGlassColors.onlineGreen
+        ) {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                if dongtaiFilterAudio == true {
+                    dongtaiFilterAudio = nil
+                } else {
+                    dongtaiFilterAudio = true
+                    dongtaiFilterFourK = nil // 互斥，便于 UI 清晰
+                }
+                Task { await applyDongTaiFilters() }
+            }
+        }
+    }
+
+    private var dongtaiFourKFilterChip: some View {
+        FilterChip(
+            title: t("dongtai.filter.fourK"),
+            subtitle: "",
+            isSelected: dongtaiFilterFourK == true,
+            tint: LiquidGlassColors.primaryPink
+        ) {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                if dongtaiFilterFourK == true {
+                    dongtaiFilterFourK = nil
+                } else {
+                    dongtaiFilterFourK = true
+                    dongtaiFilterAudio = nil // 互斥
+                }
+                Task { await applyDongTaiFilters() }
+            }
+        }
+    }
+
+    // MARK: - DongTai 活跃筛选标签
+
+    @ViewBuilder
+    private var dongtaiActiveFiltersSection: some View {
+        let chips = dongtaiActiveFilterChips
+        if !chips.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Text(t("currentFilters"))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(arcSettings.secondaryText.opacity(0.46))
+                    Button(t("clear")) {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                            selectedDongTaiCategories = []
+                            selectedDongTaiListType = .all
+                            dongtaiFilterAudio = nil
+                            dongtaiFilterFourK = nil
+                            Task { await applyDongTaiFilters() }
+                        }
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(arcSettings.secondaryText.opacity(0.72))
+                    .buttonStyle(.plain)
+                }
+                FlowLayout(spacing: 10) {
+                    ForEach(chips) { chip in
+                        WorkshopActiveFilterChip(
+                            title: chip.title,
+                            accentHex: chip.accentHex
+                        ) {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                removeDongTaiFilter(chip)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private struct DongTaiFilterChipData: Identifiable {
+        let id: String
+        let title: String
+        let accentHex: String
+        let kind: Kind
+        enum Kind { case category, listType, audio, fourK }
+    }
+
+    private var dongtaiActiveFilterChips: [DongTaiFilterChipData] {
+        var chips: [DongTaiFilterChipData] = []
+        if selectedDongTaiListType != .all {
+            chips.append(DongTaiFilterChipData(
+                id: "list_\(selectedDongTaiListType.id)",
+                title: selectedDongTaiListType.displayName,
+                accentHex: "FF5E98",
+                kind: .listType
+            ))
+        }
+        for cat in selectedDongTaiCategories {
+            chips.append(DongTaiFilterChipData(
+                id: "cat_\(cat.rawValue)",
+                title: cat.title,
+                accentHex: cat.accentColors.first ?? "FFFFFF",
+                kind: .category
+            ))
+        }
+        if dongtaiFilterAudio == true {
+            chips.append(DongTaiFilterChipData(
+                id: "audio",
+                title: t("dongtai.filter.hasAudio"),
+                accentHex: "43C463",
+                kind: .audio
+            ))
+        }
+        if dongtaiFilterFourK == true {
+            chips.append(DongTaiFilterChipData(
+                id: "fourk",
+                title: t("dongtai.filter.fourK"),
+                accentHex: "FF5A7D",
+                kind: .fourK
+            ))
+        }
+        return chips
+    }
+
+    private func removeDongTaiFilter(_ chip: DongTaiFilterChipData) {
+        switch chip.kind {
+        case .category:
+            let catId = chip.id.replacingOccurrences(of: "cat_", with: "")
+            selectedDongTaiCategories = selectedDongTaiCategories.filter { $0.rawValue != catId }
+        case .listType:
+            selectedDongTaiListType = .all
+        case .audio:
+            dongtaiFilterAudio = nil
+        case .fourK:
+            dongtaiFilterFourK = nil
+        }
+        Task { await applyDongTaiFilters() }
+    }
+
+    /// 应用 DongTai 筛选（组合全部活跃筛选条件）
+    private func applyDongTaiFilters(query: String? = nil) async {
+        // 先重置 isLoading 避免被 loadDongTaiFeedInternal 的 guard 阻塞
+        viewModel.isLoading = false
+        viewModel.clearItems()
+
+        let searchQuery = query ?? searchText
+        let dongtaiQuery = workshopSourceManager.activeSource == .dongtai ? searchQuery : ""
+
+        // 同步筛选状态到 ViewModel 并组合全部条件
+        await viewModel.loadDongTaiWithAllFilters(
+            query: dongtaiQuery,
+            categories: selectedDongTaiCategories,
+            listType: selectedDongTaiListType,
+            sortBy: selectedDongTaiSort,
+            hasAudio: dongtaiFilterAudio,
+            isFourK: dongtaiFilterFourK
+        )
+
+        // 强制刷新网格：DongTai 查询为同步操作，isLoading 变化太快，
+        // SwiftUI 的 .onChange(of: viewModel.isLoading) 无法捕捉到中间状态，
+        // 此处显式通知网格重新加载
+        syncAtmosphereIfNeeded()
+        bumpReloadToken()
+    }
+
     private var contentHeader: some View {
         HStack(alignment: .center) {
             Text("\(formattedCount(viewModel.items.count)) \(t("media.count")) · \(t("media.loaded")) \(formattedCount(viewModel.items.count))")
@@ -670,8 +915,13 @@ struct MediaExploreContentView: View {
 
             Spacer()
 
-            if workshopSourceManager.activeSource == .wallpaperEngine {
+            switch workshopSourceManager.activeSource {
+            case .wallpaperEngine:
                 SortMenu(options: WorkshopSortOption.allCases, selected: $selectedWorkshopSort, tint: exploreAtmosphere.tint.primary)
+            case .dongtai:
+                SortMenu(options: DynamicWallpaperSortOption.allCases, selected: $selectedDongTaiSort, tint: exploreAtmosphere.tint.primary)
+            default:
+                EmptyView()
             }
         }
     }
@@ -763,7 +1013,8 @@ struct MediaExploreContentView: View {
     }
 
     private func prefetchVisibleMediaDetails(indexPaths: Set<IndexPath>) {
-        guard workshopSourceManager.activeSource != .wallpaperEngine else { return }
+        guard workshopSourceManager.activeSource != .wallpaperEngine,
+              workshopSourceManager.activeSource != .dongtai else { return }
 
         let candidates = indexPaths
             .map(\.item)
@@ -783,10 +1034,25 @@ struct MediaExploreContentView: View {
 
     private func smartRetry() async {
         let query = viewModel.currentQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !query.isEmpty {
-            await viewModel.search(query: query)
-        } else {
-            await viewModel.loadHomeFeed()
+        switch workshopSourceManager.activeSource {
+        case .wallpaperEngine:
+            if !query.isEmpty {
+                await viewModel.searchWorkshop(query: query)
+            } else {
+                await viewModel.loadWorkshopFeed()
+            }
+        case .dongtai:
+            if !query.isEmpty {
+                await viewModel.searchDongTai(query: query)
+            } else {
+                await viewModel.loadDongTaiFeed()
+            }
+        default:
+            if !query.isEmpty {
+                await viewModel.search(query: query)
+            } else {
+                await viewModel.loadHomeFeed()
+            }
         }
     }
 
@@ -872,9 +1138,12 @@ struct MediaExploreContentView: View {
         loadMoreFailed = false
         viewModel.errorMessage = nil
 
-        if workshopSourceManager.activeSource == .wallpaperEngine {
+        switch workshopSourceManager.activeSource {
+        case .wallpaperEngine:
             await viewModel.loadWorkshopFeed()
-        } else {
+        case .dongtai:
+            await viewModel.loadDongTaiFeed()
+        default:
             await viewModel.loadHomeFeed()
         }
 
@@ -901,12 +1170,17 @@ struct MediaExploreContentView: View {
         viewModel.isLoading = false
         searchTask = Task { @MainActor in
             defer { searchTask = nil }
-            if workshopSourceManager.activeSource == .wallpaperEngine {
+            switch workshopSourceManager.activeSource {
+            case .wallpaperEngine:
                 await viewModel.loadWorkshopFeed()
-            } else if category == .all {
-                await viewModel.loadHomeFeed()
-            } else {
-                await viewModel.loadTagFeed(slug: category.slug, title: category.title)
+            case .dongtai:
+                await viewModel.loadDongTaiFeed()
+            default:
+                if category == .all {
+                    await viewModel.loadHomeFeed()
+                } else {
+                    await viewModel.loadTagFeed(slug: category.slug, title: category.title)
+                }
             }
         }
     }
@@ -915,7 +1189,8 @@ struct MediaExploreContentView: View {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // BG 源：中文翻译处理（仅在无外部 query 时触发）
-        if query == nil && workshopSourceManager.activeSource != .wallpaperEngine && !trimmed.isEmpty {
+        let isMotionBG = workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai
+        if query == nil && isMotionBG && !trimmed.isEmpty {
             let chineseDetected = translationBridge.isChinese(trimmed)
             let needsTranslation = chineseDetected
                 && !translationBridge.translationDismissed
@@ -954,16 +1229,20 @@ struct MediaExploreContentView: View {
                 syncAtmosphereIfNeeded()
                 bumpReloadToken()
             }
-            if workshopSourceManager.activeSource == .wallpaperEngine {
+            switch workshopSourceManager.activeSource {
+            case .wallpaperEngine:
                 await applyWorkshopFilters(query: query)
-            } else {
+            case .dongtai:
+                await viewModel.searchDongTai(query: query)
+            default:
                 await viewModel.search(query: query)
             }
         }
     }
 
     private func handleTranslationCompleted() {
-        guard workshopSourceManager.activeSource != .wallpaperEngine else { return }
+        guard workshopSourceManager.activeSource != .wallpaperEngine,
+              workshopSourceManager.activeSource != .dongtai else { return }
         guard let pending = pendingSearchText else { return }
         pendingSearchText = nil
         let query = translationBridge.effectiveQuery(for: pending)
@@ -974,8 +1253,8 @@ struct MediaExploreContentView: View {
     private func handleFilterChange() {
         guard !isApplyingProgrammaticReset else { return }
 
-        // Workshop 模式下不支持标签过滤
-        if workshopSourceManager.activeSource == .wallpaperEngine {
+        // Workshop/DongTai 模式下不支持标签过滤
+        if workshopSourceManager.activeSource == .wallpaperEngine || workshopSourceManager.activeSource == .dongtai {
             syncAtmosphereIfNeeded()
             return
         }
@@ -1018,6 +1297,23 @@ struct MediaExploreContentView: View {
         }
     }
 
+    private func handleDongTaiSortChange() {
+        guard !isApplyingProgrammaticReset else { return }
+
+        guard workshopSourceManager.activeSource == .dongtai else { return }
+        searchTask?.cancel()
+        viewModel.isLoading = false
+        searchTask = Task { @MainActor in
+            defer {
+                searchTask = nil
+                // 强制刷新网格（DongTai 查询为同步操作）
+                syncAtmosphereIfNeeded()
+                bumpReloadToken()
+            }
+            await viewModel.setDongTaiSort(sortBy: selectedDongTaiSort)
+        }
+    }
+
     private func handleSourceChange() {
         // 数据源切换时重置并重新加载
         resetAllFilters(reloadData: true)
@@ -1034,9 +1330,12 @@ struct MediaExploreContentView: View {
         Task {
             do {
                 let isWE = WorkshopService.extractWorkshopID(from: url) != nil
+                let isDongTai = DynamicWallpaperService.shared.canHandleOSSURL(url)
                 let item: MediaItem
                 if isWE {
                     item = try await viewModel.resolveWorkshopItemByURL(url)
+                } else if isDongTai {
+                    item = try await viewModel.resolveDongTaiItemByURL(url)
                 } else {
                     item = try await viewModel.resolveMotionBGItemByURL(url)
                 }
@@ -1065,9 +1364,12 @@ struct MediaExploreContentView: View {
         loadMoreFailed = false
         loadMoreTask?.cancel()
         loadMoreTask = Task {
-            if workshopSourceManager.activeSource == .wallpaperEngine {
+            switch workshopSourceManager.activeSource {
+            case .wallpaperEngine:
                 await viewModel.loadMoreWorkshop()
-            } else {
+            case .dongtai:
+                await viewModel.loadMoreDongTai()
+            default:
                 await viewModel.loadMore()
             }
             await MainActor.run {
@@ -1100,6 +1402,11 @@ struct MediaExploreContentView: View {
         selectedWorkshopContentLevel = .everyone
         selectedWorkshopResolution = nil
         selectedWorkshopSort = .trendWeek
+        selectedDongTaiCategories = []
+        selectedDongTaiListType = .all
+        selectedDongTaiSort = .popular
+        dongtaiFilterAudio = nil
+        dongtaiFilterFourK = nil
         selectedCategory = .all
         selectedSort = .newest
         lastSyncedFirstItemID = nil
@@ -1131,9 +1438,12 @@ struct MediaExploreContentView: View {
                 searchTask = nil
             }
 
-            if workshopSourceManager.activeSource == .wallpaperEngine {
+            switch workshopSourceManager.activeSource {
+            case .wallpaperEngine:
                 await viewModel.resetAndLoadDefaultWorkshopFeed()
-            } else {
+            case .dongtai:
+                await viewModel.resetAndLoadDefaultDongTaiFeed()
+            default:
                 await viewModel.resetAndLoadDefaultHomeFeed()
             }
 

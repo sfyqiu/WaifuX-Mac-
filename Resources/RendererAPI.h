@@ -30,6 +30,11 @@ LW_API void lw_renderer_free_buffer(void* buffer);
 LW_API void lw_renderer_set_screen(void* renderer, int screenIndex);
 LW_API void lw_renderer_destroy(void* renderer);
 
+/// 获取所有动态文本对象的当前状态 JSON 字符串。
+/// 返回值需调用 lw_renderer_free_buffer() 释放。
+/// 若渲染器未实现此功能，返回 NULL。
+LW_API char* lw_renderer_get_dynamic_texts_json(void* renderer);
+
 #ifdef __cplusplus
 }
 #endif

@@ -10,6 +10,22 @@ import shutil
 from pathlib import Path
 
 BREW_PREFIX = "/opt/homebrew"
+BREW_CELLAR_PLACEHOLDER = "@@HOMEBREW_CELLAR@@"
+BREW_PREFIX_PLACEHOLDER = "@@HOMEBREW_PREFIX@@"
+
+
+def _has_brew_placeholder(path: str) -> bool:
+    """判断路径是否包含未替换的 Homebrew CMake 占位符"""
+    return BREW_CELLAR_PLACEHOLDER in path or BREW_PREFIX_PLACEHOLDER in path
+
+
+def resolve_brew_placeholder(path: str) -> str:
+    """将 @@HOMEBREW_CELLAR@@ / @@HOMEBREW_PREFIX@@ 占位符解析为实际路径"""
+    if BREW_CELLAR_PLACEHOLDER in path:
+        return path.replace(BREW_CELLAR_PLACEHOLDER, f"{BREW_PREFIX}/Cellar")
+    if BREW_PREFIX_PLACEHOLDER in path:
+        return path.replace(BREW_PREFIX_PLACEHOLDER, BREW_PREFIX)
+    return path
 
 
 def get_dependencies(dylib_path: str) -> list:
@@ -31,8 +47,8 @@ def get_dependencies(dylib_path: str) -> list:
         # 排除自身
         if path == dylib_path:
             continue
-        # 只处理 brew 相关的库
-        if BREW_PREFIX in path or path.startswith("@rpath/") or path.startswith("@loader_path"):
+        # 只处理 brew 相关的库（包括未替换的 CMake 占位符路径）
+        if BREW_PREFIX in path or path.startswith("@rpath/") or path.startswith("@loader_path/") or _has_brew_placeholder(path):
             deps.append(path)
     return deps
 
@@ -87,7 +103,10 @@ def collect_all_dependencies(start_dylib: str, collected: set = None) -> set:
     collected.add(real_path)
 
     for dep in get_dependencies(real_path):
-        if dep.startswith("@rpath/") or dep.startswith("@loader_path"):
+        # 将占位符路径解析为真实路径，用于查找和复制文件
+        dep_real = resolve_brew_placeholder(dep) if _has_brew_placeholder(dep) else dep
+
+        if dep.startswith("@rpath/") or dep.startswith("@loader_path/"):
             # 相对路径，尝试在同级目录查找
             base_dir = os.path.dirname(real_path)
             lib_name = dep.split("/")[-1]
@@ -96,8 +115,8 @@ def collect_all_dependencies(start_dylib: str, collected: set = None) -> set:
                 collect_all_dependencies(candidate, collected)
             continue
 
-        if dep.startswith(BREW_PREFIX):
-            real_dep = resolve_symlink(dep)
+        if dep_real.startswith(BREW_PREFIX):
+            real_dep = resolve_symlink(dep_real)
             if os.path.exists(real_dep):
                 collect_all_dependencies(real_dep, collected)
 
@@ -183,12 +202,15 @@ def process_dylib(source_path: str, dest_dir: str, processed: set = None):
     # 修改依赖路径
     deps = get_dependencies(real_source)
     for dep in deps:
-        if dep.startswith("@rpath/") or dep.startswith("@loader_path"):
+        if dep.startswith("@rpath/") or dep.startswith("@loader_path/"):
             # 已经是相对路径，跳过
             continue
 
         dep_basename = os.path.basename(dep)
         new_dep = f"@loader_path/{dep_basename}"
+
+        # 解析占位符路径为真实 Homebrew 路径（用于文件操作）
+        dep_real = resolve_brew_placeholder(dep) if _has_brew_placeholder(dep) else dep
 
         # 在目标目录中查找依赖
         dep_in_dest = os.path.join(dest_dir, dep_basename)
@@ -196,8 +218,8 @@ def process_dylib(source_path: str, dest_dir: str, processed: set = None):
             print(f"    Change: {dep} -> {new_dep}")
             change_install_name(dest_path, dep, new_dep)
         else:
-            # 尝试解析并复制依赖
-            real_dep = resolve_symlink(dep)
+            # 尝试解析并复制依赖（使用真实路径）
+            real_dep = resolve_symlink(dep_real)
             if os.path.exists(real_dep):
                 process_dylib(real_dep, dest_dir, processed)
                 # 如果复制后 dep_basename 仍然不存在（因为实际文件名不同），

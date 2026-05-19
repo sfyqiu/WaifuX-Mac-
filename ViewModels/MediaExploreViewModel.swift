@@ -30,6 +30,7 @@ final class MediaExploreViewModel: ObservableObject {
     private let localScanner = LocalWallpaperScanner.shared
     private let workshopService = WorkshopService.shared
     private let workshopSourceManager = WorkshopSourceManager.shared
+    private let dynamicWallpaperService = DynamicWallpaperService.shared
 
     private var currentSource: MediaRouteSource = .home
     private var nextPagePath: String?
@@ -61,6 +62,18 @@ final class MediaExploreViewModel: ObservableObject {
     private(set) var workshopSortBy: WorkshopSearchParams.SortOption = .ranked
     /// Workshop 热门趋势时间范围（仅对 trend 排序有效），nil = 全部时间
     private(set) var workshopDays: Int? = nil
+
+    // MARK: - Dynamic Wallpaper (DongTai) 分页状态
+    private var dongtaiCurrentPage = 1
+    private var dongtaiHasMore = true
+    private var dongtaiSearchQuery = ""
+    private var dongtaiCurrentCategories: Set<DynamicWallpaperCategory> = []
+    private var dongtaiCurrentListType: DynamicWallpaperListType = .all
+    private var dongtaiSortBy: DynamicWallpaperSortOption = .popular
+    private var dongtaiFilterAudio: Bool? = nil
+    private var dongtaiFilterFourK: Bool? = nil
+    /// 加载世代计数器，用于丢弃旧请求的结果
+    private var dongtaiLoadGeneration: UInt = 0
 
     /// 与 WallpaperViewModel.libraryContentRevision 相同用途：保证列表上的收藏/下载状态随库更新而刷新。
     @Published private(set) var libraryContentRevision: UInt = 0
@@ -113,9 +126,12 @@ final class MediaExploreViewModel: ObservableObject {
                     self?.networkRecoveryTask?.cancel()
                     self?.networkRecoveryTask = Task { [weak self] in
                         guard let self else { return }
-                        if self.workshopSourceManager.activeSource == .wallpaperEngine {
+                        switch self.workshopSourceManager.activeSource {
+                        case .wallpaperEngine:
                             await self.loadWorkshopFeed()
-                        } else {
+                        case .dongtai:
+                            await self.loadDongTaiFeed()
+                        default:
                             await self.loadHomeFeed()
                         }
                     }
@@ -132,18 +148,29 @@ final class MediaExploreViewModel: ObservableObject {
                 self.sourceSwitchTask?.cancel()
                 self.cancelDetailPrefetchQueue()
                 self.items.removeAll()
-                if source == .wallpaperEngine {
+                switch source {
+                case .wallpaperEngine:
                     // 切换到 Workshop 数据源
                     self.sourceSwitchTask = Task { [weak self] in
                         guard let self else { return }
                         await self.loadWorkshopFeed()
                         await self.refreshHomeItems()
                     }
-                } else {
+                case .dongtai:
+                    // 切换到 Dynamic Wallpaper 数据源
+                    self.sourceSwitchTask = Task { [weak self] in
+                        guard let self else { return }
+                        await self.loadDongTaiFeed()
+                        await self.refreshHomeItems()
+                    }
+                default:
                     // 切换回 MotionBG 数据源，重置状态
                     self.workshopCurrentPage = 1
                     self.workshopHasMore = true
                     self.workshopSearchQuery = ""
+                    self.dongtaiCurrentPage = 1
+                    self.dongtaiHasMore = true
+                    self.dongtaiSearchQuery = ""
                     self.sourceSwitchTask = Task { [weak self] in
                         guard let self else { return }
                         await self.loadHomeFeed()
@@ -255,9 +282,12 @@ final class MediaExploreViewModel: ObservableObject {
             print("[MediaExploreViewModel] items not empty, skipping initial load")
             return
         }
-        if workshopSourceManager.activeSource == .wallpaperEngine {
+        switch workshopSourceManager.activeSource {
+        case .wallpaperEngine:
             await loadWorkshopFeed()
-        } else {
+        case .dongtai:
+            await loadDongTaiFeed()
+        default:
             await load(source: .home)
         }
     }
@@ -426,7 +456,8 @@ final class MediaExploreViewModel: ObservableObject {
         for items: [MediaItem],
         prioritizeVisible: Bool
     ) {
-        guard workshopSourceManager.activeSource != .wallpaperEngine else { return }
+        guard workshopSourceManager.activeSource != .wallpaperEngine,
+              workshopSourceManager.activeSource != .dongtai else { return }
 
         let candidates = items.filter(shouldPrefetchDetail(for:))
 
@@ -540,7 +571,8 @@ final class MediaExploreViewModel: ObservableObject {
         print("[MediaExploreViewModel] refreshHomeItems called")
         let source = workshopSourceManager.activeSource
         do {
-            if source == .wallpaperEngine {
+            switch source {
+            case .wallpaperEngine:
                 let wallpaperType: WorkshopWallpaper.WallpaperType? = (workshopCurrentType == .all) ? nil : {
                     switch workshopCurrentType {
                     case .scene: return .scene
@@ -561,7 +593,17 @@ final class MediaExploreViewModel: ObservableObject {
                 )
                 let response = try await workshopService.search(params: params)
                 homeItems = workshopService.convertToMediaItems(response.items)
-            } else {
+            case .dongtai:
+                let params = DynamicWallpaperSearchParams(
+                    query: "",
+                    listType: .all,
+                    sortBy: .popular,
+                    page: 1,
+                    pageSize: 10
+                )
+                let result = dynamicWallpaperService.queryItems(params: params)
+                homeItems = result.items
+            default:
                 let page = try await mediaService.fetchPage(source: .home)
                 page.items.forEach { mediaLibrary.upsert($0) }
                 homeItems = Array(page.items.prefix(10))
@@ -1250,6 +1292,8 @@ final class MediaExploreViewModel: ObservableObject {
         hasMorePages = true
         workshopHasMore = true
         workshopCurrentPage = 1
+        dongtaiHasMore = true
+        dongtaiCurrentPage = 1
     }
 
     // MARK: - Workshop 数据加载
@@ -1461,6 +1505,249 @@ final class MediaExploreViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Dynamic Wallpaper (DongTai) 数据加载
+
+    /// 检查当前是否使用 DongTai 数据源
+    var isUsingDongTai: Bool {
+        workshopSourceManager.activeSource == .dongtai
+    }
+
+    /// 加载 DongTai 首页/搜索内容
+    func loadDongTaiFeed() async {
+        await loadDongTaiFeedInternal(
+            query: dongtaiSearchQuery,
+            categories: dongtaiCurrentCategories,
+            listType: dongtaiCurrentListType,
+            sortBy: dongtaiSortBy,
+            hasAudio: dongtaiFilterAudio,
+            isFourK: dongtaiFilterFourK
+        )
+    }
+
+    /// 重置 DongTai 浏览状态并强制加载默认列表
+    @MainActor
+    func resetAndLoadDefaultDongTaiFeed() async {
+        dongtaiSearchQuery = ""
+        currentQuery = ""
+        dongtaiCurrentCategories = []
+        dongtaiCurrentListType = .all
+        dongtaiSortBy = .popular
+        dongtaiFilterAudio = nil
+        dongtaiFilterFourK = nil
+        dongtaiCurrentPage = 1
+        dongtaiHasMore = true
+        hasMorePages = true
+        isLoading = false
+        isLoadingMore = false
+        errorMessage = nil
+
+        // 确保数据已加载
+        if !dynamicWallpaperService.isDataReady {
+            _ = await dynamicWallpaperService.loadData()
+        }
+
+        await loadDongTaiFeedInternal(
+            query: "",
+            categories: [],
+            listType: .all,
+            sortBy: .popular,
+            hasAudio: nil,
+            isFourK: nil
+        )
+    }
+
+    /// DongTai 搜索
+    func searchDongTai(query: String) async {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        dongtaiSearchQuery = trimmedQuery
+        currentQuery = trimmedQuery
+        dongtaiCurrentCategories = []
+        dongtaiCurrentListType = .all
+
+        await loadDongTaiFeedInternal(
+            query: trimmedQuery,
+            categories: [],
+            listType: .all,
+            sortBy: dongtaiSortBy,
+            hasAudio: dongtaiFilterAudio,
+            isFourK: dongtaiFilterFourK
+        )
+    }
+
+    /// 按分类筛选 DongTai 内容
+    func loadDongTaiWithCategories(_ categories: Set<DynamicWallpaperCategory>) async {
+        dongtaiCurrentCategories = categories
+        await loadDongTaiFeedInternal(
+            query: dongtaiSearchQuery,
+            categories: categories,
+            listType: dongtaiCurrentListType,
+            sortBy: dongtaiSortBy,
+            hasAudio: dongtaiFilterAudio,
+            isFourK: dongtaiFilterFourK
+        )
+    }
+
+    /// 按列表类型筛选
+    func loadDongTaiWithListType(_ listType: DynamicWallpaperListType) async {
+        dongtaiCurrentListType = listType
+        await loadDongTaiFeedInternal(
+            query: dongtaiSearchQuery,
+            categories: dongtaiCurrentCategories,
+            listType: listType,
+            sortBy: dongtaiSortBy,
+            hasAudio: dongtaiFilterAudio,
+            isFourK: dongtaiFilterFourK
+        )
+    }
+
+    /// 设置 DongTai 排序方式
+    func setDongTaiSort(sortBy: DynamicWallpaperSortOption) async {
+        dongtaiSortBy = sortBy
+        await loadDongTaiFeedInternal(
+            query: dongtaiSearchQuery,
+            categories: dongtaiCurrentCategories,
+            listType: dongtaiCurrentListType,
+            sortBy: sortBy,
+            hasAudio: dongtaiFilterAudio,
+            isFourK: dongtaiFilterFourK
+        )
+    }
+
+    /// 以全部筛选条件加载 DongTai 数据（UI 层统一入口）
+    func loadDongTaiWithAllFilters(
+        query: String,
+        categories: Set<DynamicWallpaperCategory>,
+        listType: DynamicWallpaperListType,
+        sortBy: DynamicWallpaperSortOption,
+        hasAudio: Bool?,
+        isFourK: Bool?
+    ) async {
+        dongtaiSearchQuery = query
+        currentQuery = query
+        dongtaiCurrentCategories = categories
+        dongtaiCurrentListType = listType
+        dongtaiSortBy = sortBy
+        dongtaiFilterAudio = hasAudio
+        dongtaiFilterFourK = isFourK
+
+        await loadDongTaiFeedInternal(
+            query: query,
+            categories: categories,
+            listType: listType,
+            sortBy: sortBy,
+            hasAudio: hasAudio,
+            isFourK: isFourK
+        )
+    }
+
+    /// 设置 DongTai 筛选（音频/4K）
+    func setDongTaiFilters(hasAudio: Bool? = nil, isFourK: Bool? = nil) async {
+        dongtaiFilterAudio = hasAudio
+        dongtaiFilterFourK = isFourK
+        await loadDongTaiFeedInternal(
+            query: dongtaiSearchQuery,
+            categories: dongtaiCurrentCategories,
+            listType: dongtaiCurrentListType,
+            sortBy: dongtaiSortBy,
+            hasAudio: hasAudio,
+            isFourK: isFourK
+        )
+    }
+
+    /// 内部方法：加载 DongTai 数据
+    private func loadDongTaiFeedInternal(
+        query: String,
+        categories: Set<DynamicWallpaperCategory>,
+        listType: DynamicWallpaperListType = .all,
+        sortBy: DynamicWallpaperSortOption = .popular,
+        hasAudio: Bool? = nil,
+        isFourK: Bool? = nil
+    ) async {
+        guard !isLoading else { return }
+
+        // 确保数据已加载
+        if !dynamicWallpaperService.isDataReady {
+            let loaded = await dynamicWallpaperService.loadData()
+            guard loaded else {
+                errorMessage = dynamicWallpaperService.errorMessage ?? "动态桌面数据加载失败"
+                return
+            }
+        }
+
+        let generation = dongtaiLoadGeneration &+ 1
+        dongtaiLoadGeneration = generation
+
+        isLoading = true
+        errorMessage = nil
+        items = []
+
+        defer {
+            // 只有当前世代（未被更新的请求覆盖）才清除加载状态
+            if dongtaiLoadGeneration == generation {
+                isLoading = false
+            }
+        }
+
+        // 重置分页状态
+        dongtaiCurrentPage = 1
+        dongtaiHasMore = true
+
+        let params = DynamicWallpaperSearchParams(
+            query: query,
+            listType: listType,
+            categories: categories,
+            sortBy: sortBy,
+            page: 1,
+            pageSize: 20,
+            hasAudio: hasAudio,
+            isFourK: isFourK
+        )
+
+        let result = dynamicWallpaperService.queryItems(params: params)
+
+        // 丢弃旧世代的结果（被取消/过期的请求）
+        guard dongtaiLoadGeneration == generation else { return }
+
+        items = result.items
+        dongtaiHasMore = result.hasMore
+        hasMorePages = result.hasMore
+        currentTitle = query.isEmpty ? t("dongtai") : "搜索: \(query)"
+        print("[MediaExploreViewModel] loadDongTaiFeedInternal completed: \(items.count) items, total=\(result.totalCount)")
+    }
+
+    /// DongTai 加载更多
+    func loadMoreDongTai() async {
+        guard !isLoading, !isLoadingMore, dongtaiHasMore else { return }
+
+        isLoadingMore = true
+        errorMessage = nil
+
+        defer { isLoadingMore = false }
+
+        dongtaiCurrentPage += 1
+
+        let params = DynamicWallpaperSearchParams(
+            query: dongtaiSearchQuery,
+            listType: dongtaiCurrentListType,
+            categories: dongtaiCurrentCategories,
+            sortBy: dongtaiSortBy,
+            page: dongtaiCurrentPage,
+            pageSize: 20,
+            hasAudio: dongtaiFilterAudio,
+            isFourK: dongtaiFilterFourK
+        )
+
+        let result = dynamicWallpaperService.queryItems(params: params)
+
+        let existingIDs = Set(items.map(\.id))
+        let newItems = result.items.filter { !existingIDs.contains($0.id) }
+        items.append(contentsOf: newItems)
+
+        dongtaiHasMore = result.hasMore
+        hasMorePages = result.hasMore
+        print("[MediaExploreViewModel] loadMoreDongTai completed: +\(newItems.count) items, total: \(items.count)")
+    }
+
     // MARK: - 按作者获取 Workshop 物品
 
     /// 获取指定作者的所有 Workshop 壁纸
@@ -1562,6 +1849,13 @@ final class MediaExploreViewModel: ObservableObject {
         }
         let item = try await mediaService.fetchDetail(slug: slug)
         print("[MediaExploreViewModel] resolveMotionBGItemByURL success: \(item.id) - \(item.title)")
+        return item
+    }
+
+    /// 解析动态桌面（DongTai）OSS 视频链接并返回 MediaItem
+    func resolveDongTaiItemByURL(_ urlString: String) async throws -> MediaItem {
+        let item = try await dynamicWallpaperService.resolveItemByOSSURL(urlString)
+        print("[MediaExploreViewModel] resolveDongTaiItemByURL success: \(item.id) - \(item.title)")
         return item
     }
 }

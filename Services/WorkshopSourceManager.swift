@@ -15,11 +15,13 @@ class WorkshopSourceManager: ObservableObject {
     enum SourceType: String, CaseIterable {
         case motionBG = "motionbg"
         case wallpaperEngine = "wallpaper_engine"
+        case dongtai = "dongtai"
 
         var displayName: String {
             switch self {
             case .motionBG: return "MotionBG"
             case .wallpaperEngine: return t("wallpaperEngine")
+            case .dongtai: return t("dongtai")
             }
         }
 
@@ -27,6 +29,7 @@ class WorkshopSourceManager: ObservableObject {
             switch self {
             case .motionBG: return "在线视频壁纸"
             case .wallpaperEngine: return "Steam Workshop"
+            case .dongtai: return "动态桌面视频壁纸"
             }
         }
 
@@ -35,6 +38,7 @@ class WorkshopSourceManager: ObservableObject {
             switch self {
             case .motionBG: return "play.rectangle.fill"
             case .wallpaperEngine: return "gearshape.fill"
+            case .dongtai: return "sparkles.tv.fill"
             }
         }
 
@@ -43,6 +47,7 @@ class WorkshopSourceManager: ObservableObject {
             switch self {
             case .motionBG: return true
             case .wallpaperEngine: return true
+            case .dongtai: return true
             }
         }
 
@@ -51,6 +56,7 @@ class WorkshopSourceManager: ObservableObject {
             switch self {
             case .motionBG: return true
             case .wallpaperEngine: return true
+            case .dongtai: return true
             }
         }
 
@@ -59,6 +65,7 @@ class WorkshopSourceManager: ObservableObject {
             switch self {
             case .motionBG: return false
             case .wallpaperEngine: return false
+            case .dongtai: return false
             }
         }
 
@@ -67,6 +74,7 @@ class WorkshopSourceManager: ObservableObject {
             switch self {
             case .motionBG: return false
             case .wallpaperEngine: return true
+            case .dongtai: return false
             }
         }
 
@@ -75,6 +83,7 @@ class WorkshopSourceManager: ObservableObject {
             switch self {
             case .motionBG: return "cyan"
             case .wallpaperEngine: return "blue"
+            case .dongtai: return "pink"
             }
         }
     }

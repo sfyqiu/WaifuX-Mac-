@@ -436,15 +436,34 @@ enum SceneOfflineBakeService {
             designHeight = sceneHeight
         }
 
-        // 4. 构建 __SCENE_BAKE_CONFIG__ 配置
-        let config: [String: Any] = [
+        // 4. 尝试加载动态文本 JSON（由 CLI bake 过程中保存的渲染器解析结果）
+        let dynamicTexts: [[String: Any]]? = {
+            let videoBase = (videoPath as NSString).deletingPathExtension
+            let jsonPath = videoBase + "_dynamic_texts.json"
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: jsonPath)),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let texts = json["texts"] as? [[String: Any]] else {
+                return nil
+            }
+            print("[WebOverlay] Loaded \(texts.count) dynamic texts from renderer")
+            return texts
+        }()
+
+        // 5. 构建 __SCENE_BAKE_CONFIG__ 配置
+        var config: [String: Any] = [
             "sceneWidth": designWidth,
             "sceneHeight": designHeight,
             "videoSrc": "baked.mp4",
             "elements": elements
         ]
 
-        // 4. 复制模板并注入配置
+        // 如果有渲染器解析的动态文本 JSON，注入到 config.texts（模板优先使用）
+        if let texts = dynamicTexts {
+            config["texts"] = texts
+            config["dynamicTextsSource"] = "renderer"
+        }
+
+        // 6. 复制模板并注入配置
         guard let templateURL = resolveWebTemplateURL() else {
             print("[WebOverlay] Template not found")
             cleanUp()
@@ -477,7 +496,7 @@ enum SceneOfflineBakeService {
             return
         }
 
-        // 5. 创建 project.json（CLI Web 渲染器需要）
+        // 7. 创建 project.json（CLI Web 渲染器需要）
         let projectJSON: [String: Any] = [
             "type": "web",
             "file": "index.html"
@@ -487,7 +506,7 @@ enum SceneOfflineBakeService {
             try? projectData.write(to: projectURL)
         }
 
-        // 6. 复制烘焙视频到 .web 目录
+        // 8. 复制烘焙视频到 .web 目录
         let videoURL = URL(fileURLWithPath: videoPath)
         let destVideoURL = webDir.appendingPathComponent("baked.mp4")
         do {
@@ -496,8 +515,18 @@ enum SceneOfflineBakeService {
             print("[WebOverlay] Failed to copy video: \(error)")
         }
 
-        // 7. 复制引用的字体文件
-        copyReferencedFonts(elements: elements, from: contentRoot, to: webDir)
+        // 9. 复制引用的字体文件
+        let allElementsForFonts: [[String: Any]] = {
+            if let texts = dynamicTexts {
+                // 合并 elements 与 dynamic texts 的字体引用
+                let textFontEntries = texts.map { t -> [String: Any] in
+                    ["font": t["fontFamily"] as? String ?? ""]
+                }
+                return elements + textFontEntries
+            }
+            return elements
+        }()
+        copyReferencedFonts(elements: allElementsForFonts, from: contentRoot, to: webDir)
 
         print("[WebOverlay] Generated overlay at \(webDirPath) with \(elements.count) elements")
     }

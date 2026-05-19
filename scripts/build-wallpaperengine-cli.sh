@@ -105,6 +105,38 @@ if [[ -f "$ROOT/scripts/bundle-dylibs.py" ]]; then
       echo "[build-wallpaperengine-cli] Copied Python framework"
     fi
   fi
+
+  # 🔧 安全网：修复 bundle-dylibs.py 可能遗漏的 @@HOMEBREW_ 占位符
+  # 某些 Homebrew 构建的 dylib 中 CMake 变量（@@HOMEBREW_CELLAR@@ / @@HOMEBREW_PREFIX@@）
+  # 可能未被正确替换，导致 dyld 找不到依赖。这里将它们全部转成 @loader_path/ 相对路径。
+  echo "[build-wallpaperengine-cli] Fixing any remaining Homebrew placeholders..."
+  FIXED_COUNT=0
+  for f in "$ROOT"/Resources/lib/*.dylib; do
+    [[ -L "$f" ]] && continue
+    while IFS= read -r line; do
+      dep_path=$(echo "$line" | awk '{print $1}')
+      if [[ "$dep_path" == *"@@HOMEBREW_CELLAR@@"* ]] || [[ "$dep_path" == *"@@HOMEBREW_PREFIX@@"* ]]; then
+        dep_base=$(basename "$dep_path")
+        new_dep="@loader_path/$dep_base"
+        echo "    Fix: $(basename "$f") — $dep_path -> $new_dep"
+        install_name_tool -change "$dep_path" "$new_dep" "$f" 2>/dev/null || true
+        FIXED_COUNT=$((FIXED_COUNT + 1))
+      fi
+    done < <(otool -L "$f" 2>/dev/null | tail -n +2)
+  done
+
+  if [[ "$FIXED_COUNT" -gt 0 ]]; then
+    echo "[build-wallpaperengine-cli] Fixed $FIXED_COUNT placeholder reference(s), re-signing..."
+    # 重新签名所有受影响的 dylib
+    for f in "$ROOT"/Resources/lib/*.dylib; do
+      [[ -L "$f" ]] && continue
+      codesign --force -s - "$f" 2>/dev/null || true
+    done
+    # 重新签名 CLI 二进制（根目录 + Resources 内两份）
+    codesign --force -s - "$OUT_CLI" 2>/dev/null || true
+    cp "$OUT_CLI" "$ROOT/wallpaperengine-cli"
+    codesign --force -s - "$ROOT/wallpaperengine-cli" 2>/dev/null || true
+  fi
 fi
 
 echo "[build-wallpaperengine-cli] OK → $OUT_CLI"
