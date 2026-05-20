@@ -438,7 +438,7 @@ final class StatusBarController: NSObject {
             // 先尝试恢复上次保存的壁纸，没有则打开主窗口让用户选择
             videoWallpaperManager.restoreIfNeeded()
             if !videoWallpaperManager.isVideoWallpaperActive {
-                weBridge.restoreIfNeeded()
+                Task { await weBridge.restoreIfNeeded() }
                 if !weBridge.isControllingExternalEngine {
                     showWindowHandler?()
                 }

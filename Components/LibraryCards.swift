@@ -109,9 +109,8 @@ extension MediaItem {
             if Self.libraryLocalRasterExtensions.contains(ext) {
                 return resolved
             }
-            // Workshop Scene 项目（含 .pkg）：尝试使用烘焙产物的 MP4 抽帧缓存
-            if Self.localWorkshopProjectType(from: local) == "scene",
-               let record = MediaLibraryService.shared.downloadRecords.first(where: { $0.item.id == id }),
+            // Workshop 项目（Scene/Web）已烘焙产物：尝试使用烘焙产物的 MP4 抽帧缓存
+            if let record = MediaLibraryService.shared.downloadRecords.first(where: { $0.item.id == id }),
                let bakedPath = record.sceneBakeArtifact?.videoPath,
                FileManager.default.fileExists(atPath: bakedPath) {
                 let bakedURL = URL(fileURLWithPath: bakedPath)
@@ -298,6 +297,11 @@ public struct MediaVideoCard: View {
         }
         .onAppear { triggerThumbnailIfNeeded() }
         .onChange(of: localMediaFileURL) { _, _ in resolvedThumbnailURL = nil; triggerThumbnailIfNeeded() }
+        .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeThumbnailDidUpdate)) { notification in
+            guard let updatedItemID = notification.object as? String,
+                  updatedItemID == item.id else { return }
+            triggerThumbnailIfNeeded()
+        }
     }
 
     /// 已下载的视频如果没有缓存抽帧，异步生成并刷新封面

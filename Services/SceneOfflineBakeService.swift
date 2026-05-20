@@ -24,6 +24,8 @@ enum SceneOfflineBakeError: LocalizedError {
 extension Notification.Name {
     /// Scene 离线烘焙完成（成功或失败）。`object` 为 `SceneBakeArtifact?`，失败时为 `nil`。
     static let sceneOfflineBakeDidComplete = Notification.Name("sceneOfflineBakeDidComplete")
+    /// 烘焙视频抽帧封面已生成。`object` 为 `String`（itemID），`userInfo["thumbnailURL"]` 为 `URL`。
+    static let sceneOfflineBakeThumbnailDidUpdate = Notification.Name("sceneOfflineBakeThumbnailDidUpdate")
 }
 
 /// 全局只允许一个 `wallpaperengine-cli bake` 子进程，避免重叠渲染导致内存成倍上涨。

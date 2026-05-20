@@ -2434,7 +2434,7 @@ struct MediaDetailSheet: View {
                 isSettingWallpaper = true
                 Task { @MainActor in
                     do {
-                        try WallpaperEngineXBridge.shared.setWallpaper(
+                        try await WallpaperEngineXBridge.shared.setWallpaper(
                             path: path,
                             posterURL: posterURL,
                             targetScreens: selectedScreen.map { [$0] }
@@ -2451,7 +2451,7 @@ struct MediaDetailSheet: View {
             isSettingWallpaper = true
             Task { @MainActor in
                 do {
-                    try WallpaperEngineXBridge.shared.setWallpaper(
+                    try await WallpaperEngineXBridge.shared.setWallpaper(
                         path: path,
                         posterURL: posterURL,
                         targetScreens: nil

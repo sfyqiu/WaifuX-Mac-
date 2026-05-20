@@ -76,7 +76,7 @@ targets:
       - package: Kanna
       - package: Kingfisher
     postBuildScripts:
-        basedOnDependencyAnalysis: false
+      - basedOnDependencyAnalysis: false
         script: |
           FRAMEWORKS_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Frameworks"
           if [ -d "$FRAMEWORKS_DIR" ]; then
@@ -108,6 +108,29 @@ targets:
                 fi
                 find "$framework" -name ".DS_Store" -delete 2>/dev/null || true
               fi
+            done
+          fi
+      - basedOnDependencyAnalysis: false
+        script: |
+          # 修复 Resources/Resources/lib/ 中 dylib 的 @@HOMEBREW_ 占位符路径
+          WE_LIB_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib"
+          if [[ -d "$WE_LIB_DIR" ]]; then
+            for f in "$WE_LIB_DIR"/*.dylib; do
+              [[ -L "$f" ]] && continue
+              [[ ! -f "$f" ]] && continue
+              while IFS= read -r line; do
+                dep_path=$(echo "$line" | awk '{print $1}')
+                if [[ "$dep_path" == *"@@HOMEBREW_CELLAR@@"* ]] || [[ "$dep_path" == *"@@HOMEBREW_PREFIX@@"* ]]; then
+                  dep_base=$(basename "$dep_path")
+                  echo "fix-dylib: $(basename "$f") — ${dep_path} -> @loader_path/${dep_base}"
+                  install_name_tool -change "$dep_path" "@loader_path/$dep_base" "$f" 2>/dev/null || true
+                fi
+              done < <(otool -L "$f" 2>/dev/null | tail -n +2)
+            done
+            for f in "$WE_LIB_DIR"/*.dylib; do
+              [[ -L "$f" ]] && continue
+              [[ ! -f "$f" ]] && continue
+              codesign --force -s - "$f" 2>/dev/null || true
             done
           fi
     entitlements:

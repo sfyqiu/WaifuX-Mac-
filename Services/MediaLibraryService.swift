@@ -172,7 +172,7 @@ final class MediaLibraryService: ObservableObject {
         }
         downloadRecords[index].sceneBakeEligibility = snapshot
         persistDownloads()
-        downloadRecords = downloadRecords
+        downloadRecords = Array(downloadRecords)
 
         if triggerAutoBake, snapshot.isEligibleForOfflineBake {
             SceneOfflineBakeService.scheduleAutoBakeAfterEligibility(itemID: itemID)
@@ -185,13 +185,20 @@ final class MediaLibraryService: ObservableObject {
         }
         downloadRecords[index].sceneBakeArtifact = artifact
         persistDownloads()
-        downloadRecords = downloadRecords
+        downloadRecords = Array(downloadRecords)
 
         // 确保烘焙视频有抽帧封面
         let bakedVideoURL = URL(fileURLWithPath: artifact.videoPath)
         if FileManager.default.fileExists(atPath: artifact.videoPath) {
             Task { @MainActor in
-                _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: bakedVideoURL)
+                if let posterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: bakedVideoURL) {
+                    // 抽帧生成后通知 UI 刷新封面
+                    NotificationCenter.default.post(
+                        name: .sceneOfflineBakeThumbnailDidUpdate,
+                        object: itemID,
+                        userInfo: ["thumbnailURL": posterURL]
+                    )
+                }
             }
         }
     }
@@ -200,7 +207,7 @@ final class MediaLibraryService: ObservableObject {
         if let favoriteIndex = favoriteRecords.firstIndex(where: { $0.item.id == item.id }) {
             favoriteRecords[favoriteIndex].item = item
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
 
         if let recentIndex = recentItems.firstIndex(where: { $0.id == item.id }) {
@@ -211,7 +218,7 @@ final class MediaLibraryService: ObservableObject {
         if let downloadIndex = downloadRecords.firstIndex(where: { $0.item.id == item.id }) {
             downloadRecords[downloadIndex].item = item
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
     }
 
@@ -224,7 +231,7 @@ final class MediaLibraryService: ObservableObject {
         if let index = downloadRecords.firstIndex(where: { $0.item.id == itemID }) {
             downloadRecords[index].localFilePath = newURL.path
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
             print("[MediaLibraryService] Updated download path for \(itemID) to \(newURL.path)")
         }
     }
@@ -284,11 +291,11 @@ final class MediaLibraryService: ObservableObject {
         }
         if changed {
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
         if favoritesChanged {
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
         if changed || favoritesChanged {
             print("[MediaLibraryService] Bulk updated paths from \(oldPrefix) to \(newPrefix)")
@@ -314,7 +321,7 @@ final class MediaLibraryService: ObservableObject {
             }
         }
         persistFavorites()
-        favoriteRecords = favoriteRecords
+        favoriteRecords = Array(favoriteRecords)
     }
 
     /// 删除单个下载记录（含物理文件）
@@ -326,7 +333,7 @@ final class MediaLibraryService: ObservableObject {
             // 标记软删除
             downloadRecords[index].metadata.markLocalMutation(deleted: true)
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
             // 删除物理文件
             deletePhysicalFile(at: filePath)
             // 删除对应的烘焙产物
@@ -345,7 +352,7 @@ final class MediaLibraryService: ObservableObject {
             }
         }
         persistDownloads()
-        downloadRecords = downloadRecords
+        downloadRecords = Array(downloadRecords)
         // 删除所有对应的物理文件及烘焙产物
         for record in recordsToDelete {
             deletePhysicalFile(at: record.localFilePath)
@@ -446,13 +453,13 @@ final class MediaLibraryService: ObservableObject {
         if let index = favoriteRecords.firstIndex(where: { $0.item.id == mediaID }) {
             favoriteRecords[index].folderID = folderID
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
         // 更新下载记录
         if let index = downloadRecords.firstIndex(where: { $0.item.id == mediaID }) {
             downloadRecords[index].folderID = folderID
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
     }
 
@@ -469,11 +476,11 @@ final class MediaLibraryService: ObservableObject {
         }
         if favoritesChanged {
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
         if downloadsChanged {
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
     }
 
@@ -494,7 +501,7 @@ final class MediaLibraryService: ObservableObject {
 
         if cleanedCount > 0 {
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
             print("[MediaLibraryService] Cleaned up \(cleanedCount) invalid download records")
         }
 
@@ -745,13 +752,13 @@ final class WallpaperLibraryService: ObservableObject {
         if let favoriteIndex = favoriteRecords.firstIndex(where: { $0.wallpaper.id == wallpaper.id }) {
             favoriteRecords[favoriteIndex].wallpaper = wallpaper
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
 
         if let downloadIndex = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaper.id }) {
             downloadRecords[downloadIndex].wallpaper = wallpaper
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
     }
 
@@ -775,11 +782,11 @@ final class WallpaperLibraryService: ObservableObject {
         // 批量持久化
         if favoritesChanged {
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
         if downloadsChanged {
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
     }
 
@@ -792,7 +799,7 @@ final class WallpaperLibraryService: ObservableObject {
         if let index = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
             downloadRecords[index].localFilePath = newURL.path
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
             print("[WallpaperLibraryService] Updated download path for \(wallpaperID) to \(newURL.path)")
         }
     }
@@ -826,11 +833,11 @@ final class WallpaperLibraryService: ObservableObject {
         }
         if changed {
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
         if favoritesChanged {
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
         if changed || favoritesChanged {
             print("[WallpaperLibraryService] Bulk updated paths from \(oldPrefix) to \(newPrefix)")
@@ -886,7 +893,7 @@ final class WallpaperLibraryService: ObservableObject {
             }
         }
         persistFavorites()
-        favoriteRecords = favoriteRecords
+        favoriteRecords = Array(favoriteRecords)
     }
 
     /// 批量删除壁纸下载记录（含物理文件）
@@ -900,7 +907,7 @@ final class WallpaperLibraryService: ObservableObject {
             }
         }
         persistDownloads()
-        downloadRecords = downloadRecords
+        downloadRecords = Array(downloadRecords)
         // 删除所有对应的物理文件
         for path in filesToDelete {
             wallpaperDeletePhysicalFile(at: path)
@@ -963,7 +970,7 @@ final class WallpaperLibraryService: ObservableObject {
 
         if cleanedCount > 0 {
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
             print("[WallpaperLibraryService] Cleaned up \(cleanedCount) invalid download records")
         }
 
@@ -989,13 +996,13 @@ final class WallpaperLibraryService: ObservableObject {
         if let index = favoriteRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
             favoriteRecords[index].folderID = folderID
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
         // 更新下载记录
         if let index = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
             downloadRecords[index].folderID = folderID
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
     }
 
@@ -1012,11 +1019,11 @@ final class WallpaperLibraryService: ObservableObject {
         }
         if favoritesChanged {
             persistFavorites()
-            favoriteRecords = favoriteRecords
+            favoriteRecords = Array(favoriteRecords)
         }
         if downloadsChanged {
             persistDownloads()
-            downloadRecords = downloadRecords
+            downloadRecords = Array(downloadRecords)
         }
     }
 

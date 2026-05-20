@@ -571,7 +571,7 @@ class WallpaperSchedulerService: ObservableObject {
                FileManager.default.fileExists(atPath: webDirPath) {
                 print("\(logTag) Using baked .web dir: \(webDirPath)")
                 do {
-                    try WallpaperEngineXBridge.shared.setWallpaper(
+                    try await WallpaperEngineXBridge.shared.setWallpaper(
                         path: webDirPath,
                         targetScreens: [screen]
                     )
@@ -634,7 +634,7 @@ class WallpaperSchedulerService: ObservableObject {
                             )
                             print("\(logTag) Generated preset HTML slideshow: \(images.count) images, interval=\(switchTime)s")
                             // 通过 CLI web 渲染器渲染
-                            try WallpaperEngineXBridge.shared.setWallpaper(
+                            try await WallpaperEngineXBridge.shared.setWallpaper(
                                 path: resolvedRoot.path,
                                 targetScreens: [screen]
                             )
@@ -670,7 +670,7 @@ class WallpaperSchedulerService: ObservableObject {
                                 print("\(logTag) Skipping CLI fallback in on-end mode")
                                 return false
                             }
-                            try WallpaperEngineXBridge.shared.setWallpaper(
+                            try await WallpaperEngineXBridge.shared.setWallpaper(
                                 path: resolvedRoot.path,
                                 targetScreens: [screen]
                             )
@@ -684,7 +684,7 @@ class WallpaperSchedulerService: ObservableObject {
                             return false
                         }
                         print("\(logTag) Using CLI renderer for WE \(type): \(resolvedRoot.path)")
-                        try WallpaperEngineXBridge.shared.setWallpaper(
+                        try await WallpaperEngineXBridge.shared.setWallpaper(
                             path: resolvedRoot.path,
                             targetScreens: [screen]
                         )

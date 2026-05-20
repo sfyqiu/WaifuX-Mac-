@@ -65,7 +65,7 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     // MARK: - 控制接口
 
-    func setWallpaper(path: String, posterURL: URL? = nil, targetScreens: [NSScreen]? = nil) throws {
+    func setWallpaper(path: String, posterURL: URL? = nil, targetScreens: [NSScreen]? = nil) async throws {
         // 只停本机视频层；切勿调用 VideoWallpaperManager.stopWallpaper()（会恢复静态桌面，干扰后续 CLI set）。
         // 多屏场景下只停目标屏幕，不影响其他屏正在播放的本机视频。
         if let screens = targetScreens, !screens.isEmpty {
@@ -77,7 +77,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
 
         // 每次应用 CLI 壁纸：先 stop 销毁上一轮 daemon/会话，再 set 重建，避免状态残留。
-        try? executeCLI(arguments: ["stop"])
+        try? await executeCLIAsync(arguments: ["stop"])
 
         lastWallpaperPath = path
         isExternalPaused = false
@@ -94,10 +94,10 @@ final class WallpaperEngineXBridge: ObservableObject {
         if let screens = targetScreens, !screens.isEmpty {
             for screen in screens {
                 guard let index = NSScreen.screens.firstIndex(of: screen) else { continue }
-                try executeCLI(arguments: ["set", path, String(index)])
+                try await executeCLIAsync(arguments: ["set", path, String(index)])
             }
         } else {
-            try executeCLI(arguments: ["set", path])
+            try await executeCLIAsync(arguments: ["set", path])
         }
 
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
@@ -148,7 +148,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         return activeTargetIDs.isSubset(of: coveredScreenIDs)
     }
 
-    func restoreIfNeeded() {
+    func restoreIfNeeded() async {
         // 从 UserDefaults 恢复上次状态（不在 init 中读取，避免 macOS 26+ _CFXPreferences 递归崩溃）
         if !isControllingExternalEngine {
             if let path = UserDefaults.standard.string(forKey: lastWallpaperPathKey) {
@@ -168,7 +168,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         isExternalPaused = false
         let hasPersistedTargets = !targetScreenIDs.isEmpty || !targetScreenFingerprints.isEmpty
         let screens = hasPersistedTargets ? activeTargetScreens() : []
-        try? setWallpaper(path: path, targetScreens: hasPersistedTargets && !screens.isEmpty ? screens : nil)
+        try? await setWallpaper(path: path, targetScreens: hasPersistedTargets && !screens.isEmpty ? screens : nil)
     }
 
     private func persistState() {
@@ -334,6 +334,20 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
         }
         if let error = capturedError { throw error }
+    }
+
+    /// async 版 CLI 执行：不阻塞主线程，CLI 在后台串行队列运行。
+    private func executeCLIAsync(arguments: [String]) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            weCLIQueue.async {
+                do {
+                    try Self._runCLI(arguments: arguments)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 }
 

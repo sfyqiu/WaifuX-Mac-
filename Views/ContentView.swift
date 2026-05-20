@@ -1842,6 +1842,11 @@ private struct MyMediaVideoCard: View {
         }
         .onAppear { triggerThumbnailIfNeeded() }
         .onChange(of: localMediaFileURL) { _, _ in resolvedThumbnailURL = nil; triggerThumbnailIfNeeded() }
+        .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeThumbnailDidUpdate)) { notification in
+            guard let updatedItemID = notification.object as? String,
+                  updatedItemID == item.id else { return }
+            triggerThumbnailIfNeeded()
+        }
     }
 
     /// 已下载的视频如果没有缓存抽帧，异步生成并刷新封面

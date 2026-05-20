@@ -335,7 +335,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             // 恢复动态壁纸（如果用户之前设置了）
                             VideoWallpaperManager.shared.restoreIfNeeded()
                             if !VideoWallpaperManager.shared.isVideoWallpaperActive {
-                                WallpaperEngineXBridge.shared.restoreIfNeeded()
+                                Task { await WallpaperEngineXBridge.shared.restoreIfNeeded() }
                             }
 
                             // 恢复动态壁纸自动暂停设置
