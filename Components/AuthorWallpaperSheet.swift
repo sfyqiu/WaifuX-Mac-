@@ -11,17 +11,16 @@ struct AuthorWallpaperSheet: View {
     let onLoadMore: (() -> Void)?
 
     @State private var isVisible = false
-    @State private var contentOffset: CGFloat = 0
-
-    private let cardWidthRatio: CGFloat = 0.44
-    private let cardSpacing: CGFloat = 12
-    private let cornerRadius: CGFloat = 28
+    private let cardSpacing: CGFloat = 14
+    private let cornerRadius: CGFloat = 18
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack(alignment: .bottom) {
-                // 半透明背景
-                Color.black.opacity(0.55)
+            let panelWidth = min(max(geometry.size.width * 0.72, 720), 1040)
+            let panelHeight = min(max(geometry.size.height * 0.78, 620), 820)
+
+            ZStack {
+                Color.black.opacity(0.36)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture {
@@ -29,32 +28,23 @@ struct AuthorWallpaperSheet: View {
                     }
                     .opacity(isVisible ? 1 : 0)
 
-                // 底部弹出卡片
                 VStack(spacing: 0) {
-                    // 拖拽指示器
-                    Capsule()
-                        .fill(.white.opacity(0.25))
-                        .frame(width: 36, height: 4)
-                        .padding(.top, 12)
-                        .padding(.bottom, 8)
-
-                    // 作者信息头部
                     authorHeader
-                        .padding(.horizontal, 24)
-                        .padding(.bottom, 16)
+                        .padding(.horizontal, 28)
+                        .padding(.top, 24)
+                        .padding(.bottom, 18)
 
-                    // 分隔线
                     dividerLine
-                        .padding(.horizontal, 24)
+                        .padding(.horizontal, 28)
 
-                    // 壁纸网格标题
                     HStack {
                         Text(t("authorWallpapers"))
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.85))
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.82))
                         Spacer()
                         if isLoading {
                             ProgressView()
+                                .controlSize(.small)
                                 .scaleEffect(0.7)
                                 .frame(width: 16, height: 16)
                         }
@@ -64,30 +54,29 @@ struct AuthorWallpaperSheet: View {
                                 .foregroundStyle(.white.opacity(0.4))
                         }
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 14)
-                    .padding(.bottom, 10)
+                    .padding(.horizontal, 28)
+                    .padding(.top, 16)
+                    .padding(.bottom, 12)
 
-                    // 壁纸网格
-                    wallpaperGrid
+                    wallpaperGrid(width: panelWidth)
                         .frame(maxHeight: .infinity)
                 }
-                .frame(maxHeight: 560)
-                .frame(maxWidth: min(480, geometry.size.width - 32))
+                .frame(width: panelWidth, height: panelHeight)
                 .background(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(.regularMaterial)
+                        .fill(.ultraThickMaterial)
                         .overlay(
                             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                                .fill(Color(hex: "0A0A0C").opacity(0.45))
+                                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.38))
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                                .stroke(.white.opacity(0.1), lineWidth: 0.5)
+                                .stroke(.white.opacity(0.14), lineWidth: 0.5)
                         )
                 )
-                .shadow(color: .black.opacity(0.4), radius: 40, y: -8)
-                .offset(y: isVisible ? 0 : 600)
+                .shadow(color: .black.opacity(0.28), radius: 42, y: 18)
+                .scaleEffect(isVisible ? 1 : 0.97)
+                .opacity(isVisible ? 1 : 0)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -100,45 +89,35 @@ struct AuthorWallpaperSheet: View {
 
     // MARK: - 作者信息头部
     private var authorHeader: some View {
-        HStack(spacing: 14) {
-            // 作者头像
+        HStack(spacing: 16) {
             authorAvatar
-                .frame(width: 48, height: 48)
+                .frame(width: 56, height: 56)
 
-            // 作者名称和信息
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 6) {
                 Text(uploader.username)
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.95))
                     .lineLimit(1)
 
                 HStack(spacing: 6) {
-                    // 来源标签
-                    Text("wallhaven")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.7))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule()
-                                .fill(.white.opacity(0.1))
-                        )
+                    Label("wallhaven", systemImage: "photo.stack")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.62))
                 }
             }
 
             Spacer()
 
-            // 关闭按钮
             Button {
                 dismiss()
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.6))
-                    .frame(width: 32, height: 32)
+                    .foregroundStyle(.white.opacity(0.72))
+                    .frame(width: 30, height: 30)
                     .background(
                         Circle()
-                            .fill(.white.opacity(0.1))
+                            .fill(.white.opacity(0.09))
                     )
             }
             .buttonStyle(.plain)
@@ -159,7 +138,7 @@ struct AuthorWallpaperSheet: View {
                 }
                 .resizable()
                 .scaledToFill()
-                .frame(width: 48, height: 48)
+                .frame(width: 56, height: 56)
                 .clipShape(Circle())
                 .overlay(
                     Circle()
@@ -169,7 +148,7 @@ struct AuthorWallpaperSheet: View {
             Image(systemName: "person.crop.circle.fill")
                 .font(.system(size: 28))
                 .foregroundStyle(.white.opacity(0.4))
-                .frame(width: 48, height: 48)
+                .frame(width: 56, height: 56)
                 .background(
                     Circle()
                         .fill(.white.opacity(0.08))
@@ -178,16 +157,14 @@ struct AuthorWallpaperSheet: View {
     }
 
     // MARK: - 壁纸网格
-    private var wallpaperGrid: some View {
+    private func wallpaperGrid(width: CGFloat) -> some View {
         ScrollView(.vertical, showsIndicators: false) {
             if wallpapers.isEmpty && !isLoading {
                 emptyState
             } else {
+                let columnCount = max(2, min(4, Int(width / 240)))
                 LazyVGrid(
-                    columns: [
-                        GridItem(.flexible(), spacing: cardSpacing),
-                        GridItem(.flexible(), spacing: cardSpacing)
-                    ],
+                    columns: Array(repeating: GridItem(.flexible(), spacing: cardSpacing), count: columnCount),
                     spacing: cardSpacing
                 ) {
                     ForEach(wallpapers) { wallpaper in
@@ -199,8 +176,8 @@ struct AuthorWallpaperSheet: View {
                         )
                     }
                 }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 28)
 
                 // 加载更多触发器
                 if let onLoadMore = onLoadMore, !wallpapers.isEmpty {
@@ -216,6 +193,7 @@ struct AuthorWallpaperSheet: View {
             Color.clear
                 .frame(height: 12)
         }
+        .iosSmoothScroll()
 
     }
 
@@ -237,7 +215,7 @@ struct AuthorWallpaperSheet: View {
     // MARK: - 分隔线
     private var dividerLine: some View {
         Rectangle()
-            .fill(.white.opacity(0.06))
+            .fill(.white.opacity(0.08))
             .frame(height: 1)
     }
 
@@ -273,6 +251,7 @@ private struct AuthorWallpaperCard: View {
     let onTap: () -> Void
 
     @State private var isHovered = false
+    private let cardCornerRadius: CGFloat = 14
 
     var body: some View {
         Button {
@@ -280,11 +259,15 @@ private struct AuthorWallpaperCard: View {
         } label: {
             VStack(alignment: .leading, spacing: 0) {
                 // 壁纸封面
-                KFImage(wallpaper.thumbURL ?? wallpaper.fullImageURL)
+                KFImage(coverImageURL)
+                    .setProcessor(DownsamplingImageProcessor(size: targetImageSize))
+                    .backgroundDecode()
+                    .cancelOnDisappear(true)
                     .placeholder { _ in
                         Rectangle()
                             .fill(.white.opacity(0.05))
                     }
+                    .fade(duration: 0.15)
                     .resizable()
                     .scaledToFill()
                     .frame(height: cardImageHeight)
@@ -319,26 +302,34 @@ private struct AuthorWallpaperCard: View {
                 .padding(.vertical, 8)
             }
             .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                     .fill(Color(hex: "1A1D24").opacity(0.6))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                     .stroke(isHovered ? .white.opacity(0.2) : .white.opacity(0.06), lineWidth: 0.5)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .scaleEffect(isHovered ? 1.02 : 1)
+            .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+            .scaleEffect(isHovered ? 1.01 : 1)
+            .animation(.easeOut(duration: 0.14), value: isHovered)
         }
         .buttonStyle(.plain)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.2)) {
-                isHovered = hovering
-            }
+        .throttledHover(interval: 0.08) { hovering in
+            isHovered = hovering
         }
     }
 
     /// 根据当前视图宽度自适应卡片图片高度
     private var cardImageHeight: CGFloat {
         120
+    }
+
+    private var coverImageURL: URL? {
+        wallpaper.thumbURL ?? wallpaper.smallThumbURL ?? wallpaper.fullImageURL
+    }
+
+    private var targetImageSize: CGSize {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        return CGSize(width: 240 * scale, height: cardImageHeight * scale)
     }
 }

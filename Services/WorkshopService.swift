@@ -72,6 +72,7 @@ class WorkshopService: ObservableObject {
 
     private let wallpaperEngineAppID = "431960"
     private let steamAPIBase = "https://api.steampowered.com"
+    private let authorPageSize = 30
     private var currentPage = 1
     private let pageSize = 20
 
@@ -95,9 +96,15 @@ class WorkshopService: ObservableObject {
     ///   - page: 页码（从 1 开始）
     /// - Returns: 壁纸列表
     func fetchByAuthor(steamID: String, page: Int = 1) async throws -> [WorkshopWallpaper] {
-        // 构造作者 Workshop 页面 URL
-        let urlString = "https://steamcommunity.com/profiles/\(steamID)/myworkshopfiles/?appid=\(wallpaperEngineAppID)&p=\(page)&num_per_page=30"
-        guard let url = URL(string: urlString) else {
+        let profilePath = steamProfilePath(for: steamID)
+        var components = URLComponents(string: "https://steamcommunity.com\(profilePath)/myworkshopfiles/")
+        components?.queryItems = [
+            URLQueryItem(name: "appid", value: wallpaperEngineAppID),
+            URLQueryItem(name: "p", value: String(page)),
+            // Steam 作者页使用 numperpage，不是 Workshop 搜索页的 num_per_page。
+            URLQueryItem(name: "numperpage", value: String(authorPageSize))
+        ]
+        guard let url = components?.url else {
             throw WorkshopError.invalidURL
         }
 
@@ -113,17 +120,17 @@ class WorkshopService: ObservableObject {
         var wallpapers = extractFromJSON(html)
         if !wallpapers.isEmpty {
             AppLogger.info(.media, "fetchByAuthor used JSON/SSR extraction: \(wallpapers.count) items")
-            // 补充作者名
+            // 补充作者名和头像
             let authorMap = extractAuthorMapFromHTML(html)
             if !authorMap.isEmpty {
                 wallpapers = wallpapers.map { item in
-                    guard let authorName = authorMap[item.id], authorName != "Unknown" else { return item }
+                    guard let author = authorMap[item.id] else { return item }
                     return WorkshopWallpaper(
                         id: item.id,
                         title: item.title,
                         description: item.description,
                         previewURL: item.previewURL,
-                        author: WorkshopAuthor(steamID: item.author.steamID, name: authorName, avatarURL: item.author.avatarURL),
+                        author: mergedAuthor(item.author, author),
                         fileSize: item.fileSize,
                         fileURL: item.fileURL,
                         steamAppID: item.steamAppID,
@@ -139,17 +146,25 @@ class WorkshopService: ObservableObject {
                     )
                 }
             }
-            // 确保作者名为原始请求的 author
+            // 作者页也补齐 API 元数据，保持和搜索页一致，避免列表缺尺寸/类型/统计字段。
+            do {
+                wallpapers = try await enrichWithAPIDetails(wallpapers)
+            } catch {
+                AppLogger.error(.media, "Author page API enrichment failed", metadata: ["steamID": steamID, "error": "\(error)"])
+            }
+
+            let profile = try? await fetchSteamProfile(profileID: steamID)
             wallpapers = wallpapers.map { item in
-                WorkshopWallpaper(
+                let authorName = bestAuthorName(item.author.name, fallback: profile?.name ?? item.author.steamID)
+                return WorkshopWallpaper(
                     id: item.id,
                     title: item.title,
                     description: item.description,
                     previewURL: item.previewURL,
                     author: WorkshopAuthor(
-                        steamID: steamID,
-                        name: item.author.name != "Unknown" ? item.author.name : item.author.steamID,
-                        avatarURL: item.author.avatarURL
+                        steamID: profile?.steamID ?? steamID,
+                        name: authorName,
+                        avatarURL: item.author.avatarURL ?? profile?.avatarURL
                     ),
                     fileSize: item.fileSize,
                     fileURL: item.fileURL,
@@ -172,7 +187,41 @@ class WorkshopService: ObservableObject {
         AppLogger.info(.media, "fetchByAuthor falling back to HTML DOM parsing")
         let doc = try SwiftSoup.parse(html)
         let items = try doc.select(".workshopItem, .workshopItemWrapper, [id*='sharedfiles_']")
-        return try items.compactMap { try parseWorkshopItem($0) }
+        var parsed = try items.compactMap { try parseWorkshopItem($0) }
+        if parsed.isEmpty {
+            parsed = try parseModernWorkshopHTML(doc)
+        }
+        do {
+            parsed = try await enrichWithAPIDetails(parsed)
+        } catch {
+            AppLogger.error(.media, "Author HTML API enrichment failed", metadata: ["steamID": steamID, "error": "\(error)"])
+        }
+        let profile = try? await fetchSteamProfile(profileID: steamID)
+        return parsed.map { item in
+            WorkshopWallpaper(
+                id: item.id,
+                title: item.title,
+                description: item.description,
+                previewURL: item.previewURL,
+                author: WorkshopAuthor(
+                    steamID: profile?.steamID ?? steamID,
+                    name: bestAuthorName(item.author.name, fallback: profile?.name ?? steamID),
+                    avatarURL: item.author.avatarURL ?? profile?.avatarURL
+                ),
+                fileSize: item.fileSize,
+                fileURL: item.fileURL,
+                steamAppID: item.steamAppID,
+                subscriptions: item.subscriptions,
+                favorites: item.favorites,
+                views: item.views,
+                rating: item.rating,
+                type: item.type,
+                tags: item.tags,
+                isAnimatedImage: item.isAnimatedImage,
+                createdAt: item.createdAt,
+                updatedAt: item.updatedAt
+            )
+        }
     }
 
     // MARK: - Search
@@ -277,13 +326,13 @@ class WorkshopService: ObservableObject {
             let authorMap = extractAuthorMapFromHTML(html)
             if !authorMap.isEmpty {
                 wallpapers = wallpapers.map { item in
-                    guard let authorName = authorMap[item.id], authorName != "Unknown" else { return item }
+                    guard let author = authorMap[item.id] else { return item }
                     return WorkshopWallpaper(
                         id: item.id,
                         title: item.title,
                         description: item.description,
                         previewURL: item.previewURL,
-                        author: WorkshopAuthor(steamID: item.author.steamID, name: authorName, avatarURL: item.author.avatarURL),
+                        author: mergedAuthor(item.author, author),
                         fileSize: item.fileSize,
                         fileURL: item.fileURL,
                         steamAppID: item.steamAppID,
@@ -518,12 +567,12 @@ class WorkshopService: ObservableObject {
         return wallpapers
     }
 
-    /// 从 HTML DOM 提取作者名映射（用于补充 JSON/SSR 提取缺失的作者显示名）
-    private func extractAuthorMapFromHTML(_ html: String) -> [String: String] {
+    /// 从 HTML DOM 提取作者映射（用于补充 JSON/SSR 提取缺失的作者显示名和头像）
+    private func extractAuthorMapFromHTML(_ html: String) -> [String: WorkshopAuthor] {
         guard let document = try? SwiftSoup.parse(html) else { return [:] }
         let links = try? document.select("a[href*=/sharedfiles/filedetails/?id=]")
 
-        var authorMap: [String: String] = [:]
+        var authorMap: [String: WorkshopAuthor] = [:]
         var seenIDs = Set<String>()
 
         for link in links ?? Elements() {
@@ -532,7 +581,7 @@ class WorkshopService: ObservableObject {
             guard !seenIDs.contains(id) else { continue }
             seenIDs.insert(id)
 
-            var authorName = "Unknown"
+            var author = WorkshopAuthor(steamID: "", name: "Unknown", avatarURL: nil)
             var current: Element? = link
             for _ in 0..<5 {
                 guard let parent = current?.parent() else { break }
@@ -541,19 +590,106 @@ class WorkshopService: ObservableObject {
                 for profileLink in profileLinks ?? Elements() {
                     let name = (try? profileLink.text())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     if !name.isEmpty && name != "Untitled" && !name.contains("http") {
-                        authorName = name
+                        author = WorkshopAuthor(
+                            steamID: steamID(fromProfileHref: (try? profileLink.attr("href")) ?? ""),
+                            name: name,
+                            avatarURL: extractAvatarURL(near: parent)
+                        )
                         break
                     }
                 }
-                if authorName != "Unknown" { break }
+                if author.name != "Unknown" || author.avatarURL != nil { break }
             }
 
-            if authorName != "Unknown" {
-                authorMap[id] = authorName
+            if author.name != "Unknown" || author.avatarURL != nil || !author.steamID.isEmpty {
+                authorMap[id] = author
             }
         }
 
         return authorMap
+    }
+
+    private func mergedAuthor(_ existing: WorkshopAuthor, _ parsed: WorkshopAuthor) -> WorkshopAuthor {
+        WorkshopAuthor(
+            steamID: !parsed.steamID.isEmpty ? parsed.steamID : existing.steamID,
+            name: bestAuthorName(parsed.name, fallback: existing.name),
+            avatarURL: parsed.avatarURL ?? existing.avatarURL
+        )
+    }
+
+    private func bestAuthorName(_ name: String, fallback: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed != "Unknown" {
+            return trimmed
+        }
+        return fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unknown" : fallback
+    }
+
+    private func steamID(fromProfileHref href: String) -> String {
+        guard let range = href.range(of: #"/profiles/([0-9]+)"#, options: .regularExpression) else { return "" }
+        return String(href[range])
+            .replacingOccurrences(of: "/profiles/", with: "")
+            .components(separatedBy: "/")
+            .first ?? ""
+    }
+
+    private func extractAvatarURL(near element: Element) -> URL? {
+        let selectors = [
+            ".playerAvatar img",
+            ".playerAvatarMedium img",
+            ".friendBlockAvatar img",
+            "img.avatar",
+            ".playerAvatar picture img",
+            "#HeaderUserAvatar img"
+        ]
+        for selector in selectors {
+            if let img = try? element.select(selector).first(),
+               let url = normalizedSteamImageURL(from: (try? img.attr("srcset")) ?? "", fallback: (try? img.attr("src")) ?? "", dataSource: (try? img.attr("data-src")) ?? "") {
+                return url
+            }
+        }
+        if let styleElement = try? element.select("[style*=avatars]").first(),
+           let url = steamAvatarURL(fromStyle: (try? styleElement.attr("style")) ?? "") {
+            return url
+        }
+        let sourceSelectors = [
+            ".playerAvatar source",
+            ".playerAvatar picture source",
+            "#HeaderUserAvatar source"
+        ]
+        for selector in sourceSelectors {
+            if let source = try? element.select(selector).first(),
+               let url = normalizedSteamImageURL(from: (try? source.attr("srcset")) ?? "", fallback: "", dataSource: "") {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private func normalizedSteamImageURL(from srcset: String, fallback: String, dataSource: String) -> URL? {
+        var src = srcset
+        if src.isEmpty { src = fallback }
+        if src.isEmpty { src = dataSource }
+        if let firstURL = src.components(separatedBy: ",").first?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            src = firstURL.components(separatedBy: " ").first ?? firstURL
+        }
+        var cleanURL = src.components(separatedBy: "?").first ?? src
+        if cleanURL.hasPrefix("//") { cleanURL = "https:" + cleanURL }
+        return cleanURL.isEmpty ? nil : URL(string: cleanURL)
+    }
+
+    private func steamAvatarURL(fromStyle style: String) -> URL? {
+        guard let regex = try? NSRegularExpression(pattern: #"url\(['"]?([^'")]+avatars[^'")]+)['"]?\)"#, options: []) else {
+            return nil
+        }
+        let range = NSRange(style.startIndex..., in: style)
+        guard let match = regex.firstMatch(in: style, options: [], range: range),
+              let swiftRange = Range(match.range(at: 1), in: style) else {
+            return nil
+        }
+        var raw = String(style[swiftRange])
+        if raw.hasPrefix("//") { raw = "https:" + raw }
+        return URL(string: raw)
     }
 
     private func parseWorkshopItem(_ element: Element) throws -> WorkshopWallpaper? {
@@ -977,6 +1113,64 @@ class WorkshopService: ObservableObject {
             }
             throw WorkshopError.apiError("解析 Steam API 响应失败")
         }
+    }
+
+    private struct SteamProfileSummary {
+        let steamID: String?
+        let name: String
+        let avatarURL: URL?
+    }
+
+    private func fetchSteamProfile(profileID: String) async throws -> SteamProfileSummary? {
+        guard !profileID.isEmpty,
+              let url = URL(string: "https://steamcommunity.com\(steamProfilePath(for: profileID))/?xml=1") else {
+            return nil
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+        let data = try await NetworkService.shared.fetchData(request: request)
+        guard let xml = String(data: data, encoding: .utf8) else { return nil }
+
+        let numericSteamID = firstXMLValue(named: "steamID64", in: xml)
+        let name = firstXMLValue(named: "steamID", in: xml)
+            ?? firstXMLValue(named: "customURL", in: xml)
+            ?? profileID
+        let avatar = firstXMLValue(named: "avatarFull", in: xml)
+            ?? firstXMLValue(named: "avatarMedium", in: xml)
+            ?? firstXMLValue(named: "avatarIcon", in: xml)
+        return SteamProfileSummary(steamID: numericSteamID, name: name, avatarURL: avatar.flatMap(URL.init(string:)))
+    }
+
+    private func steamProfilePath(for profileID: String) -> String {
+        let trimmed = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.allSatisfy(\.isNumber) {
+            return "/profiles/\(trimmed)"
+        }
+        return "/id/\(trimmed)"
+    }
+
+    private func firstXMLValue(named tag: String, in xml: String) -> String? {
+        let cdataPattern = "<\(tag)>\\s*<!\\[CDATA\\[(.*?)\\]\\]>\\s*</\(tag)>"
+        if let value = firstRegexCapture(pattern: cdataPattern, in: xml) {
+            return value
+        }
+        let plainPattern = "<\(tag)>\\s*(.*?)\\s*</\(tag)>"
+        return firstRegexCapture(pattern: plainPattern, in: xml)
+    }
+
+    private func firstRegexCapture(pattern: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges > 1,
+              let swiftRange = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        let value = String(text[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     // MARK: - 通过 Steam Workshop URL 解析项目
@@ -2120,7 +2314,9 @@ extension WorkshopService {
             downloadOptions = [option]
         }
 
-        let authorName = wallpaper.author.name != "Unknown" ? wallpaper.author.name : nil
+        let trimmedAuthorName = wallpaper.author.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasAuthorName = !trimmedAuthorName.isEmpty && trimmedAuthorName != "Unknown"
+        let hasSteamID = !wallpaper.author.steamID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         return MediaItem(
             slug: "workshop_\(wallpaper.id)",
@@ -2142,9 +2338,9 @@ extension WorkshopService {
             favoriteCount: wallpaper.favorites,
             viewCount: wallpaper.views,
             ratingScore: wallpaper.rating,
-            authorName: authorName,
-            authorSteamID: authorName != nil ? wallpaper.author.steamID : nil,
-            authorAvatarURL: authorName != nil ? wallpaper.author.avatarURL : nil,
+            authorName: hasAuthorName ? trimmedAuthorName : nil,
+            authorSteamID: hasSteamID ? wallpaper.author.steamID : nil,
+            authorAvatarURL: wallpaper.author.avatarURL,
             fileSize: wallpaper.fileSize,
             createdAt: wallpaper.createdAt,
             updatedAt: wallpaper.updatedAt

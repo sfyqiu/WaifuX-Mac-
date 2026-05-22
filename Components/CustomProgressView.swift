@@ -77,19 +77,125 @@ struct ExploreLoadingStateView: View {
     var message: String = "加载中..."
     var tint: Color = .white
 
+    @State private var isAnimating = false
+
     var body: some View {
-        VStack(spacing: 14) {
-            ProgressView()
-                .progressViewStyle(.circular)
-                .tint(tint)
-                .scaleEffect(1.15)
-                .frame(width: 28, height: 28)
+        VStack(spacing: 18) {
+            ExploreLoadingGlyph(tint: tint)
+
             Text(message)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(tint.opacity(0.82))
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundStyle(tint.opacity(0.88))
                 .frame(maxWidth: .infinity, alignment: .center)
+
+            HStack(spacing: 7) {
+                ForEach(0..<3, id: \.self) { index in
+                    Capsule(style: .continuous)
+                        .fill(tint.opacity(index == 1 ? 0.52 : 0.30))
+                        .frame(width: index == 1 ? 20 : 12, height: 2)
+                        .opacity(isAnimating ? 0.9 : 0.35)
+                        .scaleEffect(x: isAnimating ? 1.0 : 0.72, anchor: .center)
+                        .animation(
+                            .easeInOut(duration: 0.9)
+                            .repeatForever(autoreverses: true)
+                            .delay(Double(index) * 0.12),
+                            value: isAnimating
+                        )
+                }
+            }
         }
-        .frame(maxWidth: .infinity, minHeight: 180)
+        .padding(.vertical, 26)
+        .frame(maxWidth: .infinity, minHeight: 190)
+        .onAppear { isAnimating = true }
+        .onDisappear { isAnimating = false }
+    }
+}
+
+struct ExploreLoadingGlyph: View {
+    var tint: Color = .white
+    var compact: Bool = false
+
+    @State private var isAnimating = false
+
+    private var glyphSize: CGSize {
+        compact ? CGSize(width: 44, height: 30) : CGSize(width: 92, height: 70)
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: compact ? 9 : 16, style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            tint.opacity(isAnimating ? 0.58 : 0.22),
+                            Color.white.opacity(compact ? 0.18 : 0.28),
+                            tint.opacity(0.12)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: compact ? 0.75 : 1
+                )
+                .frame(
+                    width: compact ? 38 : 70,
+                    height: compact ? 22 : 42
+                )
+                .scaleEffect(isAnimating ? 1.04 : 0.97)
+                .animation(
+                    .easeInOut(duration: 1.25).repeatForever(autoreverses: true),
+                    value: isAnimating
+                )
+
+            ForEach(0..<3, id: \.self) { index in
+                Capsule(style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(compact ? 0.70 : 0.84),
+                                tint.opacity(index == 1 ? 0.88 : 0.62)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(
+                        width: lineWidth(for: index),
+                        height: compact ? 2.6 : 4
+                    )
+                    .offset(y: CGFloat(index - 1) * (compact ? 5.2 : 9))
+                    .scaleEffect(
+                        x: isAnimating ? lineScaleOn(for: index) : lineScaleOff(for: index),
+                        y: 1,
+                        anchor: index == 1 ? .center : (index == 0 ? .leading : .trailing)
+                    )
+                    .opacity(isAnimating ? 0.92 : 0.46)
+                    .animation(
+                        .easeInOut(duration: 0.95)
+                        .repeatForever(autoreverses: true)
+                        .delay(Double(index) * 0.14),
+                        value: isAnimating
+                    )
+            }
+        }
+        .frame(width: glyphSize.width, height: glyphSize.height)
+        .contentShape(Rectangle())
+        .onAppear { isAnimating = true }
+        .onDisappear { isAnimating = false }
+    }
+
+    private func lineWidth(for index: Int) -> CGFloat {
+        let base: [CGFloat] = compact ? [21, 28, 17] : [46, 58, 36]
+        return base[index]
+    }
+
+    private func lineScaleOn(for index: Int) -> CGFloat {
+        let scales: [CGFloat] = compact ? [0.78, 1.08, 0.88] : [0.82, 1.10, 0.86]
+        return scales[index]
+    }
+
+    private func lineScaleOff(for index: Int) -> CGFloat {
+        let scales: [CGFloat] = compact ? [1.12, 0.80, 1.16] : [1.08, 0.76, 1.12]
+        return scales[index]
     }
 }
 

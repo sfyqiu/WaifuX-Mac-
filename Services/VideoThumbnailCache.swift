@@ -45,6 +45,18 @@ final class VideoThumbnailCache {
         return nil
     }
 
+    /// Scene 烘焙封面使用稳定的 item 级缓存文件，避免每次重新烘焙因为 MP4 文件名变化而堆出多张抽帧图。
+    func cachedSceneBakePosterFileURLIfExists(itemID: String) -> URL? {
+        let poster = sceneBakePosterCacheURL(itemID: itemID)
+        guard fileManager.fileExists(atPath: poster.path),
+              let attrs = try? fileManager.attributesOfItem(atPath: poster.path),
+              let sz = attrs[.size] as? NSNumber,
+              sz.intValue > 500 else {
+            return nil
+        }
+        return poster
+    }
+
     /// 获取视频缩略图 URL
     /// - Parameter videoURL: 视频文件 URL
     /// - Returns: 缩略图 URL（可能是缓存的文件 URL，也可能是原始视频 URL）
@@ -88,6 +100,36 @@ final class VideoThumbnailCache {
         return await generatePosterJPEGFile(from: fileURL, outputURL: outURL)
     }
 
+    /// 为 Scene 烘焙 MP4 生成稳定封面。`forceRegenerate` 为 true 时覆盖同一个 item 的旧抽帧。
+    func sceneBakePosterJPEGFileURL(
+        forLocalVideo videoURL: URL,
+        itemID: String,
+        forceRegenerate: Bool = false
+    ) async -> URL? {
+        guard videoURL.isFileURL else { return nil }
+        let pathKey = videoURL.standardizedFileURL.path
+        guard fileManager.fileExists(atPath: pathKey) else { return nil }
+
+        let outURL = sceneBakePosterCacheURL(itemID: itemID)
+        if !forceRegenerate,
+           let existing = cachedSceneBakePosterFileURLIfExists(itemID: itemID) {
+            return existing
+        }
+
+        try? fileManager.removeItem(at: outURL)
+        return await generatePosterJPEGFile(from: URL(fileURLWithPath: pathKey), outputURL: outURL)
+    }
+
+    /// 删除 Scene 烘焙稳定封面，并顺手清掉旧的 path-based poster，避免历史重复缓存继续被列表命中。
+    func removeSceneBakePoster(itemID: String, videoPath: String? = nil) {
+        try? fileManager.removeItem(at: sceneBakePosterCacheURL(itemID: itemID))
+        if let videoPath, !videoPath.isEmpty {
+            let videoURL = URL(fileURLWithPath: videoPath)
+            try? fileManager.removeItem(at: posterCacheURL(forPathKey: videoURL.standardizedFileURL.path))
+            try? fileManager.removeItem(at: cacheURL(for: videoURL))
+        }
+    }
+
     /// 动态壁纸的锁屏/静态桌面底图：对 mp4/mov/webm/m4v 从片源抽高清帧，失败或未识别扩展名时回退为站点封面等。
     func lockScreenPosterURL(forLocalVideo localVideoURL: URL, fallbackPosterURL: URL?) async -> URL? {
         let ext = localVideoURL.pathExtension.lowercased()
@@ -97,6 +139,10 @@ final class VideoThumbnailCache {
 
     private func posterCacheURL(forPathKey pathKey: String) -> URL {
         cacheDirectory.appendingPathComponent("poster_wallpaper_\(pathKey.md5).jpg")
+    }
+
+    private func sceneBakePosterCacheURL(itemID: String) -> URL {
+        cacheDirectory.appendingPathComponent("scene_bake_\(itemID.md5).jpg")
     }
 
     private func generatePosterJPEGFile(from videoURL: URL, outputURL: URL) async -> URL? {
@@ -322,5 +368,4 @@ extension String {
         return hash.map { String(format: "%02hhx", $0) }.joined()
     }
 }
-
 

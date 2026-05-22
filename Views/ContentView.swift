@@ -85,6 +85,12 @@ private struct MainTabContainerView: NSViewControllerRepresentable {
     }
 }
 
+private enum MainDetailRoute: Hashable {
+    case wallpaper(Wallpaper, context: [Wallpaper]?)
+    case media(MediaItem, context: [MediaItem]?)
+    case anime(AnimeSearchResult)
+}
+
 @MainActor
 private final class MainTabViewController: NSTabViewController {
     private var isConfigured = false
@@ -226,6 +232,7 @@ struct ContentView: View {
     @StateObject private var navigationState = MainContentNavigationState()
     @ObservedObject private var localization = LocalizationService.shared
     @ObservedObject private var sourceManager = WallpaperSourceManager.shared
+    @State private var detailPath: [MainDetailRoute] = []
 
     // 更新弹窗状态
     @State private var showUpdateSheet = false
@@ -234,79 +241,42 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            Color(hex: "0D0D0D")
-                .ignoresSafeArea()
-
-            MainTabContainerView(
-                navigationState: navigationState,
-                wallpaperViewModel: viewModel,
-                mediaViewModel: mediaViewModel,
-                animeViewModel: animeViewModel
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
-                releaseForegroundMemory()
-            }
-            .id(localization.currentLanguage)
-
-            VStack {
-                TopNavigationBar(
-                    selectedTab: navigationState.binding(for: \.selectedTab),
-                    onOpenSettings: { openSettingsWindow() },
-                    onClose: { hideMainWindow() },
-                    onMinimize: { minimizeWindow() },
-                    onMaximize: { maximizeWindow() },
-                    onZoom: { zoomWindow() }
-                )
-                .zIndex(100)
-
-                Spacer()
-            }
-
-            detailOverlayContainer
-
-            // 更新弹窗 - ZStack overlay，不创建新窗口避免双层红绿灯
-            if showUpdateSheet, let release = updateRelease {
-                AutoUpdateSheet(
-                    currentVersion: UpdateChecker.shared.currentVersion,
-                    latestVersion: release.version,
-                    release: release,
-                    commit: updateCommit,
-                    onClose: { showUpdateSheet = false }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .transition(.opacity.animation(.easeOut(duration: 0.25)))
-                .zIndex(600)
-            }
-
-            // 下载进度弹窗 - 固定在底部
-            VStack {
-                Spacer()
-                DownloadProgressToastHost(
-                    onDismiss: { snapshot in
-                        handleDownloadToastDismiss(snapshot)
-                    },
-                    onCancel: { snapshot in
-                        handleDownloadToastCancel(snapshot)
-                    },
-                    onRetry: { snapshot in
-                        handleDownloadToastRetry(snapshot)
+            NavigationStack(path: $detailPath) {
+                mainContent
+                    .navigationDestination(for: MainDetailRoute.self) { route in
+                        detailDestination(for: route)
                     }
-                )
-                WallpaperSourceSwitchToast()
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 8)
-                WorkshopSourceSwitchToast()
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 20)
             }
-            .zIndex(400)
 
-            // 显示器选择弹窗覆盖层
-            DisplaySelectorOverlay()
-                .zIndex(700)
+            globalOverlayLayer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: navigationState.selectedWallpaper) { _, wallpaper in
+            guard let wallpaper else { return }
+            openDetail(.wallpaper(wallpaper, context: nil))
+        }
+        .onChange(of: navigationState.selectedMedia) { _, item in
+            guard let item else { return }
+            openDetail(.media(item, context: nil))
+        }
+        .onChange(of: navigationState.selectedAnime) { _, anime in
+            guard let anime else { return }
+            openDetail(.anime(anime))
+        }
+        .onChange(of: navigationState.librarySelectedWallpaper) { _, wallpaper in
+            guard let wallpaper else { return }
+            let context = navigationState.libraryWallpaperContext.isEmpty ? nil : navigationState.libraryWallpaperContext
+            openDetail(.wallpaper(wallpaper, context: context))
+        }
+        .onChange(of: navigationState.librarySelectedMedia) { _, item in
+            guard let item else { return }
+            let context = navigationState.libraryMediaContext.isEmpty ? nil : navigationState.libraryMediaContext
+            openDetail(.media(item, context: context))
+        }
+        .onChange(of: navigationState.librarySelectedAnime) { _, anime in
+            guard let anime else { return }
+            openDetail(.anime(anime))
+        }
         .task {
             // ⚠️ 等待启动时数据源选择完成（ping Google 决策）
             // 在确定数据源之前不加载壁纸列表数据
@@ -345,6 +315,89 @@ struct ContentView: View {
         .applyTheme()
     }
 
+    private var globalOverlayLayer: some View {
+        ZStack {
+            // 更新弹窗 - ZStack overlay，不创建新窗口避免双层红绿灯
+            if showUpdateSheet, let release = updateRelease {
+                AutoUpdateSheet(
+                    currentVersion: UpdateChecker.shared.currentVersion,
+                    latestVersion: release.version,
+                    release: release,
+                    commit: updateCommit,
+                    onClose: { showUpdateSheet = false }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .transition(.opacity.animation(.easeOut(duration: 0.25)))
+                .zIndex(600)
+            }
+
+            // 下载进度与来源切换提示必须挂在 NavigationStack 外，保证详情页里也可见。
+            VStack {
+                Spacer()
+                DownloadProgressToastHost(
+                    onDismiss: { snapshot in
+                        handleDownloadToastDismiss(snapshot)
+                    },
+                    onCancel: { snapshot in
+                        handleDownloadToastCancel(snapshot)
+                    },
+                    onRetry: { snapshot in
+                        handleDownloadToastRetry(snapshot)
+                    }
+                )
+                WallpaperSourceSwitchToast()
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 8)
+                WorkshopSourceSwitchToast()
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 20)
+            }
+            .zIndex(400)
+
+            // 显示器选择弹窗覆盖层
+            DisplaySelectorOverlay()
+                .zIndex(700)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(true)
+    }
+
+    private var mainContent: some View {
+        ZStack {
+            Color(hex: "0D0D0D")
+                .ignoresSafeArea()
+
+            MainTabContainerView(
+                navigationState: navigationState,
+                wallpaperViewModel: viewModel,
+                mediaViewModel: mediaViewModel,
+                animeViewModel: animeViewModel
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
+                releaseForegroundMemory()
+            }
+            .id(localization.currentLanguage)
+
+            VStack {
+                TopNavigationBar(
+                    selectedTab: navigationState.binding(for: \.selectedTab),
+                    onOpenSettings: { openSettingsWindow() },
+                    onClose: { hideMainWindow() },
+                    onMinimize: { minimizeWindow() },
+                    onMaximize: { maximizeWindow() },
+                    onZoom: { zoomWindow() }
+                )
+                .zIndex(100)
+
+                Spacer()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .navigationBarBackButtonHidden(true)
+        .toolbar(.hidden, for: .automatic)
+    }
+
     private func minimizeWindow() {
         NSApp.mainWindow?.miniaturize(nil)
     }
@@ -354,86 +407,73 @@ struct ContentView: View {
         window.toggleFullScreen(nil)
     }
 
-    // MARK: - 详情页 overlay 容器（分离求值，减少主 ZStack body 重新计算）
     @ViewBuilder
-    private var detailOverlayContainer: some View {
-        if let wallpaper = navigationState.selectedWallpaper {
-            WallpaperDetailSheet(wallpaper: wallpaper, viewModel: viewModel) {
-                navigationState.selectedWallpaper = nil
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .transition(.asymmetric(
-                insertion: .opacity.animation(.easeOut(duration: 0.18)),
-                removal: .opacity.animation(.easeIn(duration: 0.12))
-            ))
-            .zIndex(300)
-        }
-
-        if let item = navigationState.selectedMedia {
-            MediaDetailSheet(item: item, viewModel: mediaViewModel) {
-                navigationState.selectedMedia = nil
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .transition(.asymmetric(
-                insertion: .opacity.animation(.easeOut(duration: 0.18)),
-                removal: .opacity.animation(.easeIn(duration: 0.12))
-            ))
-            .zIndex(300)
-        }
-
-        if let anime = navigationState.selectedAnime {
-            AnimeDetailSheet(anime: anime, selectedAnime: navigationState.binding(for: \.selectedAnime))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .transition(.asymmetric(
-                    insertion: .opacity.animation(.easeOut(duration: 0.18)),
-                    removal: .opacity.animation(.easeIn(duration: 0.12))
-                ))
-                .zIndex(500)
-        }
-
-        // 我的库中的详情页
-        if let wallpaper = navigationState.librarySelectedWallpaper {
+    private func detailDestination(for route: MainDetailRoute) -> some View {
+        switch route {
+        case .wallpaper(let wallpaper, let context):
             WallpaperDetailSheet(
                 wallpaper: wallpaper,
                 viewModel: viewModel,
-                contextWallpapers: navigationState.libraryWallpaperContext.isEmpty ? nil : navigationState.libraryWallpaperContext
-            ) {
-                navigationState.librarySelectedWallpaper = nil
-            }
+                contextWallpapers: context,
+                onClose: popDetail,
+                onNavigateToWallpaper: { selected in
+                    detailPath.append(.wallpaper(selected, context: context))
+                }
+            )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .transition(.asymmetric(
-                insertion: .opacity.animation(.easeOut(duration: 0.18)),
-                removal: .opacity.animation(.easeIn(duration: 0.12))
-            ))
-            .zIndex(300)
-        }
+            .navigationBarBackButtonHidden(true)
+            .toolbar(.hidden, for: .automatic)
 
-        if let item = navigationState.librarySelectedMedia {
+        case .media(let item, let context):
             MediaDetailSheet(
                 item: item,
                 viewModel: mediaViewModel,
-                contextItems: navigationState.libraryMediaContext.isEmpty ? nil : navigationState.libraryMediaContext
-            ) {
-                navigationState.librarySelectedMedia = nil
-            }
+                contextItems: context,
+                onClose: popDetail,
+                onNavigateToItem: { selected in
+                    detailPath.append(.media(selected, context: context))
+                }
+            )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .transition(.asymmetric(
-                insertion: .opacity.animation(.easeOut(duration: 0.18)),
-                removal: .opacity.animation(.easeIn(duration: 0.12))
-            ))
-            .zIndex(300)
-        }
+            .navigationBarBackButtonHidden(true)
+            .toolbar(.hidden, for: .automatic)
 
-        if let anime = navigationState.librarySelectedAnime {
-            AnimeDetailSheet(anime: anime, selectedAnime: navigationState.binding(for: \.librarySelectedAnime))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
-                .transition(.asymmetric(
-                    insertion: .opacity.animation(.easeOut(duration: 0.18)),
-                    removal: .opacity.animation(.easeIn(duration: 0.12))
-                ))
-                .zIndex(500)
+        case .anime(let anime):
+            AnimeDetailSheet(
+                anime: anime,
+                isPresented: Binding(
+                    get: { !detailPath.isEmpty },
+                    set: { if !$0 { popDetail() } }
+                )
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea()
+            .navigationBarBackButtonHidden(true)
+            .toolbar(.hidden, for: .automatic)
         }
+    }
+
+    private func openDetail(_ route: MainDetailRoute) {
+        detailPath = [route]
+        clearSelectedDetailBindings()
+    }
+
+    private func popDetail() {
+        if !detailPath.isEmpty {
+            detailPath.removeLast()
+        }
+        if detailPath.isEmpty {
+            clearSelectedDetailBindings()
+        }
+    }
+
+    private func clearSelectedDetailBindings() {
+        navigationState.selectedWallpaper = nil
+        navigationState.selectedMedia = nil
+        navigationState.selectedAnime = nil
+        navigationState.librarySelectedWallpaper = nil
+        navigationState.librarySelectedMedia = nil
+        navigationState.librarySelectedAnime = nil
     }
 
     private func zoomWindow() {
@@ -455,6 +495,7 @@ struct ContentView: View {
         viewModel.releaseForegroundMemory()
         mediaViewModel.releaseForegroundMemory()
         animeViewModel.releaseForegroundMemory()
+        detailPath.removeAll()
         navigationState.resetForMemoryRelease()
         showUpdateSheet = false
         updateRelease = nil
@@ -1709,6 +1750,8 @@ private struct MyMediaVideoCard: View {
     @State private var isHovered = false
     /// 异步生成抽帧后更新的本地封面 URL
     @State private var resolvedThumbnailURL: URL?
+    /// 缩略图刷新计数器（每次重新烘焙后递增，强制 KFImage 重新加载）
+    @State private var thumbnailRefreshID = 0
 
     private static let videoExtensions: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
 
@@ -1740,6 +1783,7 @@ private struct MyMediaVideoCard: View {
                         .scaledToFill()
                         .frame(width: LibraryCardMetrics.cardWidth, height: LibraryCardMetrics.thumbnailHeight)
                         .clipped()
+                        .id(thumbnailRefreshID)
 
                     // 左上角复选框（编辑模式下显示）
                     if isEditing {
@@ -1841,11 +1885,22 @@ private struct MyMediaVideoCard: View {
             }
         }
         .onAppear { triggerThumbnailIfNeeded() }
-        .onChange(of: localMediaFileURL) { _, _ in resolvedThumbnailURL = nil; triggerThumbnailIfNeeded() }
+        .onChange(of: localMediaFileURL) { _, _ in
+            thumbnailRefreshID &+= 1
+            resolvedThumbnailURL = nil
+            triggerThumbnailIfNeeded()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeThumbnailDidUpdate)) { notification in
             guard let updatedItemID = notification.object as? String,
                   updatedItemID == item.id else { return }
-            triggerThumbnailIfNeeded()
+            thumbnailRefreshID &+= 1
+            resolvedThumbnailURL = nil
+            // 通知中的 thumbnailURL（新生成的海报 URL）优先使用，避免被旧的 thumbnailURL 卡住
+            if let posterURL = notification.userInfo?["thumbnailURL"] as? URL {
+                resolvedThumbnailURL = posterURL
+            } else {
+                triggerThumbnailIfNeeded()
+            }
         }
     }
 
@@ -1886,14 +1941,17 @@ private struct MyMediaVideoCard: View {
         // 尝试使用烘焙产物的 MP4 视频进行抽帧
         if let record = MediaLibraryService.shared.downloadRecords.first(where: { $0.item.id == item.id }),
            let bakedVideo = record.sceneBakeArtifact.flatMap({ $0.videoPath }).map({ URL(fileURLWithPath: $0) }),
-           FileManager.default.fileExists(atPath: bakedVideo.path) {
-            if let cached = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: bakedVideo) {
+           SceneOfflineBakeService.isUsableBakedVideo(at: bakedVideo) {
+            if let cached = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: item.id) {
                 resolvedThumbnailURL = cached
                 return
             }
             if Self.videoExtensions.contains(bakedVideo.pathExtension.lowercased()) {
                 Task { @MainActor in
-                    if let poster = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: bakedVideo) {
+                    if let poster = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                        forLocalVideo: bakedVideo,
+                        itemID: item.id
+                    ) {
                         resolvedThumbnailURL = poster
                     }
                 }

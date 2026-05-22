@@ -330,11 +330,16 @@ struct ArcAtmosphereBackground: View {
     let useNoise: Bool
     /// 颗粒度强度（0.0~1.0），控制噪点纹理的可见度
     let grainIntensity: Double
+    /// 动态壁纸正在播放或列表高速滚动时启用：减少大半径模糊、噪点与图片散射，降低 WindowServer/GPU 压力。
+    var lightweight: Bool = false
 
     /// 使用传入的 tint 颜色（来自各页首张卡片采样），让每个探索页背景色独立
     private var primaryGlow: Color { tint.primary }
     private var secondaryGlow: Color { tint.secondary }
     private var tertiaryGlow: Color { tint.tertiary }
+    private var primaryOpacity: Double { isLightMode ? 0.30 : 0.42 }
+    private var secondaryOpacity: Double { isLightMode ? 0.22 : 0.32 }
+    private var tertiaryOpacity: Double { isLightMode ? 0.16 : 0.24 }
 
     var body: some View {
         ZStack {
@@ -343,107 +348,75 @@ struct ArcAtmosphereBackground: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-            // 2. 图片散射光斑（大面积高斯模糊，营造高级光感）
-            if let referenceImage {
-                Image(nsImage: referenceImage)
-                    .resizable()
-                    .interpolation(.low)
-                    .aspectRatio(contentMode: .fill)
-                    .frame(minWidth: 160, minHeight: 160)
-                    .blur(radius: 60)
-                    .opacity(isLightMode ? 0.35 : 0.28)
-                    .saturation(isLightMode ? 1.3 : 1.6)
-                    .allowsHitTesting(false)
-            }
-
-            // 3. 多层散射光斑（非对称分布，模拟光的折射散射）
+            // 2. 轻量多层渐变：保留探索页氛围，但避免图片散射和大半径 blur 持续占用 GPU。
             GeometryReader { geo in
                 let w = geo.size.width
                 let h = geo.size.height
                 ZStack {
-                    // 主光斑 — 偏左上方，大面积弥散
-                    Ellipse()
-                        .fill(
-                            RadialGradient(
-                                colors: [primaryGlow.opacity(isLightMode ? 0.45 : 0.55), primaryGlow.opacity(0)],
-                                center: .center,
-                                startRadius: 0,
-                                endRadius: w * 0.5
-                            )
-                        )
-                        .frame(width: w * 1.1, height: h * 0.9)
-                        .blur(radius: 100)
-                        .offset(x: -w * 0.2, y: -h * 0.15)
+                    RadialGradient(
+                        colors: [
+                            primaryGlow.opacity(primaryOpacity),
+                            primaryGlow.opacity(primaryOpacity * 0.34),
+                            Color.clear
+                        ],
+                        center: .topLeading,
+                        startRadius: 10,
+                        endRadius: max(w, h) * 0.82
+                    )
 
-                    // 副光斑 — 偏右下
-                    Ellipse()
-                        .fill(
-                            RadialGradient(
-                                colors: [secondaryGlow.opacity(isLightMode ? 0.35 : 0.45), secondaryGlow.opacity(0)],
-                                center: .center,
-                                startRadius: 0,
-                                endRadius: w * 0.4
-                            )
-                        )
-                        .frame(width: w * 0.85, height: h * 0.75)
-                        .blur(radius: 90)
-                        .offset(x: w * 0.2, y: h * 0.2)
+                    RadialGradient(
+                        colors: [
+                            secondaryGlow.opacity(secondaryOpacity),
+                            secondaryGlow.opacity(secondaryOpacity * 0.30),
+                            Color.clear
+                        ],
+                        center: .bottomTrailing,
+                        startRadius: 12,
+                        endRadius: max(w, h) * 0.76
+                    )
 
-                    // 第三光斑 — 底部偏左
-                    Ellipse()
-                        .fill(
-                            RadialGradient(
-                                colors: [tertiaryGlow.opacity(isLightMode ? 0.25 : 0.35), tertiaryGlow.opacity(0)],
-                                center: .center,
-                                startRadius: 0,
-                                endRadius: w * 0.35
-                            )
-                        )
-                        .frame(width: w * 0.7, height: h * 0.6)
-                        .blur(radius: 80)
-                        .offset(x: -w * 0.1, y: h * 0.25)
+                    RadialGradient(
+                        colors: [
+                            tertiaryGlow.opacity(tertiaryOpacity),
+                            tertiaryGlow.opacity(tertiaryOpacity * 0.26),
+                            Color.clear
+                        ],
+                        center: UnitPoint(x: 0.22, y: 0.82),
+                        startRadius: 24,
+                        endRadius: max(w, h) * 0.58
+                    )
 
-                    // 小光斑 — 右上角点缀，增加层次
-                    Circle()
-                        .fill(
-                            RadialGradient(
-                                colors: [primaryGlow.opacity(isLightMode ? 0.15 : 0.22), Color.clear],
-                                center: .center,
-                                startRadius: 0,
-                                endRadius: w * 0.15
-                            )
-                        )
-                        .frame(width: w * 0.4, height: w * 0.4)
-                        .blur(radius: 50)
-                        .offset(x: w * 0.3, y: -h * 0.2)
+                    LinearGradient(
+                        colors: [
+                            primaryGlow.opacity(isLightMode ? 0.08 : 0.12),
+                            Color.clear,
+                            secondaryGlow.opacity(isLightMode ? 0.06 : 0.10)
+                        ],
+                        startPoint: .topTrailing,
+                        endPoint: .bottomLeading
+                    )
 
-                    // 中心柔光 — 柔和的整体提亮
-                    Ellipse()
-                        .fill(
-                            RadialGradient(
-                                colors: [
-                                    Color.white.opacity(isLightMode ? 0.06 : 0.04),
-                                    Color.clear
-                                ],
-                                center: .center,
-                                startRadius: w * 0.1,
-                                endRadius: w * 0.6
-                            )
-                        )
-                        .frame(width: w, height: h)
-                        .blur(radius: 60)
+                    RadialGradient(
+                        colors: [
+                            Color.white.opacity(isLightMode ? 0.10 : 0.05),
+                            Color.clear
+                        ],
+                        center: .center,
+                        startRadius: 0,
+                        endRadius: max(w, h) * 0.62
+                    )
                 }
             }
             .ignoresSafeArea()
             .allowsHitTesting(false)
 
-            // 4. 暗模式：顶部微光 + 底部渐暗，增加深度
+            // 3. 暗模式：顶部微光 + 底部渐暗，增加深度
             if !isLightMode {
                 LinearGradient(
                     colors: [
-                        Color.white.opacity(0.02),
+                        Color.white.opacity(0.03),
                         Color.clear,
-                        Color.black.opacity(0.20)
+                        Color.black.opacity(0.18)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
@@ -452,13 +425,13 @@ struct ArcAtmosphereBackground: View {
                 .allowsHitTesting(false)
             }
 
-            // 5. 点阵纹理
+            // 4. 点阵纹理
             ArcDotGridBackground(
                 isLightMode: isLightMode,
-                dotOpacity: 0.02 + dotGridOpacity * 0.03
+                dotOpacity: 0.012 + dotGridOpacity * 0.018
             )
 
-            // 6. 噪点纹理
+            // 5. 噪点纹理
             if useNoise {
                 GrainOverlay(opacity: grainIntensity * 0.20)
                 .blendMode(.softLight)

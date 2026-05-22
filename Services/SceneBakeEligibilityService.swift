@@ -88,7 +88,7 @@ struct SceneBakeEligibilitySnapshot: Codable, Hashable, Sendable {
 
     /// 是否值得走「预烘焙视频」策略。当前策略：所有 Scene 都允许烘焙，
     /// 动态元素（时钟、日期、音频可视化等）在烘焙前会被预处理排除，仅保留背景；
-    /// 被排除的元素由 App 侧 Web 叠加层复现。
+    /// 被排除的元素不写入离线 MP4。
     var isEligibleForOfflineBake: Bool {
         true
     }

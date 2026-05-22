@@ -47,21 +47,27 @@ targets:
       - path: Components
       - path: DesignSystem
       - path: Assets.xcassets
-      # 含 wallpaperengine-cli（材质已嵌入二进制尾部）、dylib、JSON 等；assets/ 仅用于构建 CLI，不复制进 .app
+      # 含 wallpaper-wgpu（新 Metal 渲染器）、wallpaperengine-cli（旧离线烘焙 renderer）、dxc、dylib 等；assets/ 用于构建时内嵌
       - path: Resources
         type: folder
         buildPhase: resources
         excludes:
           - assets
           - assets/**
+          - zip_data.s
+          - zip_data.o
+          - zip_accessor.c
+          - zip_accessor.o
       - path: AnimeRules
         type: folder
         buildPhase: resources
+      # 根目录源文件（未被以上子目录覆盖）
+      - path: WallpaperEngineEmbeddedAssets.swift
     settings:
       base:
         PRODUCT_NAME: WaifuX
         PRODUCT_BUNDLE_IDENTIFIER: com.waifux.app
-        MARKETING_VERSION: 38.0.103
+        MARKETING_VERSION: 38.0.104
         CURRENT_PROJECT_VERSION: 38
         SWIFT_VERSION: "6.0"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -71,10 +77,54 @@ targets:
         INFOPLIST_FILE: App/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS: $(inherited) @executable_path/../Frameworks
+        # 内嵌 assets zip 的 .o 文件（由 preBuildScript 生成）
+        OTHER_LDFLAGS: $(inherited) $(SRCROOT)/Resources/zip_data.o $(SRCROOT)/Resources/zip_accessor.o
     dependencies:
       - package: SwiftSoup
       - package: Kanna
       - package: Kingfisher
+    preBuildScripts:
+      - name: Embed Assets
+        basedOnDependencyAnalysis: false
+        script: |
+          cd "$SRCROOT"
+          TMP_ZIP="/tmp/waifux-embedded-assets-$$.zip"
+          rm -f "$TMP_ZIP"
+          if [ -d "Resources/assets" ] && [ -n "$(ls -A Resources/assets 2>/dev/null)" ]; then
+            (cd Resources && zip -r -q "$TMP_ZIP" assets)
+          else
+            echo -n > "$TMP_ZIP"
+          fi
+          cat > Resources/zip_data.s << EOF
+            .globl _zip_data_start
+            .globl _zip_data_end
+          _zip_data_start:
+            .incbin "$TMP_ZIP"
+          _zip_data_end:
+          EOF
+          cat > Resources/zip_accessor.c << 'EOF'
+          #include <stdint.h>
+          #include <stddef.h>
+          extern uint8_t zip_data_start[];
+          extern uint8_t zip_data_end[];
+          uint8_t* get_zip_data_ptr(void) { return zip_data_start; }
+          size_t get_zip_data_size(void) { return (size_t)(zip_data_end - zip_data_start); }
+          EOF
+          EMBED_ARCHS=(arm64 x86_64)
+          DATA_OBJECTS=()
+          ACCESSOR_OBJECTS=()
+          for ARCH in "${EMBED_ARCHS[@]}"; do
+            DATA_OBJECT="Resources/zip_data.${ARCH}.o"
+            ACCESSOR_OBJECT="Resources/zip_accessor.${ARCH}.o"
+            as -arch "$ARCH" -mmacosx-version-min=14.0 Resources/zip_data.s -o "$DATA_OBJECT"
+            clang -arch "$ARCH" -c -mmacosx-version-min=14.0 Resources/zip_accessor.c -o "$ACCESSOR_OBJECT"
+            DATA_OBJECTS+=("$DATA_OBJECT")
+            ACCESSOR_OBJECTS+=("$ACCESSOR_OBJECT")
+          done
+          lipo -create "${DATA_OBJECTS[@]}" -output Resources/zip_data.o
+          lipo -create "${ACCESSOR_OBJECTS[@]}" -output Resources/zip_accessor.o
+          rm -f "${DATA_OBJECTS[@]}" "${ACCESSOR_OBJECTS[@]}"
+          rm -f "$TMP_ZIP"
     postBuildScripts:
       - basedOnDependencyAnalysis: false
         script: |
@@ -112,27 +162,76 @@ targets:
           fi
       - basedOnDependencyAnalysis: false
         script: |
-          # 修复 Resources/Resources/lib/ 中 dylib 的 @@HOMEBREW_ 占位符路径
-          WE_LIB_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib"
-          if [[ -d "$WE_LIB_DIR" ]]; then
-            for f in "$WE_LIB_DIR"/*.dylib; do
+          # 修复旧 wallpaperengine-cli 相关 dylib 的 @@HOMEBREW_ 占位符路径
+          CLI_LIB_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib"
+          if [[ -d "$CLI_LIB_DIR" ]]; then
+            for f in "$CLI_LIB_DIR"/*.dylib; do
               [[ -L "$f" ]] && continue
               [[ ! -f "$f" ]] && continue
-              while IFS= read -r line; do
+              otool -L "$f" 2>/dev/null | tail -n +2 | while IFS= read -r line; do
                 dep_path=$(echo "$line" | awk '{print $1}')
                 if [[ "$dep_path" == *"@@HOMEBREW_CELLAR@@"* ]] || [[ "$dep_path" == *"@@HOMEBREW_PREFIX@@"* ]]; then
                   dep_base=$(basename "$dep_path")
-                  echo "fix-dylib: $(basename "$f") — ${dep_path} -> @loader_path/${dep_base}"
+                  echo "fix-dylib-cli: $(basename "$f") — ${dep_path} -> @loader_path/${dep_base}"
                   install_name_tool -change "$dep_path" "@loader_path/$dep_base" "$f" 2>/dev/null || true
                 fi
-              done < <(otool -L "$f" 2>/dev/null | tail -n +2)
+              done
             done
-            for f in "$WE_LIB_DIR"/*.dylib; do
+            for f in "$CLI_LIB_DIR"/*.dylib; do
               [[ -L "$f" ]] && continue
               [[ ! -f "$f" ]] && continue
               codesign --force -s - "$f" 2>/dev/null || true
             done
           fi
+
+          # Resources/assets 已通过 zip_data.o 嵌入主程序，不能再作为普通资源复制进 .app。
+          # Xcode 的 folder reference 会保留整棵 Resources 目录，这里清掉仅用于构建的产物，避免包体重复膨胀。
+          BUNDLED_RESOURCES_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources"
+          if [[ -d "$BUNDLED_RESOURCES_DIR" ]]; then
+            rm -rf "$BUNDLED_RESOURCES_DIR/assets"
+            rm -f "$BUNDLED_RESOURCES_DIR"/zip_data.s \
+                  "$BUNDLED_RESOURCES_DIR"/zip_data.o \
+                  "$BUNDLED_RESOURCES_DIR"/zip_accessor.c \
+                  "$BUNDLED_RESOURCES_DIR"/zip_accessor.o
+          fi
+
+          sign_file_if_present() {
+            local f="$1"
+            if [[ -f "$f" ]]; then
+              codesign --force -s - "$f" 2>/dev/null || true
+            fi
+          }
+
+          # Xcode folder reference 可能复制为 Contents/Resources/Resources/...；
+          # 本地 Run 也要覆盖扁平与嵌套两种布局，避免只有打包脚本签名成功。
+          for DXC_BIN in \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/dxc" \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/dxc"; do
+            if [[ -f "$DXC_BIN" ]]; then
+              install_name_tool -add_rpath "@loader_path/lib" "$DXC_BIN" 2>/dev/null || true
+              install_name_tool -add_rpath "@loader_path/../lib" "$DXC_BIN" 2>/dev/null || true
+              sign_file_if_present "$DXC_BIN"
+            fi
+          done
+
+          for WGPU_BIN in \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaper-wgpu" \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaper-wgpu"; do
+            sign_file_if_present "$WGPU_BIN"
+          done
+
+          for CLI_BIN in \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaperengine-cli" \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaperengine-cli" \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/wallpaperengine-cli"; do
+            sign_file_if_present "$CLI_BIN"
+          done
+
+          for DXC_LIB in \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/lib/libdxcompiler.dylib" \
+            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib/libdxcompiler.dylib"; do
+            sign_file_if_present "$DXC_LIB"
+          done
     entitlements:
       path: WaifuX.entitlements
       properties:

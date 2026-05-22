@@ -137,6 +137,7 @@ jobs:
                     --sign "${{ vars.APPLE_SIGNING_IDENTITY }}" build/WaifuX.app
 
                   # 重新打包进 DMG
+                  set +e
                   create-dmg \
                     --volname "WaifuX" \
                     --window-size 540 400 \
@@ -145,6 +146,17 @@ jobs:
                     --no-internet-enable \
                     build/WaifuX.dmg \
                     build/WaifuX.app
+                  CREATE_DMG_STATUS=$?
+                  set -e
+                  if [ $CREATE_DMG_STATUS -ne 0 ]; then
+                    echo "⚠️ create-dmg failed, falling back to hdiutil..."
+                    rm -f build/WaifuX.dmg build/rw.*.WaifuX.dmg
+                    hdiutil create -volname "WaifuX" \
+                      -srcfolder build/WaifuX.app \
+                      -ov -format UDZO \
+                      -imagekey zlib-level=9 \
+                      build/WaifuX.dmg
+                  fi
 
                   # 提交公证
                   echo "Submitting for notarization..."
@@ -199,6 +211,7 @@ jobs:
                     -configuration Release \
                     -derivedDataPath build \
                     SWIFT_STRICT_CONCURRENCY=minimal \
+                    DEBUG_INFORMATION_FORMAT=dwarf \
                     CODE_SIGNING_REQUIRED=NO \
                     CODE_SIGNING_ALLOWED=NO \
                     clean build
@@ -214,6 +227,7 @@ jobs:
                     -configuration Release \
                     -derivedDataPath build \
                     SWIFT_STRICT_CONCURRENCY=minimal \
+                    DEBUG_INFORMATION_FORMAT=dwarf \
                     CODE_SIGNING_REQUIRED=NO \
                     CODE_SIGNING_ALLOWED=NO \
                     clean build

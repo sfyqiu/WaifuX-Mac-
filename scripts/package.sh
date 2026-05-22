@@ -13,41 +13,98 @@ APP_NAME="WaifuX.app"
 echo "📦 WaifuX 打包开始..."
 echo "项目目录: $PROJECT_DIR"
 
-# CLI 默认使用仓库里已提交的 Resources/wallpaperengine-cli（本地构建后提交）。
-# 若该文件不存在，或设置 WAIFUX_FORCE_CLI_REBUILD=1，则尝试 ensure assets 并执行 build 脚本。
+require_packaged_file() {
+  local path="$1"
+  local label="$2"
+  if [[ ! -f "$path" ]]; then
+    echo "❌ 缺少 $label: $path"
+    exit 1
+  fi
+}
+
+# wallpaper-wgpu + DXC 部署（使用仓库里已提交的 Resources/wallpaper-wgpu）。
+# 若该文件不存在，或设置 WAIFUX_FORCE_WGPU_REBUILD=1，则执行 build 脚本。
+WGPU_BIN="$PROJECT_DIR/Resources/wallpaper-wgpu"
+if [[ ! -f "$WGPU_BIN" ]] || [[ -n "${WAIFUX_FORCE_WGPU_REBUILD:-}" ]]; then
+  if [[ -f "$PROJECT_DIR/scripts/build-wallpaper-wgpu.sh" ]]; then
+    echo "🔧 部署 wallpaper-wgpu + DXC + 内嵌 assets..."
+    chmod +x "$PROJECT_DIR/scripts/build-wallpaper-wgpu.sh"
+    WAIFUX_FORCE_EMBED_ASSETS=1 "$PROJECT_DIR/scripts/build-wallpaper-wgpu.sh"
+  fi
+else
+  echo "🔧 使用已提交的 $WGPU_BIN（跳过部署）。若需重部署请设 WAIFUX_FORCE_WGPU_REBUILD=1"
+  # 即使使用已提交的 binary，也要确保内嵌 assets .o 是最新的
+  if [[ -f "$PROJECT_DIR/scripts/build-wallpaper-wgpu.sh" ]]; then
+    chmod +x "$PROJECT_DIR/scripts/build-wallpaper-wgpu.sh"
+    "$PROJECT_DIR/scripts/build-wallpaper-wgpu.sh"
+	  fi
+	fi
+
+require_packaged_file "$PROJECT_DIR/Resources/wallpaper-wgpu" "wallpaper-wgpu"
+require_packaged_file "$PROJECT_DIR/Resources/dxc" "dxc"
+require_packaged_file "$PROJECT_DIR/Resources/lib/libdxcompiler.dylib" "libdxcompiler.dylib"
+
+# 旧 wallpaperengine-cli 仅作为离线烘焙的可选 renderer 2 保留。
+# 实时设置壁纸仍走 wallpaper-wgpu。
 CLI_BIN="$PROJECT_DIR/Resources/wallpaperengine-cli"
-if [[ ! -f "$CLI_BIN" ]] || [[ -n "${WAIFUX_FORCE_CLI_REBUILD:-}" ]]; then
+CLI_REBUILD_REASON=""
+if [[ ! -f "$CLI_BIN" ]]; then
+  CLI_REBUILD_REASON="missing binary"
+elif [[ -n "${WAIFUX_FORCE_CLI_REBUILD:-}" ]]; then
+  CLI_REBUILD_REASON="WAIFUX_FORCE_CLI_REBUILD"
+elif [[ "$PROJECT_DIR/wallpaperengine-cli.swift" -nt "$CLI_BIN" ]]; then
+  CLI_REBUILD_REASON="wallpaperengine-cli.swift changed"
+elif [[ "$PROJECT_DIR/WallpaperEngineEmbeddedAssets.swift" -nt "$CLI_BIN" ]]; then
+  CLI_REBUILD_REASON="WallpaperEngineEmbeddedAssets.swift changed"
+elif [[ "$PROJECT_DIR/Resources/lib/liblinux-wallpaperengine-renderer.dylib" -nt "$CLI_BIN" ]]; then
+  CLI_REBUILD_REASON="liblinux-wallpaperengine-renderer.dylib changed"
+elif [[ -d "$PROJECT_DIR/Resources/assets" ]] && [[ -n "$(find "$PROJECT_DIR/Resources/assets" -type f -newer "$CLI_BIN" -print -quit 2>/dev/null)" ]]; then
+  CLI_REBUILD_REASON="Resources/assets changed"
+fi
+
+if [[ -n "$CLI_REBUILD_REASON" ]]; then
+  echo "🔧 构建 wallpaperengine-cli（renderer 2 离线烘焙用，原因：$CLI_REBUILD_REASON）..."
   if [[ -f "$PROJECT_DIR/scripts/ensure-wallpaperengine-assets.sh" ]]; then
     chmod +x "$PROJECT_DIR/scripts/ensure-wallpaperengine-assets.sh"
     "$PROJECT_DIR/scripts/ensure-wallpaperengine-assets.sh"
   fi
   if [[ -f "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh" ]]; then
-    echo "🔧 构建 wallpaperengine-cli（内嵌 assets）..."
+    echo "🔧 构建 wallpaperengine-cli（renderer 2 离线烘焙用）..."
     chmod +x "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh"
     "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh"
   fi
 else
-  echo "🔧 使用已提交的 $CLI_BIN（跳过 CLI 构建）。若需重编请设 WAIFUX_FORCE_CLI_REBUILD=1"
+  echo "🔧 使用已提交的 $CLI_BIN（跳过旧 CLI 构建）。若需重编请设 WAIFUX_FORCE_CLI_REBUILD=1"
 fi
 
-# 捆绑 Homebrew dylib 依赖（无论 CLI 是否重建都需要确保依赖路径正确）
-echo "📚 捆绑 dylib 依赖..."
+require_packaged_file "$PROJECT_DIR/Resources/wallpaperengine-cli" "wallpaperengine-cli"
+require_packaged_file "$PROJECT_DIR/Resources/lib/liblinux-wallpaperengine-renderer.dylib" "liblinux-wallpaperengine-renderer.dylib"
+
+# 捆绑并修复旧 CLI 的 Homebrew dylib 依赖。
+echo "📚 检查旧 CLI dylib 依赖..."
 if [[ -f "$PROJECT_DIR/scripts/bundle-dylibs.py" && -f "$PROJECT_DIR/Resources/lib/liblinux-wallpaperengine-renderer.dylib" ]]; then
   python3 "$PROJECT_DIR/scripts/bundle-dylibs.py" \
     "$PROJECT_DIR/Resources/lib/liblinux-wallpaperengine-renderer.dylib" \
     "$PROJECT_DIR/Resources/lib"
-  # 重新签名
-  for f in "$PROJECT_DIR"/Resources/lib/*.dylib; do
-    codesign --force -s - "$f" 2>/dev/null || true
-  done
   install_name_tool -id "@rpath/liblinux-wallpaperengine-renderer.dylib" \
     "$PROJECT_DIR/Resources/lib/liblinux-wallpaperengine-renderer.dylib" 2>/dev/null || true
-  codesign --force -s - \
-    "$PROJECT_DIR/Resources/lib/liblinux-wallpaperengine-renderer.dylib" 2>/dev/null || true
-  echo "✅ dylib 依赖捆绑完成"
 else
-  echo "⚠️ 跳过 dylib 捆绑（bundle-dylibs.py 或渲染器 dylib 不存在）"
+  echo "⚠️ 跳过旧 CLI dylib 捆绑（bundle-dylibs.py 或 renderer dylib 不存在）"
 fi
+
+# 签名 wallpaper-wgpu、旧 CLI、dxc 及二者依赖
+echo "🔏 签名渲染器二进制..."
+for f in "$PROJECT_DIR"/Resources/wallpaper-wgpu \
+         "$PROJECT_DIR"/Resources/wallpaperengine-cli \
+         "$PROJECT_DIR"/wallpaperengine-cli \
+         "$PROJECT_DIR"/Resources/dxc \
+         "$PROJECT_DIR"/Resources/lib/*.dylib \
+         "$PROJECT_DIR"/Resources/lib/Python; do
+  if [[ -f "$f" ]]; then
+    codesign --force -s - "$f" 2>/dev/null || true
+  fi
+done
+echo "✅ 签名完成"
 
 # 清理旧构建
 echo "🧹 清理旧构建..."
@@ -60,6 +117,7 @@ xcodebuild -scheme WaifuX -configuration Release clean archive \
   CODE_SIGN_IDENTITY="-" \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGNING_ALLOWED=NO \
+  DEBUG_INFORMATION_FORMAT=dwarf \
   -archivePath "$BUILD_DIR/$ARCHIVE_NAME" 2>&1 | tee "$BUILD_DIR/archive.log"
 
 ARCHIVE_STATUS=${PIPESTATUS[0]}
@@ -101,10 +159,76 @@ fi
 
 echo "✅ 导出成功"
 
+find_codesign_identity() {
+  if [[ -n "${WAIFUX_CODESIGN_IDENTITY:-}" ]]; then
+    echo "$WAIFUX_CODESIGN_IDENTITY"
+    return 0
+  fi
+
+  local identity
+  identity="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' \
+    | head -n 1)"
+  if [[ -n "$identity" ]]; then
+    echo "$identity"
+    return 0
+  fi
+
+  identity="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' \
+    | head -n 1)"
+  if [[ -n "$identity" ]]; then
+    echo "$identity"
+    return 0
+  fi
+
+  echo "-"
+}
+
+sign_exported_app() {
+  local app_path="$1"
+  local identity="$2"
+  local entitlements="$PROJECT_DIR/WaifuX.entitlements"
+
+  echo "🔏 正在签名导出的 App..."
+  if [[ "$identity" == "-" ]]; then
+    echo "⚠️ 未找到 Developer ID / Apple Development 证书，将使用 ad-hoc 签名；屏幕录制权限可能需要重新授权。"
+  else
+    echo "签名身份: $identity"
+  fi
+
+  while IFS= read -r code_path; do
+    codesign --force --timestamp=none --options runtime -s "$identity" "$code_path" 2>/dev/null || \
+      codesign --force -s "$identity" "$code_path"
+  done < <(
+    find "$app_path/Contents/Resources" -type f \( -perm -111 -o -name "*.dylib" \) -print 2>/dev/null \
+      | while IFS= read -r candidate; do
+          if file "$candidate" | grep -q "Mach-O"; then
+            echo "$candidate"
+          fi
+        done
+  )
+
+  if [[ -f "$entitlements" ]]; then
+    codesign --force --timestamp=none --options runtime --entitlements "$entitlements" -s "$identity" "$app_path" 2>/dev/null || \
+      codesign --force --options runtime --entitlements "$entitlements" -s "$identity" "$app_path"
+  else
+    codesign --force --timestamp=none --options runtime -s "$identity" "$app_path" 2>/dev/null || \
+      codesign --force --options runtime -s "$identity" "$app_path"
+  fi
+
+  codesign --verify --deep --strict --verbose=2 "$app_path"
+  echo "✅ App 签名验证通过"
+}
+
+SIGN_IDENTITY="$(find_codesign_identity)"
+sign_exported_app "$BUILD_DIR/$APP_NAME" "$SIGN_IDENTITY"
+
 # 仅在非签名流程时创建 DMG（签名流程由 CI 另行处理）
 if [ "${WAIFUX_SKIP_DMG:-}" != "1" ]; then
   echo "💿 正在创建 DMG..."
   if command -v create-dmg &> /dev/null; then
+      set +e
       create-dmg \
         --volname "WaifuX" \
         --window-size 540 400 \
@@ -113,6 +237,17 @@ if [ "${WAIFUX_SKIP_DMG:-}" != "1" ]; then
         --no-internet-enable \
         "$BUILD_DIR/$DMG_NAME" \
         "$BUILD_DIR/$APP_NAME"
+      CREATE_DMG_STATUS=$?
+      set -e
+      if [ $CREATE_DMG_STATUS -ne 0 ]; then
+          echo "⚠️ create-dmg 失败，使用 hdiutil 生成标准 DMG..."
+          rm -f "$BUILD_DIR/$DMG_NAME" "$BUILD_DIR"/rw.*."$DMG_NAME"
+          hdiutil create -volname "WaifuX" \
+            -srcfolder "$BUILD_DIR/$APP_NAME" \
+            -ov -format UDZO \
+            -imagekey zlib-level=9 \
+            "$BUILD_DIR/$DMG_NAME"
+      fi
   else
       echo "⚠️ create-dmg 未安装，使用 hdiutil..."
       hdiutil create -volname "WaifuX" \

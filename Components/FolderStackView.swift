@@ -62,6 +62,7 @@ struct LibraryFolderCard: View {
     let previewURLs: [URL]
     let itemCount: Int
     let cardWidth: CGFloat
+    let isEditing: Bool
     let onTap: () -> Void
     let onDrop: ([String]) -> Void
     let onDisband: () -> Void
@@ -139,15 +140,11 @@ struct LibraryFolderCard: View {
             }
         }
         .dropDestination(for: String.self) { strings, _ in
-            let ids = strings.compactMap { str -> String? in
-                if str.hasPrefix("waifux:item:") {
-                    return String(str.dropFirst(12))
-                }
-                return nil
+            let ids = uniqueIDs(strings.flatMap(parseDropPayload))
+            guard !ids.isEmpty else {
+                return false
             }
-            if !ids.isEmpty {
-                onDrop(ids)
-            }
+            onDrop(ids)
             return true
         } isTargeted: { isTargeted in
             isDropTarget = isTargeted
@@ -164,6 +161,35 @@ struct LibraryFolderCard: View {
             Text("\(itemCount)")
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.7))
+        }
+    }
+
+    private func parseDropPayload(_ payload: String) -> [String] {
+        if payload.hasPrefix("waifux:items:") {
+            return String(payload.dropFirst(13))
+                .split(separator: "\n")
+                .map(String.init)
+                .filter { !$0.isEmpty }
+        }
+        if payload.hasPrefix("waifux:item:") {
+            return [String(payload.dropFirst(12))]
+        }
+        return []
+    }
+
+    private func uniqueIDs(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ids.filter { seen.insert($0).inserted }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func when<Content: View>(_ condition: Bool, transform: (Self) -> Content) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
         }
     }
 }

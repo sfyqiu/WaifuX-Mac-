@@ -3,30 +3,17 @@ import AppKit
 import Kingfisher
 @preconcurrency import Translation
 
+// MARK: - macOS 14 兼容：滚动加载更多哨兵
+
 private struct WallpaperLoadMoreSentinelMinYPreferenceKey: PreferenceKey {
     static let defaultValue: CGFloat = .greatestFiniteMagnitude
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-@MainActor
-private final class WallpaperExploreGridRuntimeState: ObservableObject {
-    var gridImagePrefetcher: Kingfisher.ImagePrefetcher?
-    var lastPrefetchCenterIndex: Int = -1
-    var lastPrefetchStartedAt: Date = .distantPast
-    var lastPrefetchURLs: Set<URL> = []
-
-    deinit {
-        gridImagePrefetcher?.stop()
-    }
-
-    func resetPrefetchState() {
-        gridImagePrefetcher?.stop()
-        lastPrefetchCenterIndex = -1
-        lastPrefetchStartedAt = .distantPast
-        lastPrefetchURLs.removeAll()
+        let next = nextValue()
+        // 只取最小值，且仅当显著变化时记录（避免同一帧多次更新警告）
+        if next < value {
+            value = next
+        }
     }
 }
 
@@ -41,8 +28,9 @@ struct WallpaperExploreContentView: View {
     var isVisible: Bool = true
     @StateObject private var exploreAtmosphere = ExploreAtmosphereController(wallpaperMode: true)
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
+    @ObservedObject private var videoWallpaperManager = VideoWallpaperManager.shared
+    @ObservedObject private var wallpaperEngineBridge = WallpaperEngineXBridge.shared
     @StateObject private var translationBridge = SearchTranslationBridge()
-    @StateObject private var gridRuntimeState = WallpaperExploreGridRuntimeState()
     init(viewModel: WallpaperViewModel, selectedWallpaper: Binding<Wallpaper?>, isVisible: Bool = true) {
         self._viewModel = ObservedObject(wrappedValue: viewModel)
         self._selectedWallpaper = selectedWallpaper
@@ -65,12 +53,6 @@ struct WallpaperExploreContentView: View {
     @State private var pendingSearchText: String?
     /// 氛围图仅在实际首张 id 变化时更新
     @State private var lastSyncedFirstWallpaperID: String?
-    @State private var gridScrollToTopToken = 0
-    @State private var gridReloadToken = 0
-    @State private var gridLayoutRefreshToken = 0
-    @State private var gridSavedScrollOffset: CGFloat = 0
-    @State private var gridContentHeight: CGFloat = 600
-
     @State private var loadMoreTask: Task<Void, Never>?
 
     @State private var showWallpaperURLSheet = false
@@ -78,8 +60,18 @@ struct WallpaperExploreContentView: View {
     @State private var isResolvingWallpaperURL = false
     @State private var wallpaperURLError: String?
 
+    /// 防抖：避免同一帧内多次 Preference 更新触发无限布局循环
+    @State private var sentinelDebounceTask: DispatchWorkItem?
+
     /// 缓存筛选后的列表，避免每次 body 重绘时对 `wallpapers` 全表过滤（Wallhaven 分类）
     @State private var visibleWallpapers: [Wallpaper] = []
+    @StateObject private var columnCache = ExploreColumnDistributionCache<Wallpaper>()
+    @State private var columnLayoutVersion = 0
+
+    private var shouldUseLightweightEffects: Bool {
+        (videoWallpaperManager.isVideoWallpaperActive && !videoWallpaperManager.isPaused) ||
+        (wallpaperEngineBridge.isControllingExternalEngine && !wallpaperEngineBridge.isExternalPaused)
+    }
 
     var body: some View {
         if #available(macOS 15.0, *) {
@@ -104,11 +96,12 @@ struct WallpaperExploreContentView: View {
                 } else {
                     ArcAtmosphereBackground(
                         tint: exploreAtmosphere.tint,
-                        referenceImage: exploreAtmosphere.referenceImage,
+                        referenceImage: shouldUseLightweightEffects ? nil : exploreAtmosphere.referenceImage,
                         isLightMode: arcSettings.isLightMode,
                         dotGridOpacity: arcSettings.dotGridOpacity,
                         useNoise: true,
-                        grainIntensity: arcSettings.exploreGrainWallpaper
+                        grainIntensity: arcSettings.exploreGrainWallpaper,
+                        lightweight: shouldUseLightweightEffects
                     )
                     .ignoresSafeArea()
                 }
@@ -139,14 +132,10 @@ struct WallpaperExploreContentView: View {
         .onChange(of: isVisible) { _, visible in
             if !visible {
                 pauseActivity()
+                columnCache.invalidate()
             } else {
-                gridRuntimeState.resetPrefetchState()
                 syncAtmosphereIfNeeded()
-                gridLayoutRefreshToken += 1
             }
-        }
-        .onChange(of: arcSettings.isLightMode) { _, _ in
-            gridReloadToken += 1
         }
         .onChange(of: searchText) { _, newValue in
             translationBridge.detectLanguage(for: newValue)
@@ -162,9 +151,6 @@ struct WallpaperExploreContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .wallpaperDataSourceChanged)) { _ in
             handleDataSourceChange()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
-            gridRuntimeState.resetPrefetchState()
         }
         .onChange(of: category) { _, _ in handleCategoryChange(); recomputeVisibleWallpapers(); syncAtmosphereIfNeeded() }
         .onChange(of: fourKCategory) { _, _ in handle4KCategoryChange() }
@@ -198,30 +184,11 @@ struct WallpaperExploreContentView: View {
                     .transition(.opacity.animation(.easeInOut(duration: 0.25)))
                 }
             } else {
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        ScrollToTopHelper(trigger: outerScrollToTopToken)
-                            .frame(height: 0)
-                        gridHeaderStack
-                        wallpaperGrid(config: gridConfig)
-                            .frame(height: max(gridContentHeight, 320))
-                        loadMoreSentinel
-                    }
-                    .padding(.horizontal, 28)
-                    .frame(width: width, alignment: .leading)
-                    .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
-                    .environment(\.arcIsLightMode, arcSettings.isLightMode)
+                if #available(macOS 15.0, *) {
+                    scrollViewModern(width: width, gridConfig: gridConfig)
+                } else {
+                    scrollViewLegacy(width: width, viewportHeight: viewportHeight, gridConfig: gridConfig)
                 }
-                .coordinateSpace(name: Self.scrollCoordinateSpaceName)
-                .onChange(of: viewModel.wallpapers.count) { _, count in
-                    if count > 60 { showScrollToTop = true }
-                }
-
-                .onPreferenceChange(WallpaperLoadMoreSentinelMinYPreferenceKey.self) { sentinelMinY in
-                    handleLoadMoreSentinelPosition(sentinelMinY, viewportHeight: viewportHeight)
-                }
-                .scrollDisabled(!isVisible)
-                .disabled(isInitialLoading || !isVisible)
             }
 
             // 底部加载状态卡片
@@ -252,6 +219,74 @@ struct WallpaperExploreContentView: View {
         .scrollDisabled(!isVisible)
     }
 
+    // MARK: - macOS 15+：使用 onScrollGeometryChange
+
+    @available(macOS 15.0, *)
+    private func scrollViewModern(width: CGFloat, gridConfig: WallpaperGridConfig) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                ScrollToTopHelper(trigger: outerScrollToTopToken)
+                    .frame(height: 0)
+                gridHeaderStack
+                wallpaperGrid(config: gridConfig)
+            }
+            .padding(.horizontal, 28)
+            .frame(width: width, alignment: .leading)
+            .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
+            .environment(\.arcIsLightMode, arcSettings.isLightMode)
+        }
+        .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+        .onChange(of: viewModel.wallpapers.count) { _, count in
+            columnLayoutVersion &+= 1
+            if count > 60 { showScrollToTop = true }
+        }
+        .onScrollGeometryChange(for: CGFloat.self, of: { geometry in
+            let bottomOffset = geometry.contentOffset.y + geometry.containerSize.height
+            return geometry.contentSize.height - bottomOffset
+        }, action: { _, distanceFromBottom in
+            guard isVisible, distanceFromBottom.isFinite else { return }
+            if distanceFromBottom <= Self.loadMoreTriggerThreshold {
+                triggerLoadMore()
+            }
+        })
+        .scrollDisabled(!isVisible)
+        .disabled(isInitialLoading || !isVisible)
+    }
+
+    // MARK: - macOS 14：使用 PreferenceKey + 防抖
+
+    private func scrollViewLegacy(width: CGFloat, viewportHeight: CGFloat, gridConfig: WallpaperGridConfig) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                ScrollToTopHelper(trigger: outerScrollToTopToken)
+                    .frame(height: 0)
+                gridHeaderStack
+                wallpaperGrid(config: gridConfig)
+                loadMoreSentinel
+            }
+            .padding(.horizontal, 28)
+            .frame(width: width, alignment: .leading)
+            .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
+            .environment(\.arcIsLightMode, arcSettings.isLightMode)
+        }
+        .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+        .onChange(of: viewModel.wallpapers.count) { _, count in
+            columnLayoutVersion &+= 1
+            if count > 60 { showScrollToTop = true }
+        }
+        .onPreferenceChange(WallpaperLoadMoreSentinelMinYPreferenceKey.self) { sentinelMinY in
+            sentinelDebounceTask?.cancel()
+            let task = DispatchWorkItem { [self] in
+                guard !Task.isCancelled else { return }
+                self.handleLoadMoreSentinelPosition(sentinelMinY, viewportHeight: viewportHeight)
+            }
+            sentinelDebounceTask = task
+            DispatchQueue.main.async(execute: task)
+        }
+        .scrollDisabled(!isVisible)
+        .disabled(isInitialLoading || !isVisible)
+    }
+
     private var scrollToTopButton: some View {
         VStack {
             Spacer()
@@ -259,7 +294,6 @@ struct WallpaperExploreContentView: View {
                 Spacer()
                 if showScrollToTop {
                     Button {
-                        gridScrollToTopToken += 1
                         outerScrollToTopToken += 1
                     } label: {
                         Image(systemName: "arrow.up")
@@ -584,159 +618,41 @@ struct WallpaperExploreContentView: View {
     // MARK: - Grid & Cards
 
     private func wallpaperGrid(config: WallpaperGridConfig) -> some View {
-        ExploreGridContainer(
-            itemCount: { visibleWallpapers.count },
-            aspectRatio: { index in
-                guard index < visibleWallpapers.count else {
-                    return wallpaperCellAspectRatio(config: config)
+        let columnItems = distributeItemsToColumns(config: config)
+
+        return HStack(alignment: .top, spacing: config.spacing) {
+            ForEach(0..<config.columnCount, id: \.self) { columnIndex in
+                let items = columnItems[safe: columnIndex] ?? []
+                LazyVStack(spacing: config.spacing) {
+                    ForEach(items) { wallpaper in
+                        WallpaperCardView(
+                            wallpaper: wallpaper,
+                            isFavorite: viewModel.isFavorite(wallpaper),
+                            cardWidth: config.cardWidth
+                        ) {
+                            if let index = visibleWallpapers.firstIndex(where: { $0.id == wallpaper.id }) {
+                                selectedWallpaper = visibleWallpapers[index]
+                            }
+                        }
+                    }
                 }
-                return wallpaperCellAspectRatio(for: visibleWallpapers[index], config: config)
-            },
-            configureCell: { cell, index in
-                guard index < visibleWallpapers.count else { return }
-                cell.configure(
-                    with: visibleWallpapers[index],
-                    isFavorite: viewModel.isFavorite(visibleWallpapers[index])
-                )
-            },
-            cellClass: WallpaperGridCell.self,
-            onSelect: { index in
-                guard index < visibleWallpapers.count else { return }
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                    selectedWallpaper = visibleWallpapers[index]
-                }
-            },
-            onVisibleItemsChange: { indexPaths in
-                preloadVisibleNeighborhood(indexPaths: indexPaths, config: config)
-            },
-            onScrollOffsetChange: { offset in
-                gridSavedScrollOffset = offset
-            },
-            onReachBottom: triggerLoadMore,
-            scrollToTopToken: gridScrollToTopToken,
-            reloadToken: gridReloadToken,
-            layoutRefreshToken: gridLayoutRefreshToken,
-            allowsScrolling: false,
-            onContentHeightChange: { height in
-                if abs(gridContentHeight - height) > 0.5 {
-                    gridContentHeight = height
-                }
-            },
-            isVisible: isVisible,
-            layoutWidth: config.contentWidth,
-            gridColumnCount: config.columnCount,
-            hoverExpansionAllowance: 8
-        )
-    }
-
-    private func wallpaperCellAspectRatio(config: WallpaperGridConfig) -> CGFloat {
-        let safeCardWidth = max(1, config.cardWidth)
-        let height = safeCardWidth * 0.6 + 46
-        return safeCardWidth / max(1, height)
-    }
-
-    private func wallpaperCellAspectRatio(for wallpaper: Wallpaper, config: WallpaperGridConfig) -> CGFloat {
-        let safeCardWidth = max(1, config.cardWidth)
-        let imageAspectRatio = CGFloat(wallpaper.effectiveAspectRatioValue)
-        let clampedImageAspectRatio = min(max(imageAspectRatio, 0.35), 3.6)
-        let imageHeight = safeCardWidth / clampedImageAspectRatio
-        let height = imageHeight + 46
-        return safeCardWidth / max(1, height)
-    }
-
-    private func preloadVisibleNeighborhood(indexPaths: Set<IndexPath>, config: WallpaperGridConfig) {
-        let visibleIndices = indexPaths
-            .map(\.item)
-            .filter { $0 >= 0 && $0 < visibleWallpapers.count }
-            .sorted()
-        guard let center = visibleIndices.dropFirst(visibleIndices.count / 2).first,
-              center < visibleWallpapers.count else { return }
-        preloadNearbyImages(centerIndex: center, config: config)
-    }
-
-    /// 智能预加载附近图片（前后各 8 张）；中心索引节流，减少快速滑动时 Prefetcher 抖动。
-    /// 预取不应用降采样处理器，让 Cell 按自身动态尺寸从磁盘缓存读取原始图并处理。
-    private func preloadNearbyImages(centerIndex index: Int, config: WallpaperGridConfig) {
-        let items = visibleWallpapers
-        guard index >= 0, index < items.count else { return }
-        let centerDelta = gridRuntimeState.lastPrefetchCenterIndex >= 0
-            ? abs(index - gridRuntimeState.lastPrefetchCenterIndex)
-            : Int.max
-        let now = Date()
-        if centerDelta < 8 { return }
-        if now.timeIntervalSince(gridRuntimeState.lastPrefetchStartedAt) < 0.24, centerDelta < 16 {
-            return
+                .frame(width: config.cardWidth)
+            }
         }
-
-        let count = items.count
-        guard count > 0 else { return }
-        let clamped = min(max(0, index), count - 1)
-        let lower = max(0, clamped - 8)
-        let upper = min(count, clamped + 9)
-        guard lower < upper else { return }
-        let range = lower..<upper
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        let urls = range
-            .filter { $0 != clamped }
-            .flatMap { prefetchCandidateURLs(for: items[$0], config: config, scale: scale) }
-        let urlSet = Set(urls)
-        guard !urlSet.isEmpty, urlSet != gridRuntimeState.lastPrefetchURLs else { return }
-
-        // 停止旧预取器，启动新预取器（Kingfisher 内部队列执行，不阻塞主线程）
-        gridRuntimeState.gridImagePrefetcher?.stop()
-        gridRuntimeState.lastPrefetchCenterIndex = index
-        gridRuntimeState.lastPrefetchStartedAt = now
-        gridRuntimeState.lastPrefetchURLs = urlSet
-        // 不应用 DownsamplingImageProcessor：Cell 按各自动态尺寸处理，
-        // 预取仅负责把原始图下载到 Kingfisher 磁盘缓存即可。
-        let prefetcher = ImagePrefetcher(
-            urls: urls,
-            options: [
-                .scaleFactor(scale),
-                .backgroundDecode
-            ]
-        )
-        gridRuntimeState.gridImagePrefetcher = prefetcher
-        prefetcher.start()
     }
 
-    private func prefetchCandidateURLs(
-        for wallpaper: Wallpaper,
-        config: WallpaperGridConfig,
-        scale: CGFloat
-    ) -> [URL] {
-        let cardWidth = max(1, config.cardWidth)
-        let aspectRatio = min(max(CGFloat(wallpaper.effectiveAspectRatioValue), 0.35), 3.6)
-        let imageHeight = cardWidth / aspectRatio
-        let targetWidth = cardWidth * scale
-        let targetHeight = imageHeight * scale
-        let targetMaxEdge = min(max(targetWidth, targetHeight), 1280)
-        let isExtremeAspect = aspectRatio < 0.7 || aspectRatio > 2.1
-        let prefersHighResFirst = targetMaxEdge >= 900 || isExtremeAspect
-
-        let candidates: [URL?]
-        if prefersHighResFirst {
-            candidates = [
-                wallpaper.originalThumbURL,
-                wallpaper.fullImageURL,
-                wallpaper.thumbURL
-            ]
-        } else {
-            candidates = [
-                wallpaper.thumbURL,
-                wallpaper.originalThumbURL
-            ]
+    /// 瀑布流：将壁纸分配到最短列
+    private func distributeItemsToColumns(config: WallpaperGridConfig) -> [[Wallpaper]] {
+        columnCache.columns(
+            for: visibleWallpapers,
+            version: columnLayoutVersion,
+            columnCount: config.columnCount,
+            cardWidth: config.cardWidth,
+            spacing: config.spacing
+        ) { wallpaper in
+            let aspectRatio = min(max(CGFloat(wallpaper.effectiveAspectRatioValue), 0.35), 3.6)
+            return config.cardWidth / aspectRatio + 46
         }
-
-        var seen: Set<String> = []
-        let deduplicated: [URL] = candidates.compactMap { url -> URL? in
-            guard let url else { return nil }
-            let key = url.absoluteString
-            guard seen.insert(key).inserted else { return nil }
-            return url
-        }
-
-        return Array(deduplicated.prefix(prefersHighResFirst ? 2 : 1))
     }
 
     // MARK: - UI Components
@@ -777,6 +693,8 @@ struct WallpaperExploreContentView: View {
             || viewModel.isLoading
         )
     }
+
+    // MARK: - macOS 14 滚动哨兵
 
     private var loadMoreSentinel: some View {
         GeometryReader { proxy in
@@ -838,7 +756,6 @@ struct WallpaperExploreContentView: View {
                 let start = Date()
                 await viewModel.search()
                 await MainActor.run {
-                    gridRuntimeState.resetPrefetchState()
                     recomputeVisibleWallpapers()
                     syncAtmosphereIfNeeded()
                     isInitialLoading = false
@@ -851,7 +768,6 @@ struct WallpaperExploreContentView: View {
                     ])
             }
         } else {
-            gridRuntimeState.resetPrefetchState()
             recomputeVisibleWallpapers()
             syncAtmosphereIfNeeded()
         }
@@ -1023,12 +939,11 @@ struct WallpaperExploreContentView: View {
 
     private func reloadData() {
         AppLogger.info(.wallpaper, "重新搜索：用户操作触发")
-        gridRuntimeState.resetPrefetchState()
         lastSyncedFirstWallpaperID = nil
         loadMoreFailed = false
         viewModel.errorMessage = nil
         // 不再手动清空 wallpapers，让旧数据保持在屏幕上直到 search() 一次性替换新数据，
-        // 避免根视图在 ExploreGridContainer 和 legacyScrollContent 之间来回切换导致的抖动。
+        // 避免根视图切换导致的抖动。
         Task {
             await viewModel.search()
             await MainActor.run {
@@ -1055,7 +970,6 @@ struct WallpaperExploreContentView: View {
         viewModel.selectedRatios = []
         viewModel.selectedResolutions = []
         viewModel.atleastResolution = nil
-        gridRuntimeState.resetPrefetchState()
         lastSyncedFirstWallpaperID = nil
         loadMoreFailed = false
         viewModel.errorMessage = nil
@@ -1076,7 +990,7 @@ struct WallpaperExploreContentView: View {
             newVisible = viewModel.wallpapers
         }
         visibleWallpapers = newVisible
-        gridReloadToken += 1
+        columnLayoutVersion &+= 1
     }
 
     private func syncAtmosphereIfNeeded() {
@@ -1093,7 +1007,6 @@ struct WallpaperExploreContentView: View {
     private func pauseActivity() {
         loadMoreTask?.cancel()
         loadMoreTask = nil
-        gridRuntimeState.resetPrefetchState()
         exploreAtmosphere.pause()
     }
 

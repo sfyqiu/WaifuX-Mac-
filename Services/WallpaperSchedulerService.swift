@@ -74,7 +74,7 @@ class WallpaperSchedulerService: ObservableObject {
     /// 为指定屏幕触发下一次壁纸更换（用于"播完即换"模式）
     private func triggerNextWallpaper(for screenID: String) {
         guard !isScreenLocked else { return }
-        guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {
+        guard NSScreen.screens.contains(where: { $0.wallpaperScreenIdentifier == screenID }) else {
             return
         }
         let displayConfig = config.resolvedDisplayConfig(for: screenID)
@@ -151,7 +151,9 @@ class WallpaperSchedulerService: ObservableObject {
             self.pendingCleanupWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self else { return }
+                let previousFingerprints = self.displayFingerprints
                 self.relinkDisplayConfigsByFingerprint()
+                self.relinkSchedulerStateByFingerprint(using: previousFingerprints)
                 self.cleanupOrphanedScreenState()
                 if self.isRunning {
                     self.scheduleNextChange()
@@ -230,6 +232,61 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
+    /// Re-maps per-screen scheduler state using the saved display fingerprint.
+    private func relinkSchedulerStateByFingerprint(using previousFingerprints: [String: String]) {
+        let currentScreens = NSScreen.screens
+        let currentScreenIDs = Set(currentScreens.map { $0.wallpaperScreenIdentifier })
+
+        var fingerprintToScreenID: [String: String] = [:]
+        for screen in currentScreens {
+            fingerprintToScreenID[screen.wallpaperScreenFingerprint] = screen.wallpaperScreenIdentifier
+        }
+
+        let orphanedIDs = Set(lastChangedItemIDs.keys)
+            .union(lastChangeTimes.keys)
+            .union(usedItemIDs.keys)
+            .subtracting(currentScreenIDs)
+        guard !orphanedIDs.isEmpty else { return }
+
+        var migratedCount = 0
+        for orphanedID in orphanedIDs {
+            guard let fingerprint = previousFingerprints[orphanedID],
+                  let newScreenID = fingerprintToScreenID[fingerprint],
+                  newScreenID != orphanedID else {
+                continue
+            }
+
+            if let value = lastChangedItemIDs.removeValue(forKey: orphanedID) {
+                if lastChangedItemIDs[newScreenID] == nil {
+                    lastChangedItemIDs[newScreenID] = value
+                    migratedCount += 1
+                }
+            }
+
+            if let value = lastChangeTimes.removeValue(forKey: orphanedID) {
+                if lastChangeTimes[newScreenID] == nil {
+                    lastChangeTimes[newScreenID] = value
+                    migratedCount += 1
+                }
+            }
+
+            if let value = usedItemIDs.removeValue(forKey: orphanedID) {
+                if var existing = usedItemIDs[newScreenID] {
+                    existing.formUnion(value)
+                    usedItemIDs[newScreenID] = existing
+                } else {
+                    usedItemIDs[newScreenID] = value
+                }
+                migratedCount += 1
+            }
+        }
+
+        if migratedCount > 0 {
+            persistSchedulerState()
+            print("\(logTag) Relinked scheduler state by fingerprint (\(migratedCount) migrated value(s))")
+        }
+    }
+
     /// Persists fingerprint mapping whenever display configs are saved.
     private func syncDisplayFingerprints() {
         for screen in NSScreen.screens {
@@ -244,9 +301,14 @@ class WallpaperSchedulerService: ObservableObject {
     func restoreSavedConfig() {
         loadConfig()
         loadDisplayFingerprints()
-        // After loading, try to relink configs if screen IDs changed since last launch
-        relinkDisplayConfigsByFingerprint()
         restoreSchedulerState()
+        // After loading, try to relink configs if screen IDs changed since last launch
+        let previousFingerprints = displayFingerprints
+        relinkDisplayConfigsByFingerprint()
+        relinkSchedulerStateByFingerprint(using: previousFingerprints)
+        if hasAnyEnabledDisplay {
+            start()
+        }
     }
 
     /// 恢复随机一轮状态与上次切换时间，确保应用重启后随机不重复、间隔不立即触发
@@ -348,7 +410,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         if !enabled {
             if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
-                if wasOnEndMode, let videoURL = VideoWallpaperManager.shared.currentVideoURL {
+                if wasOnEndMode, let videoURL = VideoWallpaperManager.shared.videoURL(for: screen) {
                     // "播完即换"模式下关闭自动切换：重新应用当前视频并启用循环播放，
                     // 让视频继续播放而不是直接停掉整个动态壁纸
                     Task { @MainActor in
@@ -387,7 +449,7 @@ class WallpaperSchedulerService: ObservableObject {
                     let hasVideo = VideoWallpaperManager.shared.hasActiveWallpaper(on: screen)
 
                     // 已有本机视频壁纸：重新应用以禁用循环（播完即换非循环模式）
-                    if hasVideo, let videoURL = VideoWallpaperManager.shared.currentVideoURL {
+                    if hasVideo, let videoURL = VideoWallpaperManager.shared.videoURL(for: screen) {
                         let posterURL = VideoWallpaperManager.shared.posterURL(for: screen)
                         try? VideoWallpaperManager.shared.applyVideoWallpaper(
                             from: videoURL,
@@ -412,7 +474,7 @@ class WallpaperSchedulerService: ObservableObject {
             // 如果从"播完即换"模式切换回来，需要重新启用循环播放
             if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
                 Task { @MainActor in
-                    if let videoURL = VideoWallpaperManager.shared.currentVideoURL {
+                    if let videoURL = VideoWallpaperManager.shared.videoURL(for: screen) {
                         let posterURL = VideoWallpaperManager.shared.posterURL(for: screen)
                         try? VideoWallpaperManager.shared.applyVideoWallpaper(
                             from: videoURL,
@@ -451,10 +513,19 @@ class WallpaperSchedulerService: ObservableObject {
         updateConfig(newConfig)
     }
 
+    func updateDisplayFolderIDs(_ folderIDs: [String]?, for screenID: String) {
+        var newConfig = config
+        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        displayConfig.folderIDs = folderIDs
+        newConfig.displayConfigs[screenID] = displayConfig
+        updateConfig(newConfig)
+    }
+
     // MARK: - Scheduling
 
-    /// Returns the smallest interval among all enabled displays (or the global fallback).
-    /// 注意："播完即换"模式的屏幕（intervalMinutes < 0）不参与定时器调度。
+    /// Returns the smallest interval among enabled timed displays.
+    /// 注意："播完即换"模式的屏幕（intervalMinutes < 0）不参与定时器调度；
+    /// 若所有启用屏幕都处于"播完即换"模式，则返回 0 表示无需创建 timer。
     private func effectiveCheckInterval() -> TimeInterval {
         let screens = NSScreen.screens
         let intervals = screens.compactMap { screen -> TimeInterval? in
@@ -465,7 +536,7 @@ class WallpaperSchedulerService: ObservableObject {
             guard !displayConfig.isOnEndMode else { return nil }
             return TimeInterval(displayConfig.intervalMinutes * 60)
         }
-        return intervals.min() ?? TimeInterval(config.intervalMinutes * 60)
+        return intervals.min() ?? 0
     }
 
     private func scheduleNextChange() {
@@ -529,8 +600,7 @@ class WallpaperSchedulerService: ObservableObject {
             for change in pending {
                 let (screenID, item, _) = change
                 let bakeStatus: String
-                if item.bakedWebDirPath != nil { bakeStatus = "web-dir" }
-                else if item.bakedVideoPath != nil { bakeStatus = "mp4" }
+                if item.bakedVideoPath != nil { bakeStatus = "mp4" }
                 else { bakeStatus = "none" }
                 print("\(logTag) Applying '\(item.title)' to screen \(screenID) [bake=\(bakeStatus)]")
 
@@ -563,40 +633,29 @@ class WallpaperSchedulerService: ObservableObject {
             .attributesOfItem(atPath: fileURL.path)[.type] as? FileAttributeType) == .typeDirectory
 
         do {
-            // 优先使用烘焙产物（WE Scene 离线烘焙）
-            // 1a. .web 组合目录（视频背景 + Web overlay）→ 通过 CLI 渲染
-            // 注意："播完即换"模式下跳过 Web 壁纸
-            var webOverlayApplied = false
-            if !isOnEndMode, let webDirPath = item.bakedWebDirPath,
-               FileManager.default.fileExists(atPath: webDirPath) {
-                print("\(logTag) Using baked .web dir: \(webDirPath)")
-                do {
-                    try await WallpaperEngineXBridge.shared.setWallpaper(
-                        path: webDirPath,
-                        targetScreens: [screen]
-                    )
-                    // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
-                    webOverlayApplied = true
-                } catch {
-                    // .web 叠加层渲染失败（常见原因：baked.mp4 损坏、WebKit 加载异常等）
-                    // 回退到烘焙视频播放，确保壁纸至少能显示
-                    print("\(logTag) Web overlay failed (\(error.localizedDescription)), falling back to baked video")
-                }
-            }
-            // 1b. .mp4 烘焙视频 → VideoWallpaperManager 直接播放（仅当 .web 未成功时）
-            if !webOverlayApplied, let bakedPath = item.bakedVideoPath,
-               FileManager.default.fileExists(atPath: bakedPath) {
+            // 优先使用烘焙 MP4 产物（WE Scene 离线烘焙）
+            if let bakedPath = item.bakedVideoPath,
+               SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: bakedPath)) {
                 print("\(logTag) Using baked video: \(bakedPath)")
                 let bakedURL = URL(fileURLWithPath: bakedPath)
-                let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
-                    forLocalVideo: bakedURL,
-                    fallbackPosterURL: nil
-                )
+                let posterURL: URL?
+                if let itemID = item.sceneBakeItemID {
+                    posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                        forLocalVideo: bakedURL,
+                        itemID: itemID
+                    )
+                } else {
+                    posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
+                        forLocalVideo: bakedURL,
+                        fallbackPosterURL: nil
+                    )
+                }
                 try VideoWallpaperManager.shared.applyVideoWallpaper(
                     from: bakedURL,
                     posterURL: posterURL,
                     muted: true,
-                    targetScreen: screen
+                    targetScreen: screen,
+                    animatedTransition: true
                 )
                 if let posterURL = posterURL {
                     DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
@@ -658,7 +717,8 @@ class WallpaperSchedulerService: ObservableObject {
                                 from: videoURL,
                                 posterURL: posterURL,
                                 muted: true,
-                                targetScreen: screen
+                                targetScreen: screen,
+                                animatedTransition: true
                             )
                             if let posterURL = posterURL {
                                 DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
@@ -711,7 +771,8 @@ class WallpaperSchedulerService: ObservableObject {
                     from: fileURL,
                     posterURL: posterURL,
                     muted: true,
-                    targetScreen: screen
+                    targetScreen: screen,
+                    animatedTransition: true
                 )
                 if let posterURL = posterURL {
                     DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
@@ -878,8 +939,8 @@ class WallpaperSchedulerService: ObservableObject {
         let title: String
         /// 已烘焙的 scene MP4 路径（优先于原始 WE Scene 目录）
         let bakedVideoPath: String?
-        /// 已烘焙的 .web 组合目录路径（视频背景 + Web overlay，优先于纯 MP4）
-        let bakedWebDirPath: String?
+        /// 生成稳定烘焙抽帧时使用的媒体 item id。
+        let sceneBakeItemID: String?
     }
 
     private func selectNextItem(from items: [SchedulableItem], lastID: String?, screenID: String, order: ScheduleOrder) -> SchedulableItem? {
@@ -893,15 +954,25 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
-    private func getSchedulableItems(for displayConfig: DisplaySchedulerConfig) -> [SchedulableItem] {
+    private func getSchedulableItems(for displayConfig: DisplaySchedulerConfig, screenID: String? = nil) -> [SchedulableItem] {
         var items: [SchedulableItem] = []
 
         // "播完即换"模式下只获取视频项（静态图片和 Web/Scene 壁纸不支持播完即换）
         let onEndMode = displayConfig.isOnEndMode
 
+        // 文件夹过滤：nil = 全部，非空 = 仅这些文件夹（含根目录无 folderID 的项）
+        let folderIDs = displayConfig.folderIDs
+        let folderFilter: (String?) -> Bool = { itemFolderID in
+            guard let folderIDs else { return true } // nil = 全部
+            if folderIDs.isEmpty { return itemFolderID == nil } // 空数组 = 只匹配根目录
+            guard let itemFolderID else { return false } // 有文件夹过滤，nil 项不匹配
+            return folderIDs.contains(itemFolderID)
+        }
+
         if displayConfig.includeWallpapers && !onEndMode {
             // Downloaded wallpapers（图片或已烘焙的 WE scene 目录）
             for record in WallpaperLibraryService.shared.downloadedWallpapers {
+                guard folderFilter(record.folderID) else { continue }
                 let url = URL(fileURLWithPath: record.localFilePath)
                 guard FileManager.default.fileExists(atPath: url.path) else { continue }
                 items.append(SchedulableItem(
@@ -909,31 +980,35 @@ class WallpaperSchedulerService: ObservableObject {
                     fileURL: url,
                     title: url.deletingPathExtension().lastPathComponent,
                     bakedVideoPath: nil,
-                    bakedWebDirPath: nil
+                    sceneBakeItemID: nil
                 ))
             }
-            // Scanned local wallpapers
-            for item in LocalWallpaperScanner.shared.getLocalWallpapers() {
-                guard FileManager.default.fileExists(atPath: item.fileURL.path) else { continue }
-                items.append(SchedulableItem(
-                    id: "wp_scan_\(item.id)",
-                    fileURL: item.fileURL,
-                    title: item.title,
-                    bakedVideoPath: nil,
-                    bakedWebDirPath: nil
-                ))
+            // Scanned local wallpapers（仅未指定文件夹时包含本地扫描文件）
+            if folderIDs == nil {
+                for item in LocalWallpaperScanner.shared.getLocalWallpapers() {
+                    guard FileManager.default.fileExists(atPath: item.fileURL.path) else { continue }
+                    items.append(SchedulableItem(
+                        id: "wp_scan_\(item.id)",
+                        fileURL: item.fileURL,
+                        title: item.title,
+                        bakedVideoPath: nil,
+                        sceneBakeItemID: nil
+                    ))
+                }
             }
         }
 
         if displayConfig.includeMedia {
-            // 自动切换仅支持 mp4/m4v 视频（VideoWallpaperManager 实际只能稳定播放这类格式）
-            let allowedMediaExts: Set<String> = ["mp4", "m4v"]
+            // 自动切换仅支持能被 VideoWallpaperManager 播放的视频格式
+            // 与 applyItem 中的 videoExtensions 保持一致（排除 webm——macOS 原生播放器不稳定）
+            let allowedMediaExts: Set<String> = ["mp4", "m4v", "mov", "mkv", "avi", "flv"]
 
             // 已在 wallpapers 分支添加过的 Workshop 项 ID（当双选时避免重复）
             let existingIDs = Set(items.map(\.id))
 
             // Downloaded media（包含 Workshop 视频/媒体）
             for record in MediaLibraryService.shared.downloadedItems {
+                guard folderFilter(record.folderID) else { continue }
                 let url = URL(fileURLWithPath: record.localFilePath)
                 let isWorkshop = record.item.id.hasPrefix("workshop_")
                 let isAllowedExt = allowedMediaExts.contains(url.pathExtension.lowercased())
@@ -947,19 +1022,16 @@ class WallpaperSchedulerService: ObservableObject {
                 }
                 // Workshop 项优先使用烘焙产物
                 var bakedVideoPath: String? = nil
-                var bakedWebDirPath: String? = nil
+                var sceneBakeItemID: String? = nil
                 if isWorkshop, let art = record.sceneBakeArtifact {
-                    let webDir = art.videoPath.replacingOccurrences(of: ".mp4", with: ".web")
-                    if FileManager.default.fileExists(atPath: webDir) {
-                        bakedWebDirPath = webDir
-                    }
-                    if FileManager.default.fileExists(atPath: art.videoPath) {
+                    if SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
                         bakedVideoPath = art.videoPath
+                        sceneBakeItemID = record.item.id
                     }
                 }
 
                 // "播完即换"模式下跳过 Web 壁纸（由 CLI 渲染，不支持播完即换）
-                if onEndMode && bakedWebDirPath != nil {
+                if onEndMode && url.pathExtension.lowercased() == "web" {
                     continue
                 }
 
@@ -984,20 +1056,22 @@ class WallpaperSchedulerService: ObservableObject {
                     fileURL: url,
                     title: record.item.title,
                     bakedVideoPath: bakedVideoPath,
-                    bakedWebDirPath: bakedWebDirPath
+                    sceneBakeItemID: sceneBakeItemID
                 ))
             }
-            // Scanned local media
-            for item in LocalWallpaperScanner.shared.getLocalMedia() {
-                guard FileManager.default.fileExists(atPath: item.fileURL.path),
-                      allowedMediaExts.contains(item.fileURL.pathExtension.lowercased()) else { continue }
-                items.append(SchedulableItem(
-                    id: "media_scan_\(item.id)",
-                    fileURL: item.fileURL,
-                    title: item.title,
-                    bakedVideoPath: nil,
-                    bakedWebDirPath: nil
-                ))
+            // Scanned local media（仅未指定文件夹时包含）
+            if folderIDs == nil {
+                for item in LocalWallpaperScanner.shared.getLocalMedia() {
+                    guard FileManager.default.fileExists(atPath: item.fileURL.path),
+                          allowedMediaExts.contains(item.fileURL.pathExtension.lowercased()) else { continue }
+                    items.append(SchedulableItem(
+                        id: "media_scan_\(item.id)",
+                        fileURL: item.fileURL,
+                        title: item.title,
+                        bakedVideoPath: nil,
+                        sceneBakeItemID: nil
+                    ))
+                }
             }
         }
 
@@ -1065,9 +1139,6 @@ class WallpaperSchedulerService: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: userDefaultsKey),
            let loadedConfig = try? JSONDecoder().decode(SchedulerConfig.self, from: data) {
             config = loadedConfig
-            if hasAnyEnabledDisplay {
-                start()
-            }
         }
     }
 }

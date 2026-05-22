@@ -5,11 +5,12 @@ import AppKit
 struct DisplaySelectorSheet: View {
     let title: String
     let message: String
+    let allowsBackgroundDismiss: Bool
     let onSelect: (NSScreen?) -> Void
     let onCancel: () -> Void
 
     @State private var isVisible = false
-    @State private var selectedScreenID: String?
+    @State private var selectedScreenID: String? = NSScreen.main?.screenIdentifier
 
     private var screens: [NSScreen] {
         NSScreen.screens
@@ -32,7 +33,9 @@ struct DisplaySelectorSheet: View {
                 .opacity(0.6)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    dismiss()
+                    if allowsBackgroundDismiss {
+                        dismiss()
+                    }
                 }
 
             // 弹窗内容
@@ -129,6 +132,9 @@ struct DisplaySelectorSheet: View {
             .scaleEffect(isVisible ? 1.0 : 0.88)
             .opacity(isVisible ? 1.0 : 0.0)
             .onAppear {
+                if selectedScreenID == nil, let firstScreen = screens.first {
+                    selectedScreenID = firstScreen.screenIdentifier
+                }
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                     isVisible = true
                 }
@@ -233,6 +239,7 @@ class DisplaySelectorManager: ObservableObject {
     @Published var isShowingSelector = false
     @Published private(set) var selectorTitle: String = ""
     @Published private(set) var selectorMessage: String = ""
+    @Published private(set) var allowsBackgroundDismiss = false
     
     private var completionHandler: ((NSScreen?) -> Void)?
     
@@ -243,10 +250,16 @@ class DisplaySelectorManager: ObservableObject {
     ///   - title: 弹窗标题
     ///   - message: 弹窗消息
     ///   - completion: 选择完成回调，参数为选中的屏幕，nil 表示所有屏幕
-    func showSelector(title: String, message: String, completion: @escaping (NSScreen?) -> Void) {
+    func showSelector(
+        title: String,
+        message: String,
+        allowsBackgroundDismiss: Bool = false,
+        completion: @escaping (NSScreen?) -> Void
+    ) {
         self.completionHandler = completion
         self.selectorTitle = title
         self.selectorMessage = message
+        self.allowsBackgroundDismiss = allowsBackgroundDismiss
         self.isShowingSelector = true
     }
     
@@ -265,6 +278,7 @@ class DisplaySelectorManager: ObservableObject {
     func cancelForMemoryRelease() {
         selectorTitle = ""
         selectorMessage = ""
+        allowsBackgroundDismiss = false
         isShowingSelector = false
         completionHandler = nil
     }
@@ -290,6 +304,7 @@ public struct DisplaySelectorOverlay: View {
                 DisplaySelectorSheet(
                     title: manager.selectorTitle.isEmpty ? t("selectDisplay") : manager.selectorTitle,
                     message: manager.selectorMessage.isEmpty ? t("selectDisplayMessage") : manager.selectorMessage,
+                    allowsBackgroundDismiss: manager.allowsBackgroundDismiss,
                     onSelect: { screen in
                         manager.handleSelection(screen)
                     },
@@ -326,6 +341,7 @@ private extension NSScreen {
         DisplaySelectorSheet(
             title: "设置壁纸",
             message: "检测到多个显示器，请选择要设置的显示器",
+            allowsBackgroundDismiss: false,
             onSelect: { screen in
                 print("Selected screen: \(screen?.localizedName ?? "All")")
             },

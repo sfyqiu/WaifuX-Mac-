@@ -2,32 +2,225 @@ import SwiftUI
 import AppKit
 import Kingfisher
 import Combine
+import ImageIO
 
-// MARK: - 列表滚动时暂停 GIF（减轻 Lazy 列表滚动主线程压力；勿用于驱动全屏背景）
+// MARK: - GIF Image Helpers
 
 @MainActor
-final class ExploreListGIFPlaybackState: ObservableObject {
-    static let shared = ExploreListGIFPlaybackState()
+func configureAnimatedGIFViewForAspectFill(_ view: AnimatedImageView, autoPlay: Bool) {
+    #if os(macOS)
+    view.imageScaling = .scaleProportionallyUpOrDown
+    view.wantsLayer = true
+    view.layer?.masksToBounds = true
+    view.layer?.contentsGravity = .resizeAspectFill
+    #elseif canImport(UIKit)
+    view.contentMode = .scaleAspectFill
+    view.clipsToBounds = true
+    #endif
+    view.autoPlayAnimatedImage = autoPlay
+    view.needsPrescaling = true
+    view.framePreloadCount = 1
+}
 
-    /// true 时 `KFMediaCoverImage` 只显示首帧，不跑 `KFAnimatedImage` 动画
-    @Published private(set) var shouldPauseListGIFs = false
-    /// 用 `DispatchWorkItem` 合并高频滚动回调，避免每帧 `Task` 创建/取消
-    private var resumeGIFsWorkItem: DispatchWorkItem?
+actor AnimatedImageProbeCache {
+    static let shared = AnimatedImageProbeCache()
 
-    /// 由 `ScrollLoadMoreModifier` 在滚动偏移变化时调用；滚动中仅第一次切到暂停态会触发刷新，恢复前用 debounce 合并
-    func noteListScrolling() {
-        if !shouldPauseListGIFs {
-            shouldPauseListGIFs = true
+    private let maxEntries = 512
+    private var cache: [String: Bool] = [:]
+    private var accessOrder: [String] = []
+
+    private static let gifSignature = Data("GIF".utf8)
+    private static let headerByteCount = 64 * 1024
+    private static let defaultMaxPixelCount = 8_000_000
+    private static let defaultMaxFrameCount = 180
+
+    /// 不看文件名/后缀，只读取实际图片响应/文件数据判断是否为可安全播放的 GIF。
+    func isAnimatedGIF(
+        _ url: URL,
+        maxByteCount: Int64,
+        maxPixelCount: Int = defaultMaxPixelCount,
+        maxFrameCount: Int = defaultMaxFrameCount
+    ) async -> Bool {
+        let key = "\(url.absoluteString)|b:\(maxByteCount)|p:\(maxPixelCount)|f:\(maxFrameCount)"
+        if let cached = cache[key] {
+            markRecentlyUsed(key)
+            return cached
         }
-        resumeGIFsWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            if self.shouldPauseListGIFs {
-                self.shouldPauseListGIFs = false
+
+        let result: Bool
+        if url.isFileURL {
+            result = Self.probeLocalGIF(
+                url,
+                maxByteCount: maxByteCount,
+                maxPixelCount: maxPixelCount,
+                maxFrameCount: maxFrameCount
+            )
+        } else {
+            result = await Self.probeRemoteGIF(
+                url,
+                maxByteCount: maxByteCount,
+                maxPixelCount: maxPixelCount,
+                maxFrameCount: maxFrameCount
+            )
+        }
+
+        return store(result, for: key)
+    }
+
+    private static func probeLocalGIF(
+        _ url: URL,
+        maxByteCount: Int64,
+        maxPixelCount: Int,
+        maxFrameCount: Int
+    ) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let fileSize = attributes[.size] as? NSNumber,
+              fileSize.int64Value <= maxByteCount,
+              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              dataLooksLikeGIF(data) else {
+            return false
+        }
+
+        return imagePropertiesWithinBudget(
+            data,
+            maxPixelCount: maxPixelCount,
+            maxFrameCount: maxFrameCount,
+            requireAnimatedFrameCount: true
+        )
+    }
+
+    private static func probeRemoteGIF(
+        _ url: URL,
+        maxByteCount: Int64,
+        maxPixelCount: Int,
+        maxFrameCount: Int
+    ) async -> Bool {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        request.setValue("bytes=0-\(headerByteCount - 1)", forHTTPHeaderField: "Range")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue("image/gif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        if let host = url.host?.lowercased() {
+            if host.contains("steam") || host.contains("akamaihd") {
+                request.setValue("https://steamcommunity.com/", forHTTPHeaderField: "Referer")
+            } else if host.contains("motionbgs.com") {
+                request.setValue("https://motionbgs.com/", forHTTPHeaderField: "Referer")
+            } else if host.contains("wallhaven.cc") {
+                request.setValue("https://wallhaven.cc/", forHTTPHeaderField: "Referer")
             }
         }
-        resumeGIFsWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              !data.isEmpty else {
+            return false
+        }
+        if Int64(data.count) > maxByteCount {
+            return false
+        }
+        if let byteCount = estimatedByteCount(from: response), byteCount > maxByteCount {
+            return false
+        }
+
+        let looksLikeGIF = response.mimeType?.lowercased().contains("gif") == true
+            || dataLooksLikeGIF(data)
+        guard looksLikeGIF else { return false }
+
+        return imagePropertiesWithinBudget(
+            data,
+            maxPixelCount: maxPixelCount,
+            maxFrameCount: maxFrameCount,
+            requireAnimatedFrameCount: false
+        ) || gifHeaderDimensionsWithinBudget(data, maxPixelCount: maxPixelCount)
+    }
+
+    private static func dataLooksLikeGIF(_ data: Data) -> Bool {
+        data.starts(with: gifSignature)
+    }
+
+    private static func gifHeaderDimensionsWithinBudget(_ data: Data, maxPixelCount: Int) -> Bool {
+        guard data.count >= 10, dataLooksLikeGIF(data) else { return false }
+        let bytes = [UInt8](data.prefix(10))
+        let width = Int(bytes[6]) | (Int(bytes[7]) << 8)
+        let height = Int(bytes[8]) | (Int(bytes[9]) << 8)
+        let pixels = width * height
+        return pixels > 0 && pixels <= maxPixelCount
+    }
+
+    private static func imagePropertiesWithinBudget(
+        _ data: Data,
+        maxPixelCount: Int,
+        maxFrameCount: Int,
+        requireAnimatedFrameCount: Bool
+    ) -> Bool {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return false
+        }
+
+        let frameCount = CGImageSourceGetCount(source)
+        if requireAnimatedFrameCount, frameCount <= 1 {
+            return false
+        }
+        if frameCount > maxFrameCount {
+            return false
+        }
+
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return false
+        }
+
+        let pixels = width.intValue * height.intValue
+        return pixels > 0 && pixels <= maxPixelCount
+    }
+
+    private static func estimatedByteCount(from response: URLResponse) -> Int64? {
+        guard let http = response as? HTTPURLResponse else {
+            return response.expectedContentLength > 0 ? response.expectedContentLength : nil
+        }
+
+        if let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+           let totalText = contentRange.split(separator: "/").last,
+           let total = Int64(totalText) {
+            return total
+        }
+
+        guard http.statusCode != 206 else { return nil }
+
+        if response.expectedContentLength > 0 {
+            return response.expectedContentLength
+        }
+        if let contentLength = http.value(forHTTPHeaderField: "Content-Length"),
+           let total = Int64(contentLength) {
+            return total
+        }
+        return nil
+    }
+
+    private func store(_ result: Bool, for key: String) -> Bool {
+        if cache[key] == nil {
+            accessOrder.append(key)
+        } else {
+            markRecentlyUsed(key)
+        }
+
+        cache[key] = result
+
+        while accessOrder.count > maxEntries, let oldest = accessOrder.first {
+            accessOrder.removeFirst()
+            cache.removeValue(forKey: oldest)
+        }
+
+        return result
+    }
+
+    private func markRecentlyUsed(_ key: String) {
+        guard let index = accessOrder.firstIndex(of: key) else { return }
+        accessOrder.remove(at: index)
+        accessOrder.append(key)
     }
 }
 
@@ -259,6 +452,7 @@ final class ExploreAtmosphereController: ObservableObject {
 
     private var loadTask: Task<Void, Never>?
     private let wallpaperMode: Bool
+    private let atmosphereSampleSize = CGSize(width: 512, height: 512)
     /// 避免列表刷新但首张未变时重复拉缩略图、重复采样
     private var activeFirstItemKey: String?
     private var cancellables = Set<AnyCancellable>()
@@ -266,7 +460,7 @@ final class ExploreAtmosphereController: ObservableObject {
     init(wallpaperMode: Bool) {
         self.wallpaperMode = wallpaperMode
         self.tint = wallpaperMode ? .wallpaperFallback : .mediaFallback
-        
+
         // 监听应用隐藏窗口通知，清理大内存占用（异步执行避免卡顿）
         NotificationCenter.default.publisher(for: .appDidHideWindow)
             .sink { [weak self] _ in
@@ -283,7 +477,7 @@ final class ExploreAtmosphereController: ObservableObject {
         loadTask?.cancel()
         // cancellables 会自动释放，无需手动清理
     }
-    
+
     /// 清理大内存占用，但保留颜色主题
     func clearMemory() {
         loadTask?.cancel()
@@ -299,11 +493,23 @@ final class ExploreAtmosphereController: ObservableObject {
         activeFirstItemKey = nil
         tint = wallpaperMode ? .wallpaperFallback : .mediaFallback
     }
-    
+
     /// 切到其他 tab 时暂停后台任务（保留当前颜色，只取消未完成的加载）
     func pause() {
         loadTask?.cancel()
         loadTask = nil
+    }
+
+    private func retrieveAtmosphereImage(from url: URL) async -> KFCrossPlatformImage? {
+        let processor = DownsamplingImageProcessor(size: atmosphereSampleSize)
+        let result = try? await KingfisherManager.shared.retrieveImage(
+            with: .network(url),
+            options: [
+                .processor(processor),
+                .backgroundDecode
+            ]
+        )
+        return result?.image
     }
 
     func updateFirstWallpaper(_ wallpaper: Wallpaper?) {
@@ -327,8 +533,8 @@ final class ExploreAtmosphereController: ObservableObject {
         guard let url = wallpaper.thumbURL ?? wallpaper.smallThumbURL else { return }
 
         loadTask = Task {
-            let result = try? await KingfisherManager.shared.retrieveImage(with: .network(url))
-            guard !Task.isCancelled, let image = result?.image else { return }
+            guard let image = await retrieveAtmosphereImage(from: url),
+                  !Task.isCancelled else { return }
 
             let processed = await Task.detached(priority: .userInitiated) {
                 let small = image.constrainedForAtmosphereBackdrop()
@@ -368,8 +574,8 @@ final class ExploreAtmosphereController: ObservableObject {
         let url = item.thumbnailURL
 
         loadTask = Task {
-            let result = try? await KingfisherManager.shared.retrieveImage(with: .network(url))
-            guard !Task.isCancelled, let image = result?.image else { return }
+            guard let image = await retrieveAtmosphereImage(from: url),
+                  !Task.isCancelled else { return }
 
             let processed = await Task.detached(priority: .userInitiated) {
                 let small = image.constrainedForAtmosphereBackdrop()
@@ -408,8 +614,8 @@ final class ExploreAtmosphereController: ObservableObject {
         guard let url = URL(string: coverURL) else { return }
 
         loadTask = Task {
-            let result = try? await KingfisherManager.shared.retrieveImage(with: .network(url))
-            guard !Task.isCancelled, let image = result?.image else { return }
+            guard let image = await retrieveAtmosphereImage(from: url),
+                  !Task.isCancelled else { return }
 
             let processed = await Task.detached(priority: .userInitiated) {
                 let small = image.constrainedForAtmosphereBackdrop()
@@ -444,8 +650,8 @@ final class ExploreAtmosphereController: ObservableObject {
         referenceImage = nil
 
         loadTask = Task {
-            let result = try? await KingfisherManager.shared.retrieveImage(with: .network(url))
-            guard !Task.isCancelled, let image = result?.image else { return }
+            guard let image = await retrieveAtmosphereImage(from: url),
+                  !Task.isCancelled else { return }
 
             let processed = await Task.detached(priority: .userInitiated) {
                 let small = image.constrainedForAtmosphereBackdrop()
@@ -653,8 +859,7 @@ extension KFImage {
 
 extension KFAnimatedImage {
     fileprivate func wh_optionalDownsample(_ size: CGSize?) -> KFAnimatedImage {
-        guard let size else { return self }
-        return setProcessor(DownsamplingImageProcessor(size: size))
+        self
     }
 }
 
@@ -664,7 +869,6 @@ extension KFAnimatedImage {
 /// 统一使用 `KFAnimatedImage`：Kingfisher 内部会解析真实文件格式，
 /// GIF 自动走动画管线，静态图则回退到普通 ImageView 行为，无需外部根据 URL 预判断。
 struct KFMediaCoverImage: View {
-    @ObservedObject private var listGIFPlayback = ExploreListGIFPlaybackState.shared
     @Environment(\.coverGIFPlaybackHostActive) private var coverGIFPlaybackHostActive
 
     let url: URL
@@ -688,12 +892,18 @@ struct KFMediaCoverImage: View {
     @State private var detectedGIF = false
     @State private var loadFailed = false
 
+    private let maxAnimatedGIFBytes: Int64 = 18 * 1024 * 1024
+
+    private var shouldShowStaticLayer: Bool {
+        !detectedGIF || loadFailed
+    }
+
     private var shouldAnimate: Bool {
         guard playAnimatedImage, coverGIFPlaybackHostActive else { return false }
         if animateOnHoverOnly {
             return isHovered
         }
-        return isVisible && !listGIFPlayback.shouldPauseListGIFs
+        return isVisible
     }
 
     /// `KFAnimatedImage` 的 `configure` 在 SwiftUI 更新时不一定会同步到已有 NSView；仅悬停播放时让 `id` 随悬停变化以强制重建并应用 `autoPlayAnimatedImage`。
@@ -720,44 +930,33 @@ struct KFMediaCoverImage: View {
     var body: some View {
         let core = ZStack {
             underlay
-            // 1. 底层始终用 KFImage 加载，保证静态图和 GIF 首帧都能显示
-            KFImage(url)
-                .wh_optionalDownsample(downsampleSize)
-                .cacheMemoryOnly(false)
-                .cancelOnDisappear(true)
-                .fade(duration: fadeDuration)
-                .placeholder { _ in underlay }
-                .onSuccess { result in
-                    // GIF 判定：优先解码结果；降采样后静态图会丢失 `gifRepresentation`，回退到模型/URL 的 `animated` 提示
-                    if !detectedGIF {
-                        if result.image.kf.gifRepresentation() != nil {
-                            detectedGIF = true
-                        } else if animated {
+            // 静态层只负责非 GIF 或动画加载失败的封面；确认 GIF 后释放，避免静态图和动画层长期双持有。
+            if shouldShowStaticLayer {
+                KFImage(url)
+                    .wh_optionalDownsample(downsampleSize)
+                    .cacheMemoryOnly(false)
+                    .cancelOnDisappear(true)
+                    .fade(duration: fadeDuration)
+                    .placeholder { _ in underlay }
+                    .onSuccess { result in
+                        if !detectedGIF, result.image.kf.gifRepresentation() != nil {
                             detectedGIF = true
                         }
+                        loadFinished?()
                     }
-                    loadFinished?()
-                }
-                .onFailure { _ in loadFinished?() }
-                .resizable()
-                .aspectRatio(contentMode: .fill)
+                    .onFailure { _ in loadFinished?() }
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            }
 
             // 2. 若真实格式为 GIF 且允许动画，叠加 KFAnimatedImage 播放动效
             if detectedGIF && !loadFailed {
                 KFAnimatedImage.url(url)
-                    .wh_optionalDownsample(downsampleSize)
-                    .cacheMemoryOnly(false)
+                    .memoryCacheExpiration(.expired)
+                    .diskCacheExpiration(.days(3))
                     .cancelOnDisappear(true)
                     .configure { view in
-                        #if os(macOS)
-                        view.imageScaling = NSImageScaling.scaleAxesIndependently
-                        #elseif canImport(UIKit)
-                        view.contentMode = .scaleAspectFill
-                        view.clipsToBounds = true
-                        #endif
-                        view.autoPlayAnimatedImage = shouldAnimate
-                        // 列表内降低预加载帧数，减轻解码与内存峰值
-                        view.framePreloadCount = shouldAnimate ? 4 : 1
+                        configureAnimatedGIFViewForAspectFill(view, autoPlay: shouldAnimate)
                     }
                     .placeholder { _ in underlay }
                     .onSuccess { _ in loadFinished?() }
@@ -765,9 +964,10 @@ struct KFMediaCoverImage: View {
                         loadFailed = true
                         loadFinished?()
                     }
-                    // 非「仅悬停」模式：仅用 URL 稳定身份，滚动暂停 GIF 时靠 `@ObservedObject` + configure 更新。
+                    // 非「仅悬停」模式：仅用 URL 稳定身份。
                     // 「仅悬停」模式：`id` 必须随 `isHovered` 变化，否则 AppKit 侧不会响应 `autoPlayAnimatedImage` 切换。
                     .id(kfAnimatedLayerIdentity)
+                    .aspectRatio(contentMode: .fill)
             }
         }
 
@@ -777,6 +977,22 @@ struct KFMediaCoverImage: View {
             } else {
                 core
             }
+        }
+        .task(id: url.absoluteString) {
+            detectedGIF = false
+            loadFailed = false
+            guard animated else { return }
+            let result = await AnimatedImageProbeCache.shared.isAnimatedGIF(url, maxByteCount: maxAnimatedGIFBytes)
+            guard !Task.isCancelled else { return }
+            detectedGIF = result
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
+            detectedGIF = false
+            loadFailed = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .appDidReceiveMemoryPressure)) { _ in
+            detectedGIF = false
+            loadFailed = false
         }
     }
 }

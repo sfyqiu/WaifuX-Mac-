@@ -112,6 +112,7 @@ private final class RendererBridge {
     private let rendererLock = NSLock()
     private var isLoaded = false
     private var lastAssetsPath: String? = nil
+    private var closeHandler: (() -> Void)?
 
     private init() {}
 
@@ -258,12 +259,15 @@ private final class RendererBridge {
         rendererLock.unlock()
         if close {
             cancelTickTimer()
+            let handler: (() -> Void)?
             rendererLock.lock()
             if let hh = handle {
                 lw_renderer_hide_window(hh)
             }
             isLoaded = false
+            handler = closeHandler
             rendererLock.unlock()
+            handler?()
             return false
         }
         return true
@@ -294,12 +298,15 @@ private final class RendererBridge {
 
                 if close {
                     self.cancelTickTimer()
+                    let handler: (() -> Void)?
                     self.rendererLock.lock()
                     if let hh = self.handle {
                         lw_renderer_hide_window(hh)
                     }
                     self.isLoaded = false
+                    handler = self.closeHandler
                     self.rendererLock.unlock()
+                    handler?()
                     return
                 }
 
@@ -318,6 +325,12 @@ private final class RendererBridge {
     func stop() {
         cancelTickTimer()
         _ = drainTickQueue(timeout: 2.0)
+    }
+
+    func setCloseHandler(_ handler: (() -> Void)?) {
+        rendererLock.lock()
+        closeHandler = handler
+        rendererLock.unlock()
     }
 
     /// Scene 动态壁纸暂停：只停渲染 tick，**不** `hideWindow()`。
@@ -361,6 +374,7 @@ private final class RendererBridge {
             handle = nil
         }
         isLoaded = false
+        closeHandler = nil
         lastAssetsPath = nil
         rendererLock.unlock()
     }
@@ -431,6 +445,15 @@ private final class RendererBridge {
         defer { rendererLock.unlock() }
         guard let h = handle else { return }
         lw_renderer_set_screen(h, Int32(index))
+    }
+
+    /// 透传 dylib 的 set_property 接口。对齐 Wallpaper Engine X：
+    /// `setProperty("showDynamicText", "0")` 等同于上游 CLI 的 `--no-dynamic-text`。
+    func setProperty(_ name: String, _ value: String) {
+        rendererLock.lock()
+        defer { rendererLock.unlock() }
+        guard let h = handle else { return }
+        lw_renderer_set_property(h, name, value)
     }
 
     func captureFrame() -> CGImage? {
@@ -2199,6 +2222,7 @@ private enum Client {
 private final class Daemon: NSObject, NSApplicationDelegate {
     static let shared = Daemon()
     private var serverSocket: Int32 = -1
+    private var signalSources: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         writePID(getpid())
@@ -2207,6 +2231,7 @@ private final class Daemon: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.prohibited)
         startServer()
         startProhibitionTimer()
+        installDaemonSignalHandlers()
         dlog("[Daemon] Started, pid=\(getpid())")
     }
 
@@ -2221,9 +2246,42 @@ private final class Daemon: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 主程序退出时会同步 `kill(daemonPID, SIGTERM)` 让 web 壁纸落地；
+    /// 默认 AppKit run loop 不响应 SIGTERM，所以这里用 DispatchSource 接管。
+    /// 收到信号后直接 `_exit(0)`，避免走 NSApp.terminate 触发 C++ 静态析构（glslang/SDL 与 AppKit
+    /// 子线程交叉收尾时会在 libc++ 里 abort，触发系统"意外退出"弹窗。bake 那边也是同款处理）。
+    private func installDaemonSignalHandlers() {
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGINT, SIG_IGN)
+        for sig in [SIGTERM, SIGINT] {
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { [unowned self] in
+                dlog("[Daemon] Received signal \(sig), exiting...")
+                // 同步清掉壁纸窗口、socket、PID 文件（这是 applicationWillTerminate 的核心逻辑），
+                // 然后 _exit 跳过会崩溃的 C++ 静态析构。
+                DesktopWallpaperManager.shared.stopWallpaper()
+                if self.serverSocket >= 0 {
+                    close(self.serverSocket)
+                    self.serverSocket = -1
+                }
+                removeSocket()
+                if FileManager.default.fileExists(atPath: PID_PATH) {
+                    try? FileManager.default.removeItem(atPath: PID_PATH)
+                }
+                fflush(stdout)
+                fflush(stderr)
+                _exit(0)
+            }
+            src.resume()
+            signalSources.append(src)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         prohibitionTimer?.invalidate()
         prohibitionTimer = nil
+        for src in signalSources { src.cancel() }
+        signalSources.removeAll()
         DesktopWallpaperManager.shared.stopWallpaper()
         if serverSocket >= 0 {
             close(serverSocket)
@@ -2376,21 +2434,33 @@ private struct SceneOfflineBakeConfig {
     let height: Int
     let fps: Int32
     let durationSeconds: Double
+    let hideDynamicText: Bool
 }
 
 private func sceneBakeParseConfig(_ arguments: [String]) throws -> SceneOfflineBakeConfig {
-    guard arguments.count >= 2 else { throw SceneOfflineBakeError.invalidArguments }
-    let root = arguments[0]
-    let outPath = arguments[1]
+    // 拆分 flag 与位置参数（位置参数顺序仍为 root / out / w / h / fps / sec）
+    var positional: [String] = []
+    var hideDynamicText = false
+    for arg in arguments {
+        switch arg {
+        case "--no-dynamic-text", "--hide-dynamic-text":
+            hideDynamicText = true
+        default:
+            positional.append(arg)
+        }
+    }
+    guard positional.count >= 2 else { throw SceneOfflineBakeError.invalidArguments }
+    let root = positional[0]
+    let outPath = positional[1]
     var w = 1920
     var h = 1080
     var fps: Int32 = 30
     var seconds = 8.0
-    if arguments.count >= 6 {
-        w = max(32, Int(arguments[2]) ?? 1920)
-        h = max(32, Int(arguments[3]) ?? 1080)
-        fps = Int32(max(1, min(60, Int(arguments[4]) ?? 30)))
-        seconds = max(0.5, Double(arguments[5]) ?? 15.0)
+    if positional.count >= 6 {
+        w = max(32, Int(positional[2]) ?? 1920)
+        h = max(32, Int(positional[3]) ?? 1080)
+        fps = Int32(max(1, min(60, Int(positional[4]) ?? 30)))
+        seconds = max(0.5, Double(positional[5]) ?? 15.0)
     }
     w = (w / 2) * 2
     h = (h / 2) * 2
@@ -2400,8 +2470,45 @@ private func sceneBakeParseConfig(_ arguments: [String]) throws -> SceneOfflineB
         width: w,
         height: h,
         fps: fps,
-        durationSeconds: seconds
+        durationSeconds: seconds,
+        hideDynamicText: hideDynamicText
     )
+}
+
+private struct ScenePreviewConfig {
+    let sceneRoot: String
+    let width: Int
+    let height: Int
+    let hideDynamicText: Bool
+}
+
+private func scenePreviewParseConfig(_ arguments: [String]) throws -> ScenePreviewConfig {
+    // 拆分 flag 与位置参数。当前支持 flag：
+    //   --no-dynamic-text  关闭 Clock / Date 等动态文本（与上游 linux-wallpaperengine 同名）
+    var positional: [String] = []
+    var hideDynamicText = false
+    for arg in arguments {
+        switch arg {
+        case "--no-dynamic-text", "--hide-dynamic-text":
+            hideDynamicText = true
+        default:
+            positional.append(arg)
+        }
+    }
+    guard !positional.isEmpty else { throw SceneOfflineBakeError.invalidArguments }
+    let root = positional[0]
+    var w = 0
+    var h = 0
+    if positional.count >= 3 {
+        w = max(32, Int(positional[1]) ?? 0)
+        h = max(32, Int(positional[2]) ?? 0)
+    }
+    if w <= 0 || h <= 0 {
+        let screen = NSScreen.main?.frame ?? .init(x: 0, y: 0, width: 1280, height: 720)
+        w = max(64, Int(screen.width))
+        h = max(64, Int(screen.height))
+    }
+    return ScenePreviewConfig(sceneRoot: root, width: w, height: h, hideDynamicText: hideDynamicText)
 }
 
 private func sceneBakePixelBuffer(from image: CGImage) throws -> CVPixelBuffer {
@@ -2474,6 +2581,10 @@ private func sceneBakePerform(_ cfg: SceneOfflineBakeConfig) throws {
     sceneBakeOnMain {
         RendererBridge.shared.destroy()
         RendererBridge.shared.loadWallpaper(path: sceneRoot, width: cfg.width, height: cfg.height, autoStartTicking: false)
+        if cfg.hideDynamicText {
+            // 与上游 `--no-dynamic-text` 对齐：让渲染器跳过 Clock / Date 等动态文本。
+            RendererBridge.shared.setProperty("showDynamicText", "0")
+        }
         RendererBridge.shared.setDesktopWindow(false)
         RendererBridge.shared.hideWindow()
     }
@@ -2493,20 +2604,6 @@ private func sceneBakePerform(_ cfg: SceneOfflineBakeConfig) throws {
             sceneBakeOnMain { RendererBridge.shared.destroy() }
             throw SceneOfflineBakeError.loadFailed
         }
-    }
-
-    // 尝试获取动态文本 JSON 并保存到输出目录旁（.web 生成时使用）
-    let textsJSON: String? = sceneBakeOnMain { RendererBridge.shared.getDynamicTextsJson() }
-    if let json = textsJSON {
-        let textsURL = cfg.outputURL.deletingLastPathComponent().appendingPathComponent(cfg.outputURL.deletingPathExtension().lastPathComponent + "_dynamic_texts.json")
-        do {
-            try json.write(to: textsURL, atomically: true, encoding: .utf8)
-            print("[Bake] Saved dynamic texts JSON to \(textsURL.path)")
-        } catch {
-            print("[Bake] Failed to save dynamic texts JSON: \(error)")
-        }
-    } else {
-        print("[Bake] Dynamic texts JSON not available (renderer may not support it)")
     }
 
     let frameCount = max(1, Int(Double(cfg.fps) * cfg.durationSeconds))
@@ -2685,6 +2782,193 @@ private func sceneOfflineBakeRunStandalone(arguments: [String]) -> Never {
     _exit(sceneOfflineBakeExitCode)
 }
 
+private final class ScenePreviewAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    let arguments: [String]
+    private var signalSources: [DispatchSourceSignal] = []
+    private var keyEventMonitor: Any?
+    private var previewTickTimer: Timer?
+    private weak var previewWindow: NSWindow?
+    private var isTerminating = false
+
+    init(arguments: [String]) {
+        self.arguments = arguments
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 监听父进程发来的 SIGTERM/SIGINT，否则 AppKit run loop 会忽略默认信号处理，
+        // 导致父进程的 `process.terminate()` 无法退出预览窗口（用户原报告的"老渲染器预览没法退出"）。
+        installPreviewSignalHandlers()
+
+        let args = arguments
+        DispatchQueue.main.async {
+            do {
+                let cfg = try scenePreviewParseConfig(args)
+                guard FileManager.default.fileExists(atPath: cfg.sceneRoot) else {
+                    fputs("Preview failed: scene path not found\n", stderr)
+                    fflush(stderr)
+                    NSApp.terminate(nil)
+                    return
+                }
+                RendererBridge.shared.destroy()
+                RendererBridge.shared.setCloseHandler {
+                    DispatchQueue.main.async {
+                        NSApp.terminate(nil)
+                    }
+                }
+                RendererBridge.shared.loadWallpaper(path: cfg.sceneRoot, width: cfg.width, height: cfg.height, autoStartTicking: false)
+                if cfg.hideDynamicText {
+                    RendererBridge.shared.setProperty("showDynamicText", "0")
+                }
+                RendererBridge.shared.setDesktopWindow(false)
+                RendererBridge.shared.showWindow()
+                self.installPreviewKeyboardShortcuts()
+                self.startPreviewTicking()
+                self.centerPreviewWindow()
+                NSApp.activate(ignoringOtherApps: true)
+                print(cfg.sceneRoot)
+            } catch {
+                fputs("Preview failed: \(error.localizedDescription)\n", stderr)
+                fflush(stderr)
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    private func installPreviewKeyboardShortcuts() {
+        guard keyEventMonitor == nil else { return }
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            let isEscape = event.keyCode == 53
+            let isCommandW = event.modifierFlags.contains(.command) && chars == "w"
+            if isEscape || isCommandW {
+                self?.terminatePreview()
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func startPreviewTicking() {
+        previewTickTimer?.invalidate()
+        previewTickTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard RendererBridge.shared.tickOnce() else {
+                self.terminatePreview()
+            }
+        }
+        if let previewTickTimer {
+            RunLoop.main.add(previewTickTimer, forMode: .common)
+        }
+    }
+
+    private func centerPreviewWindow(attempt: Int = 0) {
+        let windows = NSApp.windows.filter { window in
+            window.isVisible && !window.isMiniaturized && window.frame.width > 1 && window.frame.height > 1
+        }
+        if let window = windows.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) {
+            previewWindow = window
+            window.delegate = self
+            window.isReleasedWhenClosed = false
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        guard attempt < 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.centerPreviewWindow(attempt: attempt + 1)
+        }
+    }
+
+    private func terminatePreview(exitCode: Int32 = 0) -> Never {
+        if isTerminating {
+            _exit(exitCode)
+        }
+        isTerminating = true
+        previewTickTimer?.invalidate()
+        previewTickTimer = nil
+        if let keyEventMonitor {
+            NSEvent.removeMonitor(keyEventMonitor)
+            self.keyEventMonitor = nil
+        }
+        RendererBridge.shared.destroy()
+        fflush(stdout)
+        fflush(stderr)
+        _exit(exitCode)
+    }
+
+    private func installPreviewSignalHandlers() {
+        // 必须先用 SIG_IGN 屏蔽默认行为，否则进程会被默认信号处理直接终止，
+        // DispatchSource 永远收不到事件。
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGINT, SIG_IGN)
+        let queue = DispatchQueue.main
+        for sig in [SIGTERM, SIGINT] {
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+            src.setEventHandler {
+                fputs("Preview received signal \(sig), exiting...\n", stderr)
+                fflush(stderr)
+                self.terminatePreview()
+            }
+            src.resume()
+            signalSources.append(src)
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        terminatePreview()
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === previewWindow else { return true }
+        terminatePreview()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === previewWindow else { return }
+        terminatePreview()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        previewTickTimer?.invalidate()
+        previewTickTimer = nil
+        if let keyEventMonitor {
+            NSEvent.removeMonitor(keyEventMonitor)
+            self.keyEventMonitor = nil
+        }
+        for src in signalSources {
+            src.cancel()
+        }
+        signalSources.removeAll()
+        RendererBridge.shared.destroy()
+    }
+}
+
+private final class ScenePreviewDelegateBox {
+    let delegate: ScenePreviewAppDelegate
+    init(arguments: [String]) {
+        delegate = ScenePreviewAppDelegate(arguments: arguments)
+    }
+}
+
+private var scenePreviewDelegateBox: ScenePreviewDelegateBox?
+
+private func scenePreviewRunStandalone(arguments: [String]) -> Never {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let box = ScenePreviewDelegateBox(arguments: arguments)
+    scenePreviewDelegateBox = box
+    app.delegate = box.delegate
+    app.run()
+    fflush(stdout)
+    fflush(stderr)
+    _exit(0)
+}
+
 // MARK: - Main
 @main
 struct WallpaperEngineCLI {
@@ -2709,10 +2993,19 @@ struct WallpaperEngineCLI {
         if command == "bake" {
             let bakeArgs = Array(remainingArgs.dropFirst())
             guard bakeArgs.count >= 2 else {
-                print("Usage: wallpaperengine-cli bake <scene_dir> <out.mp4> [width height fps seconds]")
+                print("Usage: wallpaperengine-cli bake <scene_dir> <out.mp4> [width height fps seconds] [--no-dynamic-text]")
                 exit(1)
             }
             sceneOfflineBakeRunStandalone(arguments: bakeArgs)
+        }
+
+        if command == "preview" {
+            let previewArgs = Array(remainingArgs.dropFirst())
+            guard previewArgs.count >= 1 else {
+                print("Usage: wallpaperengine-cli preview <scene_dir> [width height] [--no-dynamic-text]")
+                exit(1)
+            }
+            scenePreviewRunStandalone(arguments: previewArgs)
         }
 
         switch command {
@@ -2882,7 +3175,10 @@ struct WallpaperEngineCLI {
           resume                      Resume wallpaper
           stop                        Stop wallpaper
           exit                        Alias for stop
-          bake <dir> <out.mp4> [w h fps sec]   Offline H.264 bake (no daemon)
+          preview <scene_dir> [w h] [--no-dynamic-text]
+                                      Open a preview window (SIGTERM exits)
+          bake <dir> <out.mp4> [w h fps sec] [--no-dynamic-text]
+                                      Offline H.264 bake (no daemon)
         """)
     }
 }

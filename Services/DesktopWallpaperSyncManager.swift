@@ -242,9 +242,9 @@ final class DesktopWallpaperSyncManager {
                 continue
             }
 
-            // 跳过 CLI 壁纸的临时 capture 路径（应用重启后不存在，且 CLI daemon 自行管理桌面壁纸）
-            if url.path.contains("wallpaperengine-cli-capture") {
-                print("[DesktopWallpaperSyncManager] [\(source)] Skipping CLI capture path for screen \(screen.localizedName)")
+            // 跳过 wallpaper-wgpu 渲染的临时 capture 路径（应用重启后不存在）
+            if url.path.contains("wallpaper-wgpu-capture") || url.path.contains("wallpaperengine-cli-capture") {
+                print("[DesktopWallpaperSyncManager] [\(source)] Skipping wallpaper-wgpu capture path for screen \(screen.localizedName)")
                 continue
             }
 

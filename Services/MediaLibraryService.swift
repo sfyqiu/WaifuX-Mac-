@@ -179,7 +179,11 @@ final class MediaLibraryService: ObservableObject {
         }
     }
 
-    func attachSceneBakeArtifact(itemID: String, artifact: SceneBakeArtifact) {
+    func attachSceneBakeArtifact(
+        itemID: String,
+        artifact: SceneBakeArtifact,
+        regeneratePoster: Bool = true
+    ) {
         guard let index = downloadRecords.firstIndex(where: { $0.item.id == itemID && $0.isActive }) else {
             return
         }
@@ -188,17 +192,13 @@ final class MediaLibraryService: ObservableObject {
         downloadRecords = Array(downloadRecords)
 
         // 确保烘焙视频有抽帧封面
-        let bakedVideoURL = URL(fileURLWithPath: artifact.videoPath)
-        if FileManager.default.fileExists(atPath: artifact.videoPath) {
+        if regeneratePoster {
+            let bakedVideoURL = URL(fileURLWithPath: artifact.videoPath)
             Task { @MainActor in
-                if let posterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: bakedVideoURL) {
-                    // 抽帧生成后通知 UI 刷新封面
-                    NotificationCenter.default.post(
-                        name: .sceneOfflineBakeThumbnailDidUpdate,
-                        object: itemID,
-                        userInfo: ["thumbnailURL": posterURL]
-                    )
-                }
+                await regenerateSceneBakePosterAndNotify(
+                    itemID: itemID,
+                    videoURL: bakedVideoURL
+                )
             }
         }
     }
@@ -390,9 +390,19 @@ final class MediaLibraryService: ObservableObject {
         guard let index = downloadRecords.firstIndex(where: { $0.item.id == itemID }) else { return }
         let record = downloadRecords[index]
         deleteSceneBakeArtifacts(for: record)
+        VideoThumbnailCache.shared.removeSceneBakePoster(
+            itemID: record.item.id,
+            videoPath: record.sceneBakeArtifact?.videoPath
+        )
         objectWillChange.send()
         downloadRecords[index].sceneBakeArtifact = nil
         persistDownloads()
+        downloadRecords = Array(downloadRecords)
+        NotificationCenter.default.post(
+            name: .sceneOfflineBakeThumbnailDidUpdate,
+            object: record.item.id,
+            userInfo: [:]
+        )
     }
 
     /// 删除与下载记录关联的 Scene 烘焙产物
@@ -410,7 +420,6 @@ final class MediaLibraryService: ObservableObject {
                 print("[MediaLibraryService] ⚠️ Failed to delete scene bake video \(artifact.videoPath): \(error)")
             }
         }
-
         // 2. 删除该 item 对应的烘焙目录（清理空目录或残留文件）
         let safeID = record.item.id.replacingOccurrences(of: "/", with: "_")
         let bakeDir = DownloadPathManager.shared.sceneBakesFolderURL

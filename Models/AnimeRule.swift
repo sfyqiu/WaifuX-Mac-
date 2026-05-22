@@ -275,7 +275,7 @@ struct AnimeRuleIndex: Codable {
 
 // MARK: - 动漫内容项
 
-struct AnimeSearchResult: Identifiable, Codable, Equatable {
+struct AnimeSearchResult: Identifiable, Codable, Hashable {
     let id: String
     let title: String
     let coverURL: String?
@@ -296,7 +296,10 @@ struct AnimeSearchResult: Identifiable, Codable, Equatable {
     // 计算属性：显示标题
     var displayTitle: String { title }
 
-    // Equatable 实现：只比较 id 避免 AnimeTag 需要 Equatable
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+
     static func == (lhs: AnimeSearchResult, rhs: AnimeSearchResult) -> Bool {
         lhs.id == rhs.id
     }

@@ -19,6 +19,7 @@ class SettingsViewModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(grainTextureEnabled, forKey: "grain_texture_enabled")
             ArcBackgroundSettings.shared.grainTextureEnabled = grainTextureEnabled
+            VideoWallpaperManager.shared.refreshGrainOverlay()
         }
     }
     @Published var grainTextureQuality = "high" { didSet { UserDefaults.standard.set(grainTextureQuality, forKey: "grain_texture_quality") } }
@@ -27,6 +28,7 @@ class SettingsViewModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(grainIntensity, forKey: "arc_grain_intensity")
             ArcBackgroundSettings.shared.grainIntensity = grainIntensity
+            VideoWallpaperManager.shared.refreshGrainOverlay()
         }
     }
     @Published var pauseWhenOtherAppForeground = false { didSet { UserDefaults.standard.set(pauseWhenOtherAppForeground, forKey: "pause_when_other_app_foreground") } }

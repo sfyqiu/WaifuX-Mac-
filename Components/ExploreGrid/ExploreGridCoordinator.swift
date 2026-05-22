@@ -170,7 +170,6 @@ final class ExploreGridCoordinator: NSObject {
         scrollDebounceWorkItem?.cancel()
         restoreHoverWorkItem?.cancel()
         setHoverInteractionEnabledForVisibleItems(false)
-        ExploreListGIFPlaybackState.shared.noteListScrolling()
     }
 
     func scheduleHoverRestoreAfterScrollWheel() {

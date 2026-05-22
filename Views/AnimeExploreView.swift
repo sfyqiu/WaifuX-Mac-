@@ -5,7 +5,10 @@ private struct AnimeLoadMoreSentinelMinYPreferenceKey: PreferenceKey {
     static let defaultValue: CGFloat = .greatestFiniteMagnitude
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+        let next = nextValue()
+        if next < value {
+            value = next
+        }
     }
 }
 
@@ -26,6 +29,8 @@ struct AnimeExploreView: View {
     }
     @StateObject private var exploreAtmosphere = ExploreAtmosphereController(wallpaperMode: false)
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
+    @ObservedObject private var videoWallpaperManager = VideoWallpaperManager.shared
+    @ObservedObject private var wallpaperEngineBridge = WallpaperEngineXBridge.shared
 
     // MARK: State
     @State private var selectedCategory: AnimeCategory = .all
@@ -41,13 +46,16 @@ struct AnimeExploreView: View {
     @State private var searchTask: Task<Void, Never>?
     @State private var isTagSearchActive = false
     @State private var lastSyncedFirstAnimeID: String?
+    @State private var sentinelDebounceTask: DispatchWorkItem?
+    @StateObject private var columnCache = ExploreColumnDistributionCache<AnimeSearchResult>()
+    @State private var columnLayoutVersion = 0
 
-    // ExploreGridContainer 控制 token
-    @State private var gridScrollToTopToken: Int = 0
-    @State private var gridReloadToken: Int = 0
-    @State private var gridLayoutRefreshToken: Int = 0
-    @State private var gridSavedScrollOffset: CGFloat = 0
-    @State private var gridContentHeight: CGFloat = 600
+    private var shouldUseLightweightEffects: Bool {
+        (videoWallpaperManager.isVideoWallpaperActive && !videoWallpaperManager.isPaused) ||
+        (wallpaperEngineBridge.isControllingExternalEngine && !wallpaperEngineBridge.isExternalPaused)
+    }
+
+    // Grid 控制
     @State private var showScrollToTop: Bool = false
     @State private var outerScrollToTopToken: Int = 0
 
@@ -62,11 +70,12 @@ struct AnimeExploreView: View {
                 } else {
                     ArcAtmosphereBackground(
                         tint: exploreAtmosphere.tint,
-                        referenceImage: exploreAtmosphere.referenceImage,
+                        referenceImage: shouldUseLightweightEffects ? nil : exploreAtmosphere.referenceImage,
                         isLightMode: arcSettings.isLightMode,
                         dotGridOpacity: arcSettings.dotGridOpacity,
                         useNoise: true,
-                        grainIntensity: arcSettings.exploreGrainAnime
+                        grainIntensity: arcSettings.exploreGrainAnime,
+                        lightweight: shouldUseLightweightEffects
                     )
                     .ignoresSafeArea()
                 }
@@ -84,30 +93,11 @@ struct AnimeExploreView: View {
                             .transition(.opacity.animation(.easeInOut(duration: 0.25)))
                         }
                     } else {
-                        ScrollView(.vertical, showsIndicators: false) {
-                            VStack(alignment: .leading, spacing: 0) {
-                                ScrollToTopHelper(trigger: outerScrollToTopToken)
-                                    .frame(height: 0)
-                                headerStack
-                                animeGrid(contentWidth: contentWidth)
-                                    .frame(height: max(gridContentHeight, 320))
-                                loadMoreSentinel
-                            }
-                            .padding(.horizontal, 28)
-                            .frame(width: geometry.size.width, alignment: .leading)
-                            .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
-                            .environment(\.arcIsLightMode, arcSettings.isLightMode)
+                        if #available(macOS 15.0, *) {
+                            scrollViewModern(contentWidth: contentWidth, geometry: geometry)
+                        } else {
+                            scrollViewLegacy(contentWidth: contentWidth, geometry: geometry)
                         }
-                        .coordinateSpace(name: Self.scrollCoordinateSpaceName)
-                        .onChange(of: viewModel.animeItems.count) { _, count in
-                            if count > 60 { showScrollToTop = true }
-                        }
-
-                        .onPreferenceChange(AnimeLoadMoreSentinelMinYPreferenceKey.self) { sentinelMinY in
-                            handleLoadMoreSentinelPosition(sentinelMinY, viewportHeight: geometry.size.height)
-                        }
-                        .scrollDisabled(!isVisible)
-                        .disabled(isInitialLoading)
                     }
 
                     bottomLoadingOverlay
@@ -125,15 +115,18 @@ struct AnimeExploreView: View {
         .onChange(of: isVisible) { _, visible in
             if !visible {
                 searchTask?.cancel()
+                sentinelDebounceTask?.cancel()
                 searchTask = nil
+                sentinelDebounceTask = nil
+                columnCache.invalidate()
                 exploreAtmosphere.pause()
             } else {
                 syncAtmosphereIfNeeded()
-                gridLayoutRefreshToken &+= 1
             }
         }
         .onChange(of: searchText) { _, newValue in handleSearchChange(newValue) }
         .onChange(of: viewModel.animeItems) { _, _ in
+            columnLayoutVersion &+= 1
             syncAtmosphereIfNeeded()
         }
     }
@@ -191,7 +184,6 @@ struct AnimeExploreView: View {
                 Spacer()
                 if showScrollToTop {
                     Button {
-                        gridScrollToTopToken &+= 1
                         outerScrollToTopToken &+= 1
                     } label: {
                         Image(systemName: "arrow.up")
@@ -320,7 +312,7 @@ struct AnimeExploreView: View {
         }
     }
 
-    // MARK: - Header Stack (注入 ExploreGridContainer.header)
+    // MARK: - Header Stack
 
     private var headerStack: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -344,47 +336,39 @@ struct AnimeExploreView: View {
         let columnCount = contentWidth > 1200 ? 5 : (contentWidth > 800 ? 4 : 3)
         let spacing: CGFloat = 20
         let totalSpacing = spacing * CGFloat(columnCount - 1)
-        let cardWidth = floor((contentWidth - totalSpacing) / CGFloat(columnCount))
+        let cardWidth = max(1, floor((contentWidth - totalSpacing) / CGFloat(columnCount)))
+        let items = viewModel.animeItems
+        let columnItems = distributeItemsToColumns(items: items, cardWidth: cardWidth, columnCount: columnCount, spacing: spacing)
 
-        // AnimeGridCell 内部约束 10:14 封面 + 44pt 底栏
-        let imageHeight = cardWidth * 1.4
-        let effectiveAspect = cardWidth / max(1, imageHeight + 44)
+        return HStack(alignment: .top, spacing: spacing) {
+            ForEach(0..<columnCount, id: \.self) { columnIndex in
+                let items = columnItems[safe: columnIndex] ?? []
+                LazyVStack(spacing: spacing) {
+                    ForEach(items) { anime in
+                        AnimeCardView(
+                            anime: anime,
+                            cardWidth: cardWidth
+                        ) {
+                            selectedAnime = anime
+                        }
+                    }
+                }
+                .frame(width: cardWidth)
+            }
+        }
+    }
 
-        return ExploreGridContainer(
-            itemCount: { viewModel.animeItems.count },
-            aspectRatio: { _ in effectiveAspect },
-            configureCell: { cell, index in
-                guard index < viewModel.animeItems.count else { return }
-                cell.configure(with: viewModel.animeItems[index], isFavorite: false)
-            },
-            cellClass: AnimeGridCell.self,
-            onSelect: { index in
-                guard index < viewModel.animeItems.count else { return }
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                    selectedAnime = viewModel.animeItems[index]
-                }
-            },
-            onVisibleItemsChange: { _ in
-                // Cell 内 ImageLoader 走 LRU，无需 SwiftUI 侧 prefetch
-            },
-            onScrollOffsetChange: { offset in
-                gridSavedScrollOffset = offset
-            },
-            onReachBottom: triggerLoadMore,
-            scrollToTopToken: gridScrollToTopToken,
-            reloadToken: gridReloadToken,
-            layoutRefreshToken: gridLayoutRefreshToken,
-            allowsScrolling: false,
-            onContentHeightChange: { height in
-                if abs(gridContentHeight - height) > 0.5 {
-                    gridContentHeight = height
-                }
-            },
-            isVisible: isVisible,
-            layoutWidth: contentWidth,
-            gridColumnCount: columnCount,
-            hoverExpansionAllowance: 8
-        )
+    /// 瀑布流：将动漫项分配到最短列
+    private func distributeItemsToColumns(items: [AnimeSearchResult], cardWidth: CGFloat, columnCount: Int, spacing: CGFloat) -> [[AnimeSearchResult]] {
+        columnCache.columns(
+            for: items,
+            version: columnLayoutVersion,
+            columnCount: columnCount,
+            cardWidth: cardWidth,
+            spacing: spacing
+        ) { _ in
+            cardWidth * 1.4 + 44
+        }
     }
 
     // MARK: - UI Components
@@ -418,6 +402,75 @@ struct AnimeExploreView: View {
         .exploreFrostedPanel(cornerRadius: 30, tint: exploreAtmosphere.tint.primary)
     }
 
+    // MARK: - macOS 15+：使用 onScrollGeometryChange
+
+    @available(macOS 15.0, *)
+    private func scrollViewModern(contentWidth: CGFloat, geometry: GeometryProxy) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                ScrollToTopHelper(trigger: outerScrollToTopToken)
+                    .frame(height: 0)
+                headerStack
+                animeGrid(contentWidth: contentWidth)
+            }
+            .padding(.horizontal, 28)
+            .frame(width: geometry.size.width, alignment: .leading)
+            .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
+            .environment(\.arcIsLightMode, arcSettings.isLightMode)
+        }
+        .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+        .onChange(of: viewModel.animeItems.count) { _, count in
+            columnLayoutVersion &+= 1
+            if count > 60 { showScrollToTop = true }
+        }
+        .onScrollGeometryChange(for: CGFloat.self, of: { geometry in
+            let bottomOffset = geometry.contentOffset.y + geometry.containerSize.height
+            return geometry.contentSize.height - bottomOffset
+        }, action: { _, distanceFromBottom in
+            guard isVisible, distanceFromBottom.isFinite else { return }
+            if distanceFromBottom <= Self.loadMoreTriggerThreshold {
+                triggerLoadMore()
+            }
+        })
+        .scrollDisabled(!isVisible)
+        .disabled(isInitialLoading)
+    }
+
+    // MARK: - macOS 14：使用 PreferenceKey
+
+    private func scrollViewLegacy(contentWidth: CGFloat, geometry: GeometryProxy) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                ScrollToTopHelper(trigger: outerScrollToTopToken)
+                    .frame(height: 0)
+                headerStack
+                animeGrid(contentWidth: contentWidth)
+                loadMoreSentinel
+            }
+            .padding(.horizontal, 28)
+            .frame(width: geometry.size.width, alignment: .leading)
+            .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
+            .environment(\.arcIsLightMode, arcSettings.isLightMode)
+        }
+        .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+        .onChange(of: viewModel.animeItems.count) { _, count in
+            columnLayoutVersion &+= 1
+            if count > 60 { showScrollToTop = true }
+        }
+        .onPreferenceChange(AnimeLoadMoreSentinelMinYPreferenceKey.self) { sentinelMinY in
+            sentinelDebounceTask?.cancel()
+            let task = DispatchWorkItem {
+                handleLoadMoreSentinelPosition(sentinelMinY, viewportHeight: geometry.size.height)
+            }
+            sentinelDebounceTask = task
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: task)
+        }
+        .scrollDisabled(!isVisible)
+        .disabled(isInitialLoading)
+    }
+
+    // MARK: - 滚动哨兵
+
     private var loadMoreSentinel: some View {
         GeometryReader { proxy in
             Color.clear.preference(
@@ -429,10 +482,6 @@ struct AnimeExploreView: View {
     }
 
     // MARK: - Actions
-
-    private func bumpReloadToken() {
-        gridReloadToken &+= 1
-    }
 
     private func performFirstAppearanceLoad() async {
         isInitialLoading = true
@@ -492,7 +541,6 @@ struct AnimeExploreView: View {
             await viewModel.fetchByCategory(category)
             await MainActor.run {
                 syncAtmosphereIfNeeded()
-                bumpReloadToken()
             }
         }
     }
@@ -515,7 +563,6 @@ struct AnimeExploreView: View {
             }
             await MainActor.run {
                 syncAtmosphereIfNeeded()
-                bumpReloadToken()
             }
         }
     }
@@ -533,7 +580,6 @@ struct AnimeExploreView: View {
         if newValue.isEmpty {
             Task {
                 await viewModel.fetchPopular()
-                await MainActor.run { bumpReloadToken() }
             }
             return
         }
@@ -542,7 +588,6 @@ struct AnimeExploreView: View {
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
             await viewModel.search()
-            await MainActor.run { bumpReloadToken() }
         }
     }
 
@@ -550,7 +595,6 @@ struct AnimeExploreView: View {
         searchTask?.cancel()
         Task {
             await viewModel.search()
-            await MainActor.run { bumpReloadToken() }
         }
     }
 
@@ -559,7 +603,6 @@ struct AnimeExploreView: View {
         selectedHotTag = nil
         Task {
             await viewModel.search()
-            await MainActor.run { bumpReloadToken() }
         }
     }
 
@@ -600,10 +643,8 @@ struct AnimeExploreView: View {
         if reloadData {
             Task {
                 await viewModel.loadInitialData()
-                await MainActor.run { bumpReloadToken() }
             }
         }
-        bumpReloadToken()
     }
 
     private func reloadData() {
@@ -613,9 +654,7 @@ struct AnimeExploreView: View {
         viewModel.errorMessage = nil
         Task {
             await viewModel.loadInitialData()
-            await MainActor.run { bumpReloadToken() }
         }
-        bumpReloadToken()
     }
 
     private func syncAtmosphereIfNeeded() {

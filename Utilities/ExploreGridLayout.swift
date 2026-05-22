@@ -31,3 +31,77 @@ enum ExploreGridLayout {
         )
     }
 }
+
+private struct ExploreColumnDistributionKey: Equatable {
+    let itemCount: Int
+    let version: Int
+    let columnCount: Int
+    let cardWidthUnits: Int
+    let spacingUnits: Int
+}
+
+@MainActor
+final class ExploreColumnDistributionCache<Item>: ObservableObject {
+    private var cachedKey: ExploreColumnDistributionKey?
+    private var cachedColumnIndices: [[Int]] = []
+
+    func columns(
+        for items: [Item],
+        version: Int,
+        columnCount: Int,
+        cardWidth: CGFloat,
+        spacing: CGFloat,
+        height: (Item) -> CGFloat
+    ) -> [[Item]] {
+        let key = ExploreColumnDistributionKey(
+            itemCount: items.count,
+            version: version,
+            columnCount: columnCount,
+            cardWidthUnits: Int((cardWidth * 100).rounded()),
+            spacingUnits: Int((spacing * 100).rounded())
+        )
+
+        if cachedKey != key {
+            cachedKey = key
+            cachedColumnIndices = distributeIndices(
+                for: items,
+                columnCount: columnCount,
+                spacing: spacing,
+                height: height
+            )
+        }
+
+        return cachedColumnIndices.map { indices in
+            indices.compactMap { index in
+                guard items.indices.contains(index) else { return nil }
+                return items[index]
+            }
+        }
+    }
+
+    func invalidate() {
+        cachedKey = nil
+        cachedColumnIndices = []
+    }
+
+    private func distributeIndices(
+        for items: [Item],
+        columnCount: Int,
+        spacing: CGFloat,
+        height: (Item) -> CGFloat
+    ) -> [[Int]] {
+        let safeColumnCount = max(1, columnCount)
+        var columns: [[Int]] = Array(repeating: [], count: safeColumnCount)
+        var columnHeights: [CGFloat] = Array(repeating: 0, count: safeColumnCount)
+
+        for (index, item) in items.enumerated() {
+            let itemHeight = max(1, height(item))
+            let minHeight = columnHeights.min() ?? 0
+            let column = columnHeights.firstIndex(of: minHeight) ?? 0
+            columns[column].append(index)
+            columnHeights[column] += itemHeight + spacing
+        }
+
+        return columns
+    }
+}

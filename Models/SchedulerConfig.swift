@@ -18,6 +18,8 @@ struct DisplaySchedulerConfig: Codable, Equatable {
     var order: ScheduleOrder
     var includeWallpapers: Bool
     var includeMedia: Bool
+    /// 限制自动切换的文件夹 ID 列表。nil = 全部，非空数组 = 仅这些文件夹（含根目录无 folderID 的项）
+    var folderIDs: [String]?
 
     /// 判断是否为"播完即换"模式
     var isOnEndMode: Bool {
@@ -30,7 +32,8 @@ struct DisplaySchedulerConfig: Codable, Equatable {
             intervalMinutes: config.intervalMinutes,
             order: config.order,
             includeWallpapers: config.includeWallpapers,
-            includeMedia: config.includeMedia
+            includeMedia: config.includeMedia,
+            folderIDs: nil
         )
     }
 
@@ -41,6 +44,7 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         case source
         case includeWallpapers
         case includeMedia
+        case folderIDs
     }
 
     init(
@@ -48,13 +52,15 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         intervalMinutes: Int,
         order: ScheduleOrder,
         includeWallpapers: Bool,
-        includeMedia: Bool
+        includeMedia: Bool,
+        folderIDs: [String]? = nil
     ) {
         self.isEnabled = isEnabled
         self.intervalMinutes = intervalMinutes
         self.order = order
         self.includeWallpapers = includeWallpapers
         self.includeMedia = includeMedia
+        self.folderIDs = folderIDs
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +68,7 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
         intervalMinutes = try container.decode(Int.self, forKey: .intervalMinutes)
         order = try container.decode(ScheduleOrder.self, forKey: .order)
+        folderIDs = try container.decodeIfPresent([String].self, forKey: .folderIDs)
 
         if let includeWallpapers = try? container.decode(Bool.self, forKey: .includeWallpapers),
            let includeMedia = try? container.decode(Bool.self, forKey: .includeMedia) {
@@ -89,6 +96,7 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         try container.encode(order, forKey: .order)
         try container.encode(includeWallpapers, forKey: .includeWallpapers)
         try container.encode(includeMedia, forKey: .includeMedia)
+        try container.encodeIfPresent(folderIDs, forKey: .folderIDs)
     }
 }
 

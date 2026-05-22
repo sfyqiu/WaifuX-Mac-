@@ -782,6 +782,17 @@ private struct SchedulerSettingsTab: View {
                             }
                             .padding(.horizontal, 16)
                             .padding(.vertical, 12)
+
+                            dividerLine
+
+                            // 文件夹选择
+                            FolderPickerRow(
+                                folderIDs: displayConfig.folderIDs,
+                                screenID: screenID,
+                                viewModel: viewModel
+                            )
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
                         }
                     }
 
@@ -790,6 +801,85 @@ private struct SchedulerSettingsTab: View {
                     }
                 }
             }
+        }
+    }
+
+    // MARK: - 文件夹选择组件
+    private struct FolderPickerRow: View {
+        let folderIDs: [String]?
+        let screenID: String
+        @ObservedObject var viewModel: SettingsViewModel
+
+        @State private var wallpaperFolders: [LibraryFolder] = []
+        @State private var mediaFolders: [LibraryFolder] = []
+
+        var body: some View {
+            HStack(spacing: 12) {
+                Text("文件夹")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.9))
+
+                Spacer()
+
+                Menu {
+                    Button(action: {
+                        viewModel.schedulerViewModel.updateDisplayFolderIDs(nil, for: screenID)
+                    }) {
+                        HStack {
+                            Text("全部")
+                            if folderIDs == nil {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+
+                    if !allFolders.isEmpty {
+                        Divider()
+                        ForEach(allFolders) { folder in
+                            Button(action: {
+                                viewModel.schedulerViewModel.updateDisplayFolderIDs([folder.id], for: screenID)
+                            }) {
+                                HStack {
+                                    Text(folder.name)
+                                    if folderIDs == [folder.id] {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Text(folderIDsLabel)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.6))
+                }
+                .menuStyle(.borderlessButton)
+            }
+            .onAppear {
+                refreshFolders()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                refreshFolders()
+            }
+        }
+
+        private var allFolders: [LibraryFolder] {
+            (wallpaperFolders + mediaFolders).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }
+
+        private var folderIDsLabel: String {
+            guard let folderIDs else { return "全部" }
+            if folderIDs.isEmpty { return "无文件夹" }
+            let names = folderIDs.compactMap { id in
+                allFolders.first(where: { $0.id == id })?.name
+            }
+            if names.isEmpty { return "无文件夹" }
+            return names.joined(separator: ", ")
+        }
+
+        private func refreshFolders() {
+            wallpaperFolders = LibraryFolderStore.shared.folders(for: .wallpaper)
+            mediaFolders = LibraryFolderStore.shared.folders(for: .media)
         }
     }
 

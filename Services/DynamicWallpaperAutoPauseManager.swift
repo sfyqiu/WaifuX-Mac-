@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CoreGraphics
+import Combine
 
 /// 动态壁纸自动暂停管理器
 /// 根据用户设置，在以下场景自动暂停/恢复动态壁纸：
@@ -12,6 +13,8 @@ final class DynamicWallpaperAutoPauseManager {
     static let shared = DynamicWallpaperAutoPauseManager()
 
     private var checkTimer: Timer?
+    private var checkTimerCancellable: AnyCancellable?
+    private var cancellables = Set<AnyCancellable>()
     /// 当前是否存在“前台应用”这一自动暂停原因。
     private var foregroundPauseRequested = false
     /// 当前是否存在“电池供电”这一自动暂停原因。
@@ -59,7 +62,7 @@ final class DynamicWallpaperAutoPauseManager {
             updateTimer()
         }
     }
-    
+
     /// 切换到电池供电时自动暂停动态壁纸
     var pauseOnBatteryPower: Bool {
         get { UserDefaults.standard.bool(forKey: pauseOnBatteryKey) }
@@ -146,16 +149,20 @@ final class DynamicWallpaperAutoPauseManager {
     }
 
     private func startTimer(interval: TimeInterval) {
-        checkTimer?.invalidate()
-        checkTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+        stopTimer()
+        // 使用 Combine Timer.publish 替代 Timer.scheduledTimer（后者闭包非 @MainActor，
+        // 用 Task { @MainActor } 包装会触发 _dispatch_assert_queue_fail）
+        checkTimerCancellable = Timer.publish(every: interval, on: .main, in: .common)
+            .autoconnect()
+            .sink { @MainActor [weak self] _ in
                 self?.checkAndApply()
             }
-        }
         checkAndApply()
     }
 
     private func stopTimer() {
+        checkTimerCancellable?.cancel()
+        checkTimerCancellable = nil
         checkTimer?.invalidate()
         checkTimer = nil
     }
@@ -227,9 +234,9 @@ final class DynamicWallpaperAutoPauseManager {
             fullscreenAutoPausedExternalEngine = false
         }
     }
-    
+
     // MARK: - 电池供电处理
-    
+
     private func handleBatterySettingChange() {
         if pauseOnBatteryPower {
             PowerSourceMonitor.shared.startMonitoring()
@@ -238,25 +245,25 @@ final class DynamicWallpaperAutoPauseManager {
         }
         syncBatteryPauseRequest()
     }
-    
+
     @objc private func handlePowerSourceChange(_ notification: Notification) {
         guard pauseOnBatteryPower else { return }
         guard let userInfo = notification.userInfo,
               let isOnBattery = userInfo["isOnBatteryPower"] as? Bool else { return }
-        
+
         if isOnBattery {
             handleBatterySwitchedToBattery()
         } else {
             handleBatterySwitchedToAC()
         }
     }
-    
+
     /// 切换到电池供电：自动暂停壁纸（如果正在播放）
     private func handleBatterySwitchedToBattery() {
         batteryPauseRequested = true
         applyGlobalPauseIfNeeded()
     }
-    
+
     /// 切换回 AC 电源：如果之前是电池自动暂停的，恢复播放
     private func handleBatterySwitchedToAC() {
         batteryPauseRequested = false

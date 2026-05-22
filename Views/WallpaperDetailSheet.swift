@@ -8,6 +8,8 @@ struct WallpaperDetailSheet: View {
     @ObservedObject var viewModel: WallpaperViewModel
     let contextWallpapers: [Wallpaper]?
     let onClose: () -> Void
+    /// 当需要在 NavigationStack 中 push 新壁纸时调用（如作者列表点击）
+    let onNavigateToWallpaper: ((Wallpaper) -> Void)?
 
     @State private var resolvedWallpaper: Wallpaper
     @State private var isDownloading = false
@@ -281,11 +283,12 @@ struct WallpaperDetailSheet: View {
         }
     }
 
-    init(wallpaper: Wallpaper, viewModel: WallpaperViewModel, contextWallpapers: [Wallpaper]? = nil, onClose: @escaping () -> Void) {
+    init(wallpaper: Wallpaper, viewModel: WallpaperViewModel, contextWallpapers: [Wallpaper]? = nil, onClose: @escaping () -> Void, onNavigateToWallpaper: ((Wallpaper) -> Void)? = nil) {
         self.initialWallpaper = wallpaper
         self.viewModel = viewModel
         self.contextWallpapers = contextWallpapers
         self.onClose = onClose
+        self.onNavigateToWallpaper = onNavigateToWallpaper
         _resolvedWallpaper = State(initialValue: wallpaper)
     }
 
@@ -781,7 +784,7 @@ struct WallpaperDetailSheet: View {
                     Button {
                         openAuthorSheet()
                     } label: {
-                        compactFact(label: t("author"), value: uploaderLabel)
+                        compactFact(label: t("author"), value: uploaderLabel, isInteractive: true)
                     }
                     .buttonStyle(.plain)
                     .onHover { hovering in
@@ -859,18 +862,24 @@ struct WallpaperDetailSheet: View {
     }
 
     // 紧凑的信息项
-    private func compactFact(label: String, value: String) -> some View {
+    private func compactFact(label: String, value: String, isInteractive: Bool = false) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.white.opacity(0.45))
                 .frame(width: 70, alignment: .leading)
 
-            Text(value)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.9))
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if isInteractive {
+                    detailDisclosureIndicator
+                }
+            }
 
             Spacer(minLength: 0)
         }
@@ -1078,7 +1087,7 @@ struct WallpaperDetailSheet: View {
     }
 
     // MARK: - 元数据胶囊（参考图风格：细长边框）
-    private func DetailMetaCapsule(label: String, value: String, isLast: Bool = false) -> some View {
+    private func DetailMetaCapsule(label: String, value: String, isLast: Bool = false, isInteractive: Bool = false) -> some View {
         HStack(spacing: 4) {
             Text(label)
                 .font(.system(size: 12, weight: .medium))
@@ -1086,6 +1095,9 @@ struct WallpaperDetailSheet: View {
             Text(value)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.9))
+            if isInteractive {
+                detailDisclosureIndicator
+            }
         }
         .padding(.horizontal, 14)
         .frame(height: 32)
@@ -1109,7 +1121,8 @@ struct WallpaperDetailSheet: View {
                 DetailMetaCapsule(
                     label: label,
                     value: value,
-                    isLast: isLast
+                    isLast: isLast,
+                    isInteractive: true
                 )
             }
             .buttonStyle(.plain)
@@ -1123,6 +1136,12 @@ struct WallpaperDetailSheet: View {
                 isLast: isLast
             )
         }
+    }
+
+    private var detailDisclosureIndicator: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white.opacity(0.32))
     }
 
     // MARK: - 壁纸详情 API 获取（补充 uploader 数据）
@@ -1217,22 +1236,18 @@ struct WallpaperDetailSheet: View {
             ) { [self] selectedScreen in
                 isSettingWallpaper = true
                 errorMessage = ""
-                Task {
+                Task { @MainActor in
                     do {
                         let imageURL = try await getWallpaperImageURL()
                         // selectedScreen == nil → 所有显示器；非 nil → 仅指定显示器
                         // viewModel 内部会按需停止对应屏幕的动态壁纸
                         try await viewModel.setWallpaper(from: imageURL, option: .desktop, for: selectedScreen)
                         WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
+                        isSettingWallpaper = false
                     } catch {
-                        await MainActor.run {
-                            errorMessage = "\(t("error")): \(error.localizedDescription)"
-                            showError = true
-                            print("Set wallpaper error: \(error)")
-                            isSettingWallpaper = false
-                        }
-                    }
-                    await MainActor.run {
+                        errorMessage = "\(t("error")): \(error.localizedDescription)"
+                        showError = true
+                        print("Set wallpaper error: \(error)")
                         isSettingWallpaper = false
                     }
                 }
@@ -1241,7 +1256,7 @@ struct WallpaperDetailSheet: View {
             // 单显示器环境下直接设置
             isSettingWallpaper = true
             errorMessage = ""
-            Task {
+            Task { @MainActor in
                 do {
                     let imageURL = try await getWallpaperImageURL()
                     // viewModel 内部会按需停止动态壁纸
@@ -1447,8 +1462,10 @@ struct WallpaperDetailSheet: View {
                 guard !self.isNavigating else { return nil }
                 self.navigateToNextWallpaper()
                 return nil
-            case 53: // ESC：优先关闭预览弹窗，否则关闭详情页
-                if PreviewWindowManager.shared.isPresented {
+            case 53: // ESC：优先关闭当前弹窗，再关闭预览，最后返回详情栈
+                if self.showAuthorSheet {
+                    self.dismissAuthorSheet()
+                } else if PreviewWindowManager.shared.isPresented {
                     PreviewWindowManager.shared.closePreview()
                 } else {
                     self.onClose()
@@ -1503,10 +1520,7 @@ struct WallpaperDetailSheet: View {
                     navigateToAuthorWallpaper(selectedWallpaper)
                 },
                 onDismiss: {
-                    showAuthorSheet = false
-                    authorWallpapers = []
-                    authorWallpapersPage = 1
-                    hasMoreAuthorWallpapers = true
+                    dismissAuthorSheet()
                 },
                 onLoadMore: {
                     self.loadMoreAuthorWallpapers()
@@ -1548,6 +1562,14 @@ struct WallpaperDetailSheet: View {
         }
     }
 
+    private func dismissAuthorSheet() {
+        showAuthorSheet = false
+        authorWallpapers = []
+        authorWallpapersPage = 1
+        hasMoreAuthorWallpapers = true
+        isLoadingAuthorWallpapers = false
+    }
+
     /// 加载更多作者壁纸（分页），防止重复触发
     private func loadMoreAuthorWallpapers() {
         guard let uploader = wallpaper.uploader, !isLoadingAuthorWallpapers, hasMoreAuthorWallpapers else { return }
@@ -1585,7 +1607,13 @@ struct WallpaperDetailSheet: View {
         authorWallpapersPage = 1
         hasMoreAuthorWallpapers = true
 
-        // 导航到该壁纸
+        // 如果有 push 回调，使用 NavigationStack 入栈（保留当前详情页在栈中）
+        if let onNavigateToWallpaper {
+            onNavigateToWallpaper(wallpaper)
+            return
+        }
+
+        // 否则在当前详情页内替换壁纸
         if let index = viewModel.wallpapers.firstIndex(where: { $0.id == wallpaper.id }) {
             navigateToIndex(index)
         } else {

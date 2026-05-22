@@ -1,5 +1,7 @@
 import AppKit
+import AVFoundation
 import Foundation
+import Kingfisher
 
 enum SceneOfflineBakeError: LocalizedError {
     case cliNotFound
@@ -11,12 +13,24 @@ enum SceneOfflineBakeError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .cliNotFound: return "未找到 wallpaperengine-cli"
+        case .cliNotFound: return "未找到 wallpaper-wgpu"
         case .ineligible: return "当前 Scene 不适合离线烘焙（资格不足）"
         case .contentRootMissing: return "内容目录不存在，请重新下载"
         case .insufficientMemory: return LocalizationService.shared.t("sceneBake.error.insufficientMemory.bake")
         case .concurrentBakeInProgress: return LocalizationService.shared.t("sceneBake.error.concurrent")
         case .bakeProcessFailed(let msg): return msg
+        }
+    }
+}
+
+enum SceneBakeRenderer: String, CaseIterable, Codable, Hashable, Sendable {
+    case wallpaperWgpu
+    case legacyCLI
+
+    var displayName: String {
+        switch self {
+        case .wallpaperWgpu: return "1. wallpaper-wgpu"
+        case .legacyCLI: return "2. wallpaperengine-cli"
         }
     }
 }
@@ -28,7 +42,29 @@ extension Notification.Name {
     static let sceneOfflineBakeThumbnailDidUpdate = Notification.Name("sceneOfflineBakeThumbnailDidUpdate")
 }
 
-/// 全局只允许一个 `wallpaperengine-cli bake` 子进程，避免重叠渲染导致内存成倍上涨。
+@discardableResult
+@MainActor
+func regenerateSceneBakePosterAndNotify(itemID: String, videoURL: URL) async -> URL? {
+    guard SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) else { return nil }
+    guard let posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+        forLocalVideo: videoURL,
+        itemID: itemID,
+        forceRegenerate: true
+    ) else {
+        return nil
+    }
+    // 清除 Kingfisher 对该 poster URL 的缓存，确保下次 KFImage 加载时读取磁盘上的新文件
+    try? await ImageCache.default.removeImage(forKey: posterURL.cacheKey)
+    print("[BakeService] ✅ 已清除 Kingfisher 缓存: \(posterURL.cacheKey)")
+    NotificationCenter.default.post(
+        name: .sceneOfflineBakeThumbnailDidUpdate,
+        object: itemID,
+        userInfo: ["thumbnailURL": posterURL]
+    )
+    return posterURL
+}
+
+/// 全局只允许一个 `wallpaper-wgpu bake` 子进程，避免重叠渲染导致内存成倍上涨。
 private actor SceneOfflineBakeConcurrencyGate {
     static let shared = SceneOfflineBakeConcurrencyGate()
     private var busy = false
@@ -44,13 +80,139 @@ private actor SceneOfflineBakeConcurrencyGate {
     }
 }
 
-/// 调用 `wallpaperengine-cli bake` 将 Workshop Scene 预渲染为循环 MP4，并写入下载记录。
+@MainActor
+private final class ScenePreviewProcessController {
+    static let shared = ScenePreviewProcessController()
+    private var process: Process?
+    private var renderer: SceneBakeRenderer?
+
+    func stop() {
+        guard let process else { return }
+        if process.isRunning {
+            process.terminate()
+            let pid = process.processIdentifier
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                if kill(pid, 0) == 0 {
+                    kill(pid, SIGKILL)
+                }
+            }
+        }
+        self.process = nil
+        self.renderer = nil
+    }
+
+    func launch(executableURL: URL, arguments: [String], renderer: SceneBakeRenderer) throws {
+        stop()
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.environment = SceneOfflineBakeService.rendererLaunchEnvironment(for: executableURL)
+        process.terminationHandler = { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.process?.processIdentifier == process.processIdentifier {
+                    self.process = nil
+                    self.renderer = nil
+                }
+            }
+        }
+        try process.run()
+        self.process = process
+        self.renderer = renderer
+    }
+}
+
+/// 将 Workshop Scene 预渲染为循环 MP4，并写入下载记录。
 enum SceneOfflineBakeService {
+    private struct BakedVideoInspection {
+        let duration: TimeInterval
+        let width: Int
+        let height: Int
+    }
+
+    @MainActor
+    static func isRendererAvailable(_ renderer: SceneBakeRenderer) -> Bool {
+        switch renderer {
+        case .wallpaperWgpu:
+            return WallpaperEngineXBridge.resolvedCLIExecutableURL() != nil
+        case .legacyCLI:
+            return resolvedLegacyCLIExecutableURL() != nil
+        }
+    }
+
+    @MainActor
+    static func stopPreview() {
+        ScenePreviewProcessController.shared.stop()
+    }
+
+    @MainActor
+    static func preview(record: MediaDownloadRecord, renderer: SceneBakeRenderer) throws {
+        guard let eligibility = record.sceneBakeEligibility else {
+            throw SceneOfflineBakeError.ineligible
+        }
+        let contentRoot = URL(fileURLWithPath: eligibility.contentRootPath)
+        try preview(
+            eligibility: eligibility,
+            contentRoot: contentRoot,
+            renderer: renderer
+        )
+    }
+
+    @MainActor
+    static func preview(
+        eligibility: SceneBakeEligibilitySnapshot,
+        contentRoot: URL,
+        renderer: SceneBakeRenderer
+    ) throws {
+        guard FileManager.default.fileExists(atPath: contentRoot.path) else {
+            throw SceneOfflineBakeError.contentRootMissing
+        }
+
+        switch renderer {
+        case .wallpaperWgpu:
+            guard let cli = WallpaperEngineXBridge.resolvedCLIExecutableURL() else {
+                throw SceneOfflineBakeError.cliNotFound
+            }
+            // 预览不传 `--wallpaper` / `--background`：保留一个普通可见窗口供用户查看，
+            // 不要把窗口贴成桌面壁纸层级（壁纸层级会被其他窗口遮住，且鼠标事件全部穿透）。
+            var args = ["--release", "--", contentRoot.path]
+            if let assets = WallpaperEngineEmbeddedAssets.materializedAssetsRootIfPresent(),
+               !assets.isEmpty {
+                args += ["--assets", assets]
+            }
+            try ScenePreviewProcessController.shared.launch(
+                executableURL: cli,
+                arguments: args,
+                renderer: renderer
+            )
+        case .legacyCLI:
+            guard let cli = resolvedLegacyCLIExecutableURL() else {
+                throw SceneOfflineBakeError.bakeProcessFailed("未找到 wallpaperengine-cli，无法预览渲染器 2")
+            }
+            let screen = NSScreen.main?.frame ?? .init(x: 0, y: 0, width: 1920, height: 1080)
+            let width = max(64, Int(screen.width))
+            let height = max(64, Int(screen.height))
+            try ScenePreviewProcessController.shared.launch(
+                executableURL: cli,
+                arguments: [
+                    "preview",
+                    contentRoot.path,
+                    String(width),
+                    String(height),
+                    // 预览也跳过 Clock/Date 等动态文本，对齐离线烘焙策略。
+                    "--no-dynamic-text"
+                ],
+                renderer: renderer
+            )
+        }
+    }
+
     /// 缓存文件路径：`analysisId + 分辨率 + fps + 时长`（根目录为 `DownloadPathManager.sceneBakesFolderURL`）
     private static func cacheVideoURL(
         baseDir: URL,
         itemID: String,
         analysisId: UUID,
+        renderer: SceneBakeRenderer,
         width: Int,
         height: Int,
         fps: Int,
@@ -59,8 +221,29 @@ enum SceneOfflineBakeService {
         let safeID = itemID.replacingOccurrences(of: "/", with: "_")
         let dir = baseDir.appendingPathComponent(safeID, isDirectory: true)
         let name =
-            "\(analysisId.uuidString)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s.mp4"
+            "\(analysisId.uuidString)_\(renderer.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s.mp4"
         return dir.appendingPathComponent(name)
+    }
+
+    static func rendererLaunchEnvironment(for executableURL: URL) -> [String: String] {
+        let rendererDirectory = executableURL.deletingLastPathComponent()
+        var env = ProcessInfo.processInfo.environment
+        let searchPaths = [
+            rendererDirectory.path,
+            rendererDirectory.deletingLastPathComponent().path,
+            env["PATH"] ?? ""
+        ].filter { !$0.isEmpty }
+        env["PATH"] = searchPaths.joined(separator: ":")
+
+        let libraryPaths = [
+            rendererDirectory.appendingPathComponent("lib").path,
+            rendererDirectory.deletingLastPathComponent().appendingPathComponent("lib").path,
+            rendererDirectory.appendingPathComponent("Resources").appendingPathComponent("lib").path,
+            rendererDirectory.deletingLastPathComponent().appendingPathComponent("Resources/lib").path,
+            env["DYLD_LIBRARY_PATH"] ?? ""
+        ].filter { !$0.isEmpty }
+        env["DYLD_LIBRARY_PATH"] = libraryPaths.joined(separator: ":")
+        return env
     }
 
     /// 无媒体库记录时（例如仅能从 Steam 目录解析到工程）用于缓存目录名的稳定 ID。
@@ -81,8 +264,15 @@ enum SceneOfflineBakeService {
         cacheItemID: String,
         durationSeconds: Double = 15,
         fps: Int32 = 30,
-        persistArtifactToItemID: String? = nil
+        renderer: SceneBakeRenderer = .wallpaperWgpu,
+        persistArtifactToItemID: String? = nil,
+        progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
+        // 统一并发门控：BakeService 与 SceneOfflineBakeService 共享
+        let alreadyBaking = await MainActor.run { BakeService.shared.isBaking }
+        guard !alreadyBaking else {
+            throw SceneOfflineBakeError.concurrentBakeInProgress
+        }
         let entered = await SceneOfflineBakeConcurrencyGate.shared.tryEnter()
         guard entered else {
             throw SceneOfflineBakeError.concurrentBakeInProgress
@@ -94,7 +284,9 @@ enum SceneOfflineBakeService {
                 cacheItemID: cacheItemID,
                 durationSeconds: durationSeconds,
                 fps: fps,
-                persistArtifactToItemID: persistArtifactToItemID
+                renderer: renderer,
+                persistArtifactToItemID: persistArtifactToItemID,
+                progress: progress
             )
             await SceneOfflineBakeConcurrencyGate.shared.leave()
             await MainActor.run {
@@ -116,7 +308,9 @@ enum SceneOfflineBakeService {
         cacheItemID: String,
         durationSeconds: Double,
         fps: Int32,
-        persistArtifactToItemID: String?
+        renderer: SceneBakeRenderer,
+        persistArtifactToItemID: String?,
+        progress: (@MainActor (Double) -> Void)?
     ) async throws -> SceneBakeArtifact {
         guard FileManager.default.fileExists(atPath: contentRoot.path) else {
             throw SceneOfflineBakeError.contentRootMissing
@@ -125,14 +319,9 @@ enum SceneOfflineBakeService {
             throw SceneOfflineBakeError.insufficientMemory
         }
 
-        guard let cli = WallpaperEngineXBridge.resolvedCLIExecutableURL() else {
-            throw SceneOfflineBakeError.cliNotFound
-        }
-
-        let main = NSScreen.main
-        let scale = main?.backingScaleFactor ?? 2
-        let w = max(64, Int((main?.frame.width ?? 1920) * scale))
-        let h = max(64, Int((main?.frame.height ?? 1080) * scale))
+        let mainDisplaySize = mainDisplayPixelSize()
+        let w = max(64, mainDisplaySize.width)
+        let h = max(64, mainDisplaySize.height)
         let evenW = (w / 2) * 2
         let evenH = (h / 2) * 2
 
@@ -143,6 +332,7 @@ enum SceneOfflineBakeService {
             baseDir: sceneBakesRoot,
             itemID: cacheItemID,
             analysisId: eligibility.analysisId,
+            renderer: renderer,
             width: evenW,
             height: evenH,
             fps: Int(fps),
@@ -151,31 +341,148 @@ enum SceneOfflineBakeService {
 
         try FileManager.default.createDirectory(at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        if FileManager.default.fileExists(atPath: outURL.path),
-           let attrs = try? FileManager.default.attributesOfItem(atPath: outURL.path),
-           let sz = attrs[.size] as? NSNumber, sz.intValue > 10_000 {
+        let cachedInspection: BakedVideoInspection? = {
+            switch renderer {
+            case .wallpaperWgpu:
+                return inspectBakedVideo(at: outURL, expectedWidth: evenW, expectedHeight: evenH)
+            case .legacyCLI:
+                return inspectBakedVideo(at: outURL)
+            }
+        }()
+        if let cachedInspection,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: outURL.path) {
             let artifact = SceneBakeArtifact(
                 analysisId: eligibility.analysisId,
                 videoPath: outURL.path,
-                width: evenW,
-                height: evenH,
+                width: cachedInspection.width,
+                height: cachedInspection.height,
                 fps: Int(fps),
                 durationSeconds: durationSeconds,
-                bakedAt: (attrs[.creationDate] as? Date) ?? .now
+                bakedAt: (attrs[.creationDate] as? Date) ?? .now,
+                renderer: renderer
             )
             if let itemID = persistArtifactToItemID {
                 await MainActor.run {
-                    MediaLibraryService.shared.attachSceneBakeArtifact(itemID: itemID, artifact: artifact)
+                    MediaLibraryService.shared.attachSceneBakeArtifact(
+                        itemID: itemID,
+                        artifact: artifact,
+                        regeneratePoster: false
+                    )
                 }
+                await regenerateSceneBakePosterAndNotify(
+                    itemID: itemID,
+                    videoURL: URL(fileURLWithPath: artifact.videoPath)
+                )
             }
             return artifact
+        }
+        if FileManager.default.fileExists(atPath: outURL.path) {
+            print("[SceneOfflineBake] removing invalid cached MP4: \(outURL.path)")
+            try? FileManager.default.removeItem(at: outURL)
         }
 
         await MainActor.run {
             WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
         }
-        // 与 stop 子进程错开，降低与即将启动的 bake 进程争抢 GPU/内存导致被系统 SIGKILL（退出码常表现为 9）。
+        // 与 stop 子进程错开
         try await Task.sleep(nanoseconds: 250_000_000)
+
+        let artifact: SceneBakeArtifact
+        switch renderer {
+        case .wallpaperWgpu:
+            artifact = try await bakeWithWallpaperWgpu(
+                contentRoot: contentRoot,
+                outURL: outURL,
+                eligibility: eligibility,
+                width: evenW,
+                height: evenH,
+                fps: fps,
+                durationSeconds: durationSeconds,
+                progress: progress
+            )
+        case .legacyCLI:
+            artifact = try await bakeWithLegacyCLI(
+                contentRoot: contentRoot,
+                outURL: outURL,
+                eligibility: eligibility,
+                width: evenW,
+                height: evenH,
+                fps: fps,
+                durationSeconds: durationSeconds
+            )
+        }
+        if let itemID = persistArtifactToItemID {
+            await MainActor.run {
+                MediaLibraryService.shared.attachSceneBakeArtifact(
+                    itemID: itemID,
+                    artifact: artifact,
+                    regeneratePoster: false
+                )
+            }
+            await regenerateSceneBakePosterAndNotify(
+                itemID: itemID,
+                videoURL: URL(fileURLWithPath: artifact.videoPath)
+            )
+        }
+        return artifact
+    }
+
+    private static func bakeWithWallpaperWgpu(
+        contentRoot: URL,
+        outURL: URL,
+        eligibility: SceneBakeEligibilitySnapshot,
+        width: Int,
+        height: Int,
+        fps: Int32,
+        durationSeconds: Double,
+        progress: (@MainActor (Double) -> Void)?
+    ) async throws -> SceneBakeArtifact {
+        let tempURL = outURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(outURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).tmp.mp4")
+        try? FileManager.default.removeItem(at: tempURL)
+
+        let bakeResult = try await BakeService.shared.bakeVideo(
+            scenePath: contentRoot.path,
+            outputURL: tempURL,
+            targetWidth: width,
+            targetHeight: height,
+            fps: Int(fps),
+            duration: durationSeconds,
+            progress: progress
+        )
+
+        guard inspectBakedVideo(at: tempURL, expectedWidth: bakeResult.width, expectedHeight: bakeResult.height) != nil else {
+            try? FileManager.default.removeItem(at: tempURL)
+            try? FileManager.default.removeItem(at: outURL)
+            throw SceneOfflineBakeError.bakeProcessFailed("BakeService 完成后未找到输出文件")
+        }
+        try? FileManager.default.removeItem(at: outURL)
+        try FileManager.default.moveItem(at: tempURL, to: outURL)
+
+        return SceneBakeArtifact(
+            analysisId: eligibility.analysisId,
+            videoPath: outURL.path,
+            width: bakeResult.width,
+            height: bakeResult.height,
+            fps: bakeResult.fps,
+            durationSeconds: bakeResult.duration,
+            bakedAt: .now,
+            renderer: .wallpaperWgpu
+        )
+    }
+
+    private static func bakeWithLegacyCLI(
+        contentRoot: URL,
+        outURL: URL,
+        eligibility: SceneBakeEligibilitySnapshot,
+        width: Int,
+        height: Int,
+        fps: Int32,
+        durationSeconds: Double
+    ) async throws -> SceneBakeArtifact {
+        guard let cli = resolvedLegacyCLIExecutableURL() else {
+            throw SceneOfflineBakeError.bakeProcessFailed("未找到 wallpaperengine-cli，无法使用渲染器 2 烘焙")
+        }
 
         let task = Process()
         task.executableURL = cli
@@ -183,17 +490,22 @@ enum SceneOfflineBakeService {
             "bake",
             contentRoot.path,
             outURL.path,
-            String(evenW),
-            String(evenH),
+            String(width),
+            String(height),
             String(fps),
-            String(Int(durationSeconds))
+            String(Int(durationSeconds)),
+            // 让 CLI 跳过 Clock/Date 等动态文本；离线 MP4 只生成纯视频。
+            "--no-dynamic-text"
         ]
         var env = ProcessInfo.processInfo.environment
         env["LSUIElement"] = "1"
         let execDir = cli.deletingLastPathComponent()
         let dylibCandidates = [
             execDir.path,
+            execDir.appendingPathComponent("lib").path,
             execDir.appendingPathComponent("Resources").path,
+            execDir.appendingPathComponent("Resources/lib").path,
+            execDir.deletingLastPathComponent().appendingPathComponent("Resources/lib").path,
             execDir.deletingLastPathComponent().appendingPathComponent("Frameworks").path
         ]
         var libPaths: [String] = []
@@ -216,8 +528,6 @@ enum SceneOfflineBakeService {
         task.standardOutput = outPipe
         task.standardError = errPipe
 
-        // `waitUntilExit` 为阻塞调用：放在独立线程执行，避免占满 Swift 并发线程池导致
-        // `Task.detached` 管道读取任务无法推进，进而死锁或长时间不返回。
         let processTask = Task.detached(priority: .userInitiated) { () throws -> (Int32, Process.TerminationReason?, String) in
             let outTask = Task.detached {
                 outPipe.fileHandleForReading.readDataToEndOfFile()
@@ -242,7 +552,6 @@ enum SceneOfflineBakeService {
             return (task.terminationStatus, reason, merged)
         }
 
-        // 外部 Task 取消时（如用户关闭 Sheet）必须终止子进程，否则 bake CLI 会继续占用 GPU/内存。
         let (termStatus, termReason, output) = try await withTaskCancellationHandler {
             try await processTask.value
         } onCancel: {
@@ -252,7 +561,6 @@ enum SceneOfflineBakeService {
             processTask.cancel()
         }
 
-        // 子进程已退出后偶现文件系统尚未可见输出文件，短暂轮询避免误判失败。
         if termStatus == 0 {
             for attempt in 0 ..< 15 {
                 if FileManager.default.fileExists(atPath: outURL.path),
@@ -265,7 +573,8 @@ enum SceneOfflineBakeService {
             }
         }
 
-        guard termStatus == 0, FileManager.default.fileExists(atPath: outURL.path) else {
+        let bakedInspection = termStatus == 0 ? inspectBakedVideo(at: outURL) : nil
+        guard let bakedInspection else {
             let status = termStatus
             var hint = ""
             if #available(macOS 10.15, *) {
@@ -276,42 +585,45 @@ enum SceneOfflineBakeService {
                 hint = "（若 stderr 无明确错误，退出码 9 常为 SIGKILL）"
             }
             let tail = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            let base = tail.isEmpty ? "bake 退出码 \(status)\(hint)" : tail + (hint.isEmpty ? "" : "\n\(hint)")
+            let base = tail.isEmpty ? "wallpaperengine-cli bake 退出码 \(status)\(hint)" : tail + (hint.isEmpty ? "" : "\n\(hint)")
+            try? FileManager.default.removeItem(at: outURL)
             throw SceneOfflineBakeError.bakeProcessFailed(base)
         }
 
-        // 生成 Web 叠加层（视频背景 + 动态元素 overlay）
-        generateWebOverlayDirectory(
-            contentRoot: contentRoot,
-            videoPath: outURL.path,
-            sceneWidth: evenW,
-            sceneHeight: evenH
-        )
-
-        let artifact = SceneBakeArtifact(
+        return SceneBakeArtifact(
             analysisId: eligibility.analysisId,
             videoPath: outURL.path,
-            width: evenW,
-            height: evenH,
+            width: bakedInspection.width,
+            height: bakedInspection.height,
             fps: Int(fps),
             durationSeconds: durationSeconds,
-            bakedAt: .now
+            bakedAt: .now,
+            renderer: .legacyCLI
         )
-        if let itemID = persistArtifactToItemID {
-            await MainActor.run {
-                MediaLibraryService.shared.attachSceneBakeArtifact(itemID: itemID, artifact: artifact)
-            }
-            // 烘焙完成后异步生成抽帧，供封面展示使用
-            _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: outURL)
-        }
-        return artifact
+    }
+
+    static func resolvedLegacyCLIExecutableURL() -> URL? {
+        let fm = FileManager.default
+        let candidates = [
+            Bundle.main.url(forResource: "wallpaperengine-cli", withExtension: nil),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/wallpaperengine-cli"),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Resources/wallpaperengine-cli"),
+            Bundle.main.resourceURL?.appendingPathComponent("wallpaperengine-cli"),
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("wallpaperengine-cli"),
+            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/wallpaperengine-cli"),
+            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/Resources/wallpaperengine-cli")
+        ].compactMap { $0 }
+        return candidates.first { fm.isExecutableFile(atPath: $0.path) || fm.fileExists(atPath: $0.path) }
     }
 
     /// 检查是否有缓存（不触发实际烘焙）
-    static func hasCachedArtifact(record: MediaDownloadRecord) -> Bool {
+    static func hasCachedArtifact(record: MediaDownloadRecord, renderer: SceneBakeRenderer? = nil) -> Bool {
         guard let art = record.sceneBakeArtifact,
               art.analysisId == record.sceneBakeEligibility?.analysisId,
-              FileManager.default.fileExists(atPath: art.videoPath) else { return false }
+              isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) else { return false }
+        if let renderer {
+            return art.renderer == renderer
+        }
         return true
     }
 
@@ -319,31 +631,24 @@ enum SceneOfflineBakeService {
     static func bake(
         record: MediaDownloadRecord,
         durationSeconds: Double = 15,
-        fps: Int32 = 30
+        fps: Int32 = 30,
+        renderer: SceneBakeRenderer = .wallpaperWgpu,
+        progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
         guard let eligibility = record.sceneBakeEligibility else {
             throw SceneOfflineBakeError.ineligible
         }
         let contentRoot = URL(fileURLWithPath: eligibility.contentRootPath)
-        do {
-            let artifact = try await bake(
-                eligibility: eligibility,
-                contentRoot: contentRoot,
-                cacheItemID: record.id,
-                durationSeconds: durationSeconds,
-                fps: fps,
-                persistArtifactToItemID: record.id
-            )
-            await MainActor.run {
-                NotificationCenter.default.post(name: .sceneOfflineBakeDidComplete, object: artifact)
-            }
-            return artifact
-        } catch {
-            await MainActor.run {
-                NotificationCenter.default.post(name: .sceneOfflineBakeDidComplete, object: nil)
-            }
-            throw error
-        }
+        return try await bake(
+            eligibility: eligibility,
+            contentRoot: contentRoot,
+            cacheItemID: record.id,
+            durationSeconds: durationSeconds,
+            fps: fps,
+            renderer: renderer,
+            persistArtifactToItemID: record.id,
+            progress: progress
+        )
     }
 
     /// 资格写入后后台自动烘焙（推荐/边缘档位）；已有同 `analysisId` 成品则跳过。
@@ -361,7 +666,8 @@ enum SceneOfflineBakeService {
             }
             if let art = record.sceneBakeArtifact,
                art.analysisId == eligibility.analysisId,
-               FileManager.default.fileExists(atPath: art.videoPath) {
+               (art.renderer == nil || art.renderer == .wallpaperWgpu),
+               isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
                 return
             }
             do {
@@ -377,423 +683,51 @@ enum SceneOfflineBakeService {
         }
     }
 
-    // MARK: - Web Overlay Generation
-
-    /// 生成 Scene 烘焙后的 Web 叠加层目录（.web），包含视频 + index.html + project.json + 字体
-    /// 将动态元素（时钟、日期、音频可视化、视差等）从 scene.json 提取出来，
-    /// 通过 scene-bake-web-template 在烘焙视频之上叠加渲染。
-    private static func generateWebOverlayDirectory(
-        contentRoot: URL,
-        videoPath: String,
-        sceneWidth: Int,
-        sceneHeight: Int
-    ) {
-        // 1. 读取 scene.json
-        guard let sceneDict = loadSceneDictionary(from: contentRoot) else {
-            print("[WebOverlay] Failed to load scene.json from \(contentRoot.path)")
-            return
-        }
-
-        // 2. 解析动态元素（文本、效果、视差等已烘焙排除的内容）
-        let elements = parseSceneObjectsForOverlay(sceneDict: sceneDict)
-
-        // 没有真正需要动态 overlay 的元素时，直接跳过（不生成 .web 目录，纯静态场景已完整烘焙进视频）
-        guard !elements.isEmpty else {
-            print("[WebOverlay] No dynamic overlay elements found, skipping .web generation")
-            return
-        }
-
-        let webDirPath = videoPath.replacingOccurrences(of: ".mp4", with: ".web")
-        let webDir = URL(fileURLWithPath: webDirPath)
-        let fm = FileManager.default
-
-        // 注意：下面任何步骤失败都应清理已创建的 .web 目录，
-        // 否则空目录会导致调度器认为 .web 可用而去调用 CLI，最终渲染失败。
-        let cleanUp = { [webDirPath] in
-            try? fm.removeItem(atPath: webDirPath)
-        }
-
-        do {
-            if fm.fileExists(atPath: webDirPath) {
-                try fm.removeItem(at: webDir)
-            }
-            try fm.createDirectory(at: webDir, withIntermediateDirectories: true)
-        } catch {
-            print("[WebOverlay] Failed to create web directory: \(error)")
-            cleanUp()
-            return
-        }
-
-        // 3. 从 scene.json 读取场景设计分辨率（orthogonalprojection 优先）
-        let designWidth: Int
-        let designHeight: Int
-        if let general = sceneDict["general"] as? [String: Any],
-           let ortho = general["orthogonalprojection"] as? [String: Any],
-           let ow = ortho["width"] as? Int,
-           let oh = ortho["height"] as? Int {
-            designWidth = ow
-            designHeight = oh
-        } else {
-            designWidth = sceneWidth
-            designHeight = sceneHeight
-        }
-
-        // 4. 尝试加载动态文本 JSON（由 CLI bake 过程中保存的渲染器解析结果）
-        let dynamicTexts: [[String: Any]]? = {
-            let videoBase = (videoPath as NSString).deletingPathExtension
-            let jsonPath = videoBase + "_dynamic_texts.json"
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: jsonPath)),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let texts = json["texts"] as? [[String: Any]] else {
-                return nil
-            }
-            print("[WebOverlay] Loaded \(texts.count) dynamic texts from renderer")
-            return texts
-        }()
-
-        // 5. 构建 __SCENE_BAKE_CONFIG__ 配置
-        var config: [String: Any] = [
-            "sceneWidth": designWidth,
-            "sceneHeight": designHeight,
-            "videoSrc": "baked.mp4",
-            "elements": elements
-        ]
-
-        // 如果有渲染器解析的动态文本 JSON，注入到 config.texts（模板优先使用）
-        if let texts = dynamicTexts {
-            config["texts"] = texts
-            config["dynamicTextsSource"] = "renderer"
-        }
-
-        // 6. 复制模板并注入配置
-        guard let templateURL = resolveWebTemplateURL() else {
-            print("[WebOverlay] Template not found")
-            cleanUp()
-            return
-        }
-        guard var templateHTML = try? String(contentsOf: templateURL) else {
-            print("[WebOverlay] Failed to read template")
-            cleanUp()
-            return
-        }
-
-        guard let configData = try? JSONSerialization.data(withJSONObject: config, options: []),
-              let configJSON = String(data: configData, encoding: .utf8) else {
-            print("[WebOverlay] Failed to encode config")
-            cleanUp()
-            return
-        }
-
-        let configScript = "<script>window.__SCENE_BAKE_CONFIG__ = \(configJSON);</script>"
-        if let range = templateHTML.range(of: "</head>") {
-            templateHTML.replaceSubrange(range, with: configScript + "\n</head>")
-        }
-
-        let indexURL = webDir.appendingPathComponent("index.html")
-        do {
-            try templateHTML.write(to: indexURL, atomically: true, encoding: .utf8)
-        } catch {
-            print("[WebOverlay] Failed to write index.html: \(error)")
-            cleanUp()
-            return
-        }
-
-        // 7. 创建 project.json（CLI Web 渲染器需要）
-        let projectJSON: [String: Any] = [
-            "type": "web",
-            "file": "index.html"
-        ]
-        if let projectData = try? JSONSerialization.data(withJSONObject: projectJSON, options: [.prettyPrinted]) {
-            let projectURL = webDir.appendingPathComponent("project.json")
-            try? projectData.write(to: projectURL)
-        }
-
-        // 8. 复制烘焙视频到 .web 目录
-        let videoURL = URL(fileURLWithPath: videoPath)
-        let destVideoURL = webDir.appendingPathComponent("baked.mp4")
-        do {
-            try fm.copyItem(at: videoURL, to: destVideoURL)
-        } catch {
-            print("[WebOverlay] Failed to copy video: \(error)")
-        }
-
-        // 9. 复制引用的字体文件
-        let allElementsForFonts: [[String: Any]] = {
-            if let texts = dynamicTexts {
-                // 合并 elements 与 dynamic texts 的字体引用
-                let textFontEntries = texts.map { t -> [String: Any] in
-                    ["font": t["fontFamily"] as? String ?? ""]
-                }
-                return elements + textFontEntries
-            }
-            return elements
-        }()
-        copyReferencedFonts(elements: allElementsForFonts, from: contentRoot, to: webDir)
-
-        print("[WebOverlay] Generated overlay at \(webDirPath) with \(elements.count) elements")
+    static func isUsableBakedVideo(at url: URL) -> Bool {
+        inspectBakedVideo(at: url) != nil
     }
 
-    /// 查找 scene-bake-web-template/index.html 模板路径
-    private static func resolveWebTemplateURL() -> URL? {
-        if let url = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "scene-bake-web-template") {
-            return url
+    private static func mainDisplayPixelSize() -> (width: Int, height: Int) {
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        if let displayID = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            let cgDisplayID = CGDirectDisplayID(displayID.uint32Value)
+            let width = CGDisplayPixelsWide(cgDisplayID)
+            let height = CGDisplayPixelsHigh(cgDisplayID)
+            if width > 0, height > 0 {
+                print("[SceneOfflineBake] main display pixels: \(width)x\(height)")
+                return (width, height)
+            }
         }
-        // 兼容 Xcode folder reference → Resources 嵌套在 Contents/Resources/Resources/ 下的情况
-        let nestedResources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Resources/scene-bake-web-template/index.html")
-        if FileManager.default.fileExists(atPath: nestedResources.path) {
-            return nestedResources
-        }
-        let candidates = [
-            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/Resources/scene-bake-web-template/index.html"),
-            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/build/WaifuX.app/Contents/Resources/scene-bake-web-template/index.html")
-        ]
-        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+
+        let frame = screen?.frame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let scale = screen?.backingScaleFactor ?? 1
+        let width = max(64, Int((frame.width * scale).rounded()))
+        let height = max(64, Int((frame.height * scale).rounded()))
+        print("[SceneOfflineBake] fallback main display size: \(width)x\(height)")
+        return (width, height)
     }
 
-    /// 从 Scene 内容根目录加载 scene.json（支持 scene.pkg 和普通文件）
-    private static func loadSceneDictionary(from contentRoot: URL) -> [String: Any]? {
-        let fm = FileManager.default
-        let pkgURL = contentRoot.appendingPathComponent("scene.pkg")
-
-        if fm.fileExists(atPath: pkgURL.path) {
-            guard let data = extractSceneJSONFromPKG(pkgURL) else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    private static func inspectBakedVideo(at url: URL, expectedWidth: Int? = nil, expectedHeight: Int? = nil) -> BakedVideoInspection? {
+        guard url.isFileURL,
+              FileManager.default.fileExists(atPath: url.path),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber,
+              size.int64Value > 10_000 else {
+            return nil
         }
 
-        let sceneJSON = contentRoot.appendingPathComponent("scene.json")
-        if fm.fileExists(atPath: sceneJSON.path),
-           let data = try? Data(contentsOf: sceneJSON),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return json
+        let asset = AVURLAsset(url: url)
+        let duration = asset.duration.seconds
+        guard duration.isFinite, duration > 0.5 else { return nil }
+        guard let track = asset.tracks(withMediaType: .video).first else { return nil }
+        let transformedSize = track.naturalSize.applying(track.preferredTransform)
+        let width = abs(Int(transformedSize.width.rounded()))
+        let height = abs(Int(transformedSize.height.rounded()))
+        guard width > 0, height > 0 else { return nil }
+        if let expectedWidth, let expectedHeight, (width != expectedWidth || height != expectedHeight) {
+            print("[SceneOfflineBake] invalid cached MP4 size: actual=\(width)x\(height) expected=\(expectedWidth)x\(expectedHeight) url=\(url.path)")
+            return nil
         }
-
-        return nil
-    }
-
-    /// 从 scene.pkg 中提取 scene.json 数据（简化版，与 SceneBakeEligibilityAnalyzer 对齐）
-    private static func extractSceneJSONFromPKG(_ pkgURL: URL) -> Data? {
-        extractFileFromPKG(pkgURL, fileName: "scene.json")
-    }
-
-    /// 从 scene.pkg 中提取指定文件（通用方法）
-    private static func extractFileFromPKG(_ pkgURL: URL, fileName: String) -> Data? {
-        guard let data = try? Data(contentsOf: pkgURL) else { return nil }
-        var offset = 0
-
-        guard offset + 4 <= data.count else { return nil }
-        let slen = UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-            | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
-        offset += 4 + Int(slen)
-
-        guard offset + 4 <= data.count else { return nil }
-        let nfiles = UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-            | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
-        offset += 4
-
-        var entries: [(name: String, offset: UInt32, length: UInt32)] = []
-        for _ in 0..<Int(nfiles) {
-            guard offset + 4 <= data.count else { return nil }
-            let es = UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-                | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
-            offset += 4
-            guard offset + Int(es) <= data.count else { return nil }
-            let nameData = data.subdata(in: offset..<offset + Int(es))
-            guard let name = String(data: nameData, encoding: .utf8) else { return nil }
-            offset += Int(es)
-            guard offset + 8 <= data.count else { return nil }
-            let fileOff = UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-                | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
-            offset += 4
-            let fileLen = UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-                | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
-            offset += 4
-            entries.append((name, fileOff, fileLen))
-        }
-
-        let base = offset
-        for e in entries {
-            if e.name == fileName || e.name.hasSuffix("/\(fileName)") {
-                let start = base + Int(e.offset)
-                let end = start + Int(e.length)
-                guard end <= data.count else { return nil }
-                return data.subdata(in: start..<end)
-            }
-        }
-        return nil
-    }
-
-    /// 解析 scene.json objects，提取需要在 Web 叠加层上渲染的动态元素
-    private static func parseSceneObjectsForOverlay(sceneDict: [String: Any]) -> [[String: Any]] {
-        guard let objects = sceneDict["objects"] as? [[String: Any]] else { return [] }
-
-        var elements: [[String: Any]] = []
-
-        for obj in objects {
-            let isVisible = obj["visible"] as? Bool ?? true
-            guard isVisible else { continue }
-
-            let textDict = obj["text"] as? [String: Any]
-            let hasTextValue = (textDict?["value"] as? String)?.isEmpty == false
-            let hasTextScript = (textDict?["script"] as? String)?.isEmpty == false
-            let hasText = hasTextValue || hasTextScript
-            let hasParallax = obj["mouseparallax"] as? Bool == true
-
-            // 只保留真正需要动态 overlay 的元素：有实际内容的文本、视差
-            // effects（blur/glow/xray 等）已烘焙进视频，不单独保留；
-            // 仅当文本/视差对象附带 effects 时才作为附加属性保留
-            guard hasText || hasParallax else { continue }
-
-            var element: [String: Any] = [:]
-            element["name"] = obj["name"] as? String ?? ""
-            element["origin"] = obj["origin"] as? String ?? "0 0 0"
-            element["scale"] = obj["scale"] as? String ?? "1 1 1"
-            element["angle"] = obj["angles"] as? String ?? obj["angle"] as? String ?? "0 0 0"
-            element["size"] = obj["size"] as? String ?? "0 0 0"
-            element["visible"] = isVisible
-
-            if let alpha = obj["alpha"] as? Double {
-                element["opacity"] = alpha
-            } else if let alpha = obj["alpha"] as? String, let val = Double(alpha) {
-                element["opacity"] = val
-            }
-
-            if let color = obj["color"] as? String {
-                element["color"] = color
-            }
-
-            if let brightness = obj["brightness"] as? Double {
-                element["brightness"] = brightness
-            } else if let brightness = obj["brightness"] as? String, let val = Double(brightness) {
-                element["brightness"] = val
-            }
-
-            // 文本属性
-            if let text = obj["text"] as? [String: Any] {
-                var tp: [String: Any] = [:]
-                tp["value"] = text["value"] as? String ?? ""
-                tp["script"] = text["script"] as? String ?? ""
-
-                if let font = obj["font"] as? String {
-                    tp["font"] = font
-                    element["font"] = font
-                }
-                if let pointsize = obj["pointsize"] as? Double {
-                    tp["pointSize"] = pointsize
-                } else if let pointsize = obj["pointsize"] as? String, let val = Double(pointsize) {
-                    tp["pointSize"] = val
-                }
-                if let hAlign = obj["horizontalalign"] as? String {
-                    tp["horizontalAlign"] = hAlign
-                }
-                if let vAlign = obj["verticalalign"] as? String {
-                    tp["verticalAlign"] = vAlign
-                }
-                if let bold = obj["bold"] as? Bool {
-                    tp["bold"] = bold
-                }
-                if let bgColor = obj["backgroundcolor"] as? String {
-                    tp["backgroundColor"] = bgColor
-                }
-                if let opaqueBg = obj["opaquebackground"] as? Bool {
-                    tp["opaquebackground"] = opaqueBg
-                }
-                if let padding = obj["padding"] as? Int {
-                    tp["padding"] = padding
-                } else if let padding = obj["padding"] as? String, let val = Int(padding) {
-                    tp["padding"] = val
-                }
-                if let letterSpacing = obj["letterspacing"] as? Double {
-                    tp["letterSpacing"] = letterSpacing
-                } else if let letterSpacing = obj["letterspacing"] as? String, let val = Double(letterSpacing) {
-                    tp["letterSpacing"] = val
-                }
-                if let textCase = obj["textcase"] as? String {
-                    tp["textCase"] = textCase
-                } else if let textCase = obj["texttransform"] as? String {
-                    tp["textCase"] = textCase
-                }
-
-                element["textProperties"] = tp
-                element["type"] = "text"
-            }
-
-            // 效果（blur、glow 等）
-            if let effects = obj["effects"] as? [[String: Any]], !effects.isEmpty {
-                var mappedEffects: [[String: Any]] = []
-                for eff in effects {
-                    var mapped: [String: Any] = [:]
-                    if let file = eff["file"] as? String {
-                        mapped["name"] = file
-                    }
-                    if let passes = eff["passes"] as? [[String: Any]] {
-                        var mappedPasses: [[String: Any]] = []
-                        for pass in passes {
-                            var mappedPass: [String: Any] = [:]
-                            if let cshaders = pass["constantshadervalues"] as? [String: Any] {
-                                mappedPass["constantshadervalues"] = cshaders
-                            }
-                            mappedPasses.append(mappedPass)
-                        }
-                        mapped["passes"] = mappedPasses
-                    }
-                    mappedEffects.append(mapped)
-                }
-                element["effects"] = mappedEffects
-            }
-
-            // 鼠标视差
-            if hasParallax {
-                element["mouseParallax"] = true
-                if let amount = obj["mouseparallaxamount"] as? String {
-                    element["mouseParallaxAmount"] = amount
-                }
-            }
-
-            elements.append(element)
-        }
-
-        return elements
-    }
-
-    /// 将 scene.json 中引用的字体文件复制到 .web 目录（优先从文件系统复制， fallback 从 scene.pkg 提取）
-    private static func copyReferencedFonts(elements: [[String: Any]], from contentRoot: URL, to webDir: URL) {
-        let fm = FileManager.default
-        var fontPaths = Set<String>()
-
-        for el in elements {
-            if let font = el["font"] as? String {
-                fontPaths.insert(font)
-            }
-            if let tp = el["textProperties"] as? [String: Any], let font = tp["font"] as? String {
-                fontPaths.insert(font)
-            }
-        }
-
-        let pkgURL = contentRoot.appendingPathComponent("scene.pkg")
-        let hasPkg = fm.fileExists(atPath: pkgURL.path)
-
-        for fontPath in fontPaths {
-            let src = contentRoot.appendingPathComponent(fontPath)
-            let dest = webDir.appendingPathComponent(fontPath)
-
-            if fm.fileExists(atPath: src.path) {
-                do {
-                    try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try fm.copyItem(at: src, to: dest)
-                } catch {
-                    print("[WebOverlay] Failed to copy font \(fontPath): \(error)")
-                }
-            } else if hasPkg, let fontData = extractFileFromPKG(pkgURL, fileName: fontPath) {
-                do {
-                    try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try fontData.write(to: dest)
-                    print("[WebOverlay] Extracted font \(fontPath) from scene.pkg")
-                } catch {
-                    print("[WebOverlay] Failed to write extracted font \(fontPath): \(error)")
-                }
-            } else {
-                print("[WebOverlay] Font not found, will use system fallback: \(fontPath)")
-            }
-        }
+        return BakedVideoInspection(duration: duration, width: width, height: height)
     }
 }

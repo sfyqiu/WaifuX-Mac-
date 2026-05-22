@@ -42,6 +42,9 @@ struct MyLibraryContentView: View {
     @State private var lastWallpaperPrefetchBucket: Int?
     @State private var lastMediaPrefetchBucket: Int?
     @State private var lastAnimePrefetchBucket: Int?
+    private let wallpaperPrefetchNamespace = "library.wallpapers"
+    private let mediaPrefetchNamespace = "library.media"
+    private let animePrefetchNamespace = "library.anime"
 
     // 文件夹导航
     @State private var currentWallpaperFolderID: String? = nil
@@ -84,6 +87,23 @@ struct MyLibraryContentView: View {
         let itemCount: Int
     }
 
+    private var libraryAtmosphereTint: ExploreAtmosphereTint {
+        switch selectedContentType {
+        case .wallpaper:
+            return .wallpaperFallback
+        case .video:
+            return .mediaFallback
+        case .anime:
+            return ExploreAtmosphereTint(
+                primary: Color(hex: "FF5A7D"),
+                secondary: Color(hex: "8A5CFF"),
+                tertiary: Color(hex: "20C1FF"),
+                baseTop: Color(hex: "1D2128"),
+                baseBottom: Color(hex: "0E1116")
+            )
+        }
+    }
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             if isEditing {
@@ -98,18 +118,15 @@ struct MyLibraryContentView: View {
                     .allowsHitTesting(true)
             }
 
-            if arcSettings.compactMode {
-                arcSettings.compactBackground
-                    .ignoresSafeArea()
-            } else {
-                SpotlightBackground(
-                    lightColor: Color.white.opacity(0.95),
-                    backgroundColor: Color.black,
-                    intensity: 0.9,
-                    spread: 0.4
-                )
-                .ignoresSafeArea()
-            }
+            ArcAtmosphereBackground(
+                tint: libraryAtmosphereTint,
+                referenceImage: nil,
+                isLightMode: arcSettings.isLightMode,
+                dotGridOpacity: arcSettings.dotGridOpacity,
+                useNoise: arcSettings.useNoiseTexture,
+                grainIntensity: arcSettings.grainIntensity,
+                lightweight: true
+            )
 
             GeometryReader { geometry in
                 let contentWidth = max(0, geometry.size.width - 56)
@@ -178,6 +195,9 @@ struct MyLibraryContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
             releaseForegroundMemory()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .appDidReceiveMemoryPressure)) { _ in
+            stopLibraryPrefetchers()
         }
         .onChange(of: selectedContentType) { _, _ in
             // 切换内容类型时重置编辑状态和文件夹导航
@@ -271,6 +291,13 @@ struct MyLibraryContentView: View {
         lastWallpaperPrefetchBucket = nil
         lastMediaPrefetchBucket = nil
         lastAnimePrefetchBucket = nil
+        stopLibraryPrefetchers()
+    }
+
+    private func stopLibraryPrefetchers() {
+        ForegroundPrefetchManager.shared.stop(namespace: wallpaperPrefetchNamespace)
+        ForegroundPrefetchManager.shared.stop(namespace: mediaPrefetchNamespace)
+        ForegroundPrefetchManager.shared.stop(namespace: animePrefetchNamespace)
     }
 
     // MARK: - Hero
@@ -375,14 +402,14 @@ struct MyLibraryContentView: View {
             previewURLs: display.previewURLs,
             itemCount: display.itemCount,
             cardWidth: config.cardWidth,
-            onTap: { navigateToWallpaperFolder(folder.id) },
+            isEditing: isEditing,
+            onTap: { handleFolderTap(folder) },
             onDrop: { ids in moveWallpapersToFolder(ids: ids, folderID: folder.id) },
             onDisband: {
                 folderStore.deleteFolder(id: folder.id, contentType: .wallpaper)
                 updateWallpaperItems()
             }
         )
-        .draggable("waifux:folder:\(folder.id)")
     }
 
     private func navigateToWallpaperFolder(_ folderID: String?) {
@@ -489,7 +516,7 @@ struct MyLibraryContentView: View {
 
     @ViewBuilder
     private func wallpaperGridItem(item: AnyWallpaperItem, config: LibraryGridConfig) -> some View {
-        WallpaperEditCard(
+        let card = WallpaperEditCard(
             wallpaper: item.wallpaper,
             localFileURL: item.localFileURL,
             accent: selectedSubTab == .favorites ? LiquidGlassColors.primaryPink : LiquidGlassColors.accentCyan,
@@ -500,7 +527,6 @@ struct MyLibraryContentView: View {
         ) {
             handleWallpaperTap(item.wallpaper)
         }
-        .draggable("waifux:item:\(item.id)")
         .contextMenu {
             if currentWallpaperFolderID != nil {
                 Button {
@@ -511,6 +537,7 @@ struct MyLibraryContentView: View {
                 }
             }
         }
+        card.draggable(dragPayload(for: item.id))
     }
 
     // MARK: - Media Section
@@ -566,14 +593,14 @@ struct MyLibraryContentView: View {
             previewURLs: display.previewURLs,
             itemCount: display.itemCount,
             cardWidth: config.cardWidth,
-            onTap: { navigateToMediaFolder(folder.id) },
+            isEditing: isEditing,
+            onTap: { handleFolderTap(folder) },
             onDrop: { ids in moveMediasToFolder(ids: ids, folderID: folder.id) },
             onDisband: {
                 folderStore.deleteFolder(id: folder.id, contentType: .media)
                 updateMediaItems()
             }
         )
-        .draggable("waifux:folder:\(folder.id)")
     }
 
     private func navigateToMediaFolder(_ folderID: String?) {
@@ -611,18 +638,20 @@ struct MyLibraryContentView: View {
 
     @ViewBuilder
     private func mediaGridItem(item: AnyMediaItem, config: LibraryGridConfig) -> some View {
-        MediaVideoCard(
+        let card = MediaVideoCard(
             item: item.mediaItem,
             localMediaFileURL: item.localFileURL,
             badgeText: selectedSubTab == .favorites ? t("badge.favorite") : item.mediaItem.resolutionLabel,
             accent: selectedSubTab == .favorites ? LiquidGlassColors.primaryPink : LiquidGlassColors.accentCyan,
             isEditing: isEditing,
             isSelected: selectedItems.contains(item.id),
-            cardWidth: config.cardWidth
+            cardWidth: config.cardWidth,
+            thumbnailURL: item.thumbnailURL,
+            shouldProbeAnimatedThumbnail: item.shouldProbeAnimatedThumbnail,
+            resolvedVideoFileURL: item.resolvedVideoFileURL
         ) {
             handleMediaTap(item.mediaItem)
         }
-        .draggable("waifux:item:\(item.id)")
         .contextMenu {
             if currentMediaFolderID != nil {
                 Button {
@@ -633,6 +662,19 @@ struct MyLibraryContentView: View {
                 }
             }
         }
+        card.draggable(dragPayload(for: item.id))
+    }
+
+    private func dragPayload(for itemID: String) -> String {
+        let selectedMovableIDs = selectedItems
+            .filter { !$0.hasPrefix("folder_") }
+            .filter { currentItemIDs.contains($0) }
+
+        guard selectedItems.contains(itemID), !selectedMovableIDs.isEmpty else {
+            return "waifux:item:\(itemID)"
+        }
+
+        return "waifux:items:\(selectedMovableIDs.sorted().joined(separator: "\n"))"
     }
 
     // MARK: - Image Preloading
@@ -648,11 +690,12 @@ struct MyLibraryContentView: View {
             .filter { $0 != index }
             .compactMap { wallpaperItems[$0].wallpaper.thumbURL }
 
-        let prefetcher = Kingfisher.ImagePrefetcher(
+        ForegroundPrefetchManager.shared.stop(namespace: wallpaperPrefetchNamespace)
+        ForegroundPrefetchManager.shared.start(
             urls: urls,
-            options: [.processor(DownsamplingImageProcessor(size: targetSize))]
+            options: [.processor(DownsamplingImageProcessor(size: targetSize))],
+            namespace: wallpaperPrefetchNamespace
         )
-        prefetcher.start()
     }
 
     private func preloadNearbyMedia(around item: AnyMediaItem, config: LibraryGridConfig) {
@@ -666,13 +709,14 @@ struct MyLibraryContentView: View {
         let urls = range
             .filter { $0 != index }
             .map { currentMediaItems[$0] }
-            .map { $0.mediaItem.libraryGridThumbnailURL(localFileURL: $0.localFileURL) }
+            .map(\.thumbnailURL)
 
-        let prefetcher = Kingfisher.ImagePrefetcher(
+        ForegroundPrefetchManager.shared.stop(namespace: mediaPrefetchNamespace)
+        ForegroundPrefetchManager.shared.start(
             urls: urls,
-            options: [.processor(DownsamplingImageProcessor(size: targetSize))]
+            options: [.processor(DownsamplingImageProcessor(size: targetSize))],
+            namespace: mediaPrefetchNamespace
         )
-        prefetcher.start()
     }
 
     private func preloadNearbyAnime(around anime: AnimeSearchResult, config: AnimeGridConfig) {
@@ -687,11 +731,12 @@ struct MyLibraryContentView: View {
             .filter { $0 != index }
             .compactMap { URL(string: currentAnimeItems[$0].coverURL ?? "") }
 
-        let prefetcher = Kingfisher.ImagePrefetcher(
+        ForegroundPrefetchManager.shared.stop(namespace: animePrefetchNamespace)
+        ForegroundPrefetchManager.shared.start(
             urls: urls,
-            options: [.processor(DownsamplingImageProcessor(size: targetSize))]
+            options: [.processor(DownsamplingImageProcessor(size: targetSize))],
+            namespace: animePrefetchNamespace
         )
-        prefetcher.start()
     }
 
     private func prefetchBucket(for index: Int) -> Int {
@@ -774,11 +819,27 @@ struct MyLibraryContentView: View {
                         .flatMap { URL(fileURLWithPath: $0.videoPath) }
                     : nil
                 let videoURL = resolvedVideo ?? bakeVideoURL
+                let hasCachedPoster: Bool = {
+                    if resolvedVideo == nil {
+                        return VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: itemID) != nil
+                    }
+                    guard let videoURL else { return false }
+                    return VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: videoURL) != nil
+                }()
                 if let videoURL,
-                   VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: videoURL) == nil,
+                   !hasCachedPoster,
                    ["mp4", "mov", "webm", "m4v", "mkv"].contains(videoURL.pathExtension.lowercased()) {
                     Task { @MainActor in
-                        if await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL) != nil {
+                        let posterURL: URL?
+                        if resolvedVideo == nil {
+                            posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                                forLocalVideo: videoURL,
+                                itemID: itemID
+                            )
+                        } else {
+                            posterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL)
+                        }
+                        if posterURL != nil {
                             refreshMediaFolderDisplay()
                         }
                     }
@@ -2070,19 +2131,45 @@ private struct AnyMediaItem: Identifiable {
     let id: String
     let mediaItem: MediaItem
     let localFileURL: URL?
+    let thumbnailURL: URL
+    let shouldProbeAnimatedThumbnail: Bool
+    let resolvedVideoFileURL: URL?
     private let unifiedLocalMedia: UnifiedLocalMedia?
 
+    @MainActor
     init(mediaItem: MediaItem, localFileURL: URL? = nil) {
+        let resolvedVideoFileURL = Self.resolveVideoFileURL(localFileURL: localFileURL, downloadRecord: nil)
+        let thumbnailURL = mediaItem.libraryGridThumbnailURL(localFileURL: localFileURL)
+
         self.id = mediaItem.id
         self.mediaItem = mediaItem
         self.localFileURL = localFileURL
+        self.thumbnailURL = thumbnailURL
+        self.shouldProbeAnimatedThumbnail = Self.shouldProbeAnimatedThumbnail(
+            url: thumbnailURL,
+            mediaItem: mediaItem
+        )
+        self.resolvedVideoFileURL = resolvedVideoFileURL
         self.unifiedLocalMedia = nil
     }
 
+    @MainActor
     init(unified: UnifiedLocalMedia) {
+        let resolvedVideoFileURL = Self.resolveVideoFileURL(
+            localFileURL: unified.fileURL,
+            downloadRecord: unified.downloadRecord
+        )
+        let thumbnailURL = unified.mediaItem.libraryGridThumbnailURL(localFileURL: unified.fileURL)
+
         self.id = unified.id
         self.mediaItem = unified.mediaItem
         self.localFileURL = unified.fileURL
+        self.thumbnailURL = thumbnailURL
+        self.shouldProbeAnimatedThumbnail = Self.shouldProbeAnimatedThumbnail(
+            url: thumbnailURL,
+            mediaItem: unified.mediaItem
+        )
+        self.resolvedVideoFileURL = resolvedVideoFileURL
         self.unifiedLocalMedia = unified
     }
 
@@ -2091,9 +2178,37 @@ private struct AnyMediaItem: Identifiable {
         unifiedLocalMedia?.isPortrait ?? mediaItem.isPortrait
     }
 
-    /// 解析后的视频文件 URL：优先烘焙产物，其次目录内视频文件
-    var resolvedVideoFileURL: URL? {
-        unifiedLocalMedia?.downloadRecord?.resolvedVideoFileURL ?? localFileURL
+    private static func resolveVideoFileURL(localFileURL: URL?, downloadRecord: MediaDownloadRecord?) -> URL? {
+        if let artifactPath = downloadRecord?.sceneBakeArtifact?.videoPath,
+           SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: artifactPath)) {
+            return URL(fileURLWithPath: artifactPath)
+        }
+        guard let localFileURL,
+              localFileURL.isFileURL,
+              FileManager.default.fileExists(atPath: localFileURL.path) else {
+            return nil
+        }
+        return MediaItem.resolveLocalVideoFile(from: localFileURL) ?? localFileURL
+    }
+
+    private static func shouldProbeAnimatedThumbnail(url: URL, mediaItem: MediaItem) -> Bool {
+        if url.isFileURL {
+            let path = url.standardizedFileURL.path
+            if path.contains("/WaifuX/VideoThumbnails/") {
+                return false
+            }
+
+            let ext = url.pathExtension.lowercased()
+            if ["mp4", "mov", "webm", "m4v", "mkv"].contains(ext) {
+                return false
+            }
+        }
+
+        if mediaItem.isAnimatedImage == true {
+            return true
+        }
+
+        return true
     }
 }
 

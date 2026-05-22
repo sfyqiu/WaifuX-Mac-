@@ -56,6 +56,10 @@ final class EdgeToEdgeHostingView<Content: View>: NSHostingView<Content> {
 
 @main
 struct WaifuXApp {
+    #if os(macOS)
+    private nonisolated(unsafe) static var memoryPressureSource: DispatchSourceMemoryPressure?
+    #endif
+
     static func main() {
         // 配置 Kingfisher（高性能图片加载）
         configureKingfisher()
@@ -116,6 +120,7 @@ struct WaifuXApp {
             }
         }
         source.resume()
+        memoryPressureSource = source
         #endif
     }
 
@@ -247,6 +252,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window?.title = "WaifuX"
         window?.titlebarAppearsTransparent = true
         window?.titleVisibility = .hidden
+        window?.isOpaque = true
+        window?.backgroundColor = NSColor(Color(hex: "0D0D0D"))
         if #available(macOS 15.0, *) {
             window?.titlebarSeparatorStyle = .none
         }
@@ -261,6 +268,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // 设置 contentView
         let hostingView = EdgeToEdgeHostingView(rootView: contentView)
+        configureOpaqueHostingView(hostingView)
         window?.contentView = hostingView
 
         // 恢复保存的窗口尺寸
@@ -414,6 +422,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window?.title = "WaifuX"
             window?.titlebarAppearsTransparent = true
             window?.titleVisibility = .hidden
+            window?.isOpaque = true
+            window?.backgroundColor = NSColor(Color(hex: "0D0D0D"))
             window?.minSize = Self.minimumWindowSize
 
             // 隐藏系统红绿灯（使用自定义 CustomWindowControls）
@@ -423,6 +433,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
             // ⚠️ 先设置 contentView，再恢复保存的窗口尺寸
             let hostingView = EdgeToEdgeHostingView(rootView: contentView)
+            configureOpaqueHostingView(hostingView)
             window?.contentView = hostingView
 
             // 恢复保存的窗口尺寸
@@ -437,6 +448,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     minHeight: Self.minimumWindowSize.height
                 )
             let hostingView = EdgeToEdgeHostingView(rootView: contentView)
+            configureOpaqueHostingView(hostingView)
             window?.contentView = hostingView
         }
 
@@ -578,6 +590,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         WallpaperEngineXBridge.shared.isControllingExternalEngine
     }
 
+    private func configureOpaqueHostingView<Content: View>(_ hostingView: EdgeToEdgeHostingView<Content>) {
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = NSColor(Color(hex: "0D0D0D")).cgColor
+        hostingView.layer?.isOpaque = true
+    }
+
     func quitApplication() {
         NSApp.terminate(nil)
     }
@@ -585,13 +603,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // 只清理动态壁纸窗口，不回退到旧静态壁纸
         VideoWallpaperManager.shared.prepareForAppTermination()
-
-        // 主程序退出时，强制清理所有 wallpaperengine-cli 进程（包括 daemon 和 client）
-        let pkill = Process()
-        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-9", "-f", "wallpaperengine-cli"]
-        try? pkill.run()
-        pkill.waitUntilExit()
+        WallpaperEngineXBridge.shared.prepareForAppTermination()
     }
 
     /// 捕获 macOS 窗口布局循环异常。

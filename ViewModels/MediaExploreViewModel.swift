@@ -19,6 +19,8 @@ final class MediaExploreViewModel: ObservableObject {
 
     /// 内存保护：列表缓存上限，超出上限时丢弃最旧条目触发 grid reload。
     private static let maxCachedItems = 300
+    /// 详情预抓队列上限，避免快速滚动时待处理 MediaItem 长时间堆积。
+    private static let maxPendingDetailPrefetchItems = 48
 
     private let mediaService = MediaService.shared
     private let mediaLibrary = MediaLibraryService.shared
@@ -320,29 +322,6 @@ final class MediaExploreViewModel: ObservableObject {
         preloadedNextPath = nil
         cancelDetailPrefetchQueue()
 
-        // 先测试网络连通性
-        do {
-            print("[MediaExploreViewModel] testing direct network request...")
-            let testURL = URL(string: "https://motionbgs.com")!
-            let testString = try await NetworkService.shared.fetchString(from: testURL)
-            print("[MediaExploreViewModel] direct network test success, received \(testString.count) bytes")
-        } catch {
-            print("[MediaExploreViewModel] direct network test failed: \(error)")
-        }
-
-        // 测试 MediaService actor 是否响应
-        print("[MediaExploreViewModel] testing MediaService.clearCache...")
-        do {
-            try await withTimeout(seconds: 5) {
-                await self.mediaService.clearCache()
-            }
-            print("[MediaExploreViewModel] clearCache success")
-        } catch {
-            print("[MediaExploreViewModel] clearCache failed: \(error)")
-            errorMessage = error.localizedDescription
-            return
-        }
-
         print("[MediaExploreViewModel] about to call fetchPage")
 
         do {
@@ -414,6 +393,7 @@ final class MediaExploreViewModel: ObservableObject {
             page.items.forEach { mediaLibrary.upsert($0) }
             items.append(contentsOf: appended)
             enqueueDetailPrefetch(for: appended, prioritizeVisible: false)
+            enforceExploreItemLimit()
 
             self.nextPagePath = page.nextPagePath
             hasMorePages = page.nextPagePath != nil
@@ -442,7 +422,7 @@ final class MediaExploreViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
 
                 // 存储预加载的数据
-                preloadedItems = page.items
+                preloadedItems = Array(page.items.prefix(40))
                 preloadedNextPath = page.nextPagePath
                 print("[MediaExploreViewModel] Preloaded \(page.items.count) items")
             } catch {
@@ -475,6 +455,7 @@ final class MediaExploreViewModel: ObservableObject {
             }
         }
 
+        trimPendingDetailPrefetchQueue()
         startDetailPrefetchCoordinatorIfNeeded()
     }
 
@@ -536,6 +517,27 @@ final class MediaExploreViewModel: ObservableObject {
         detailPrefetchCoordinatorTask = nil
         pendingDetailPrefetchItems.removeAll()
         pendingDetailPrefetchIDs.removeAll()
+    }
+
+    private func trimPendingDetailPrefetchQueue() {
+        guard pendingDetailPrefetchItems.count > Self.maxPendingDetailPrefetchItems else { return }
+        pendingDetailPrefetchItems = Array(pendingDetailPrefetchItems.prefix(Self.maxPendingDetailPrefetchItems))
+        pendingDetailPrefetchIDs = Set(pendingDetailPrefetchItems.map(\.id))
+    }
+
+    private func enforceExploreItemLimit() {
+        guard items.count > Self.maxCachedItems else { return }
+
+        items = Array(items.suffix(Self.maxCachedItems))
+        let retainedIDs = Set(items.map(\.id))
+
+        pendingDetailPrefetchItems.removeAll { !retainedIDs.contains($0.id) }
+        pendingDetailPrefetchIDs = Set(pendingDetailPrefetchItems.map(\.id))
+
+        for id in Array(detailTasks.keys) where !retainedIDs.contains(id) {
+            detailTasks[id]?.cancel()
+            detailTasks[id] = nil
+        }
     }
 
     // MARK: - 便捷加载方法
@@ -1057,7 +1059,9 @@ final class MediaExploreViewModel: ObservableObject {
                 favoriteCount: updatedItem.favoriteCount,
                 viewCount: updatedItem.viewCount,
                 ratingScore: updatedItem.ratingScore,
-                authorName: updatedItem.authorName,
+                authorName: updatedItem.authorName ?? original.authorName,
+                authorSteamID: updatedItem.authorSteamID ?? original.authorSteamID,
+                authorAvatarURL: updatedItem.authorAvatarURL ?? original.authorAvatarURL,
                 fileSize: updatedItem.fileSize,
                 createdAt: updatedItem.createdAt,
                 updatedAt: updatedItem.updatedAt
@@ -1494,6 +1498,7 @@ final class MediaExploreViewModel: ObservableObject {
             let existingIDs = Set(items.map(\.id))
             let newItems = mediaItems.filter { !existingIDs.contains($0.id) }
             items.append(contentsOf: newItems)
+            enforceExploreItemLimit()
 
             workshopHasMore = response.hasMore
             hasMorePages = response.hasMore
@@ -1742,6 +1747,7 @@ final class MediaExploreViewModel: ObservableObject {
         let existingIDs = Set(items.map(\.id))
         let newItems = result.items.filter { !existingIDs.contains($0.id) }
         items.append(contentsOf: newItems)
+        enforceExploreItemLimit()
 
         dongtaiHasMore = result.hasMore
         hasMorePages = result.hasMore

@@ -115,6 +115,10 @@ class WallpaperSchedulerViewModel: ObservableObject {
         schedulerService.updateDisplayIncludeMedia(include, for: screenID)
     }
 
+    func updateDisplayFolderIDs(_ folderIDs: [String]?, for screenID: String) {
+        schedulerService.updateDisplayFolderIDs(folderIDs, for: screenID)
+    }
+
     // MARK: - Computed Properties
 
     var intervalLabel: String {

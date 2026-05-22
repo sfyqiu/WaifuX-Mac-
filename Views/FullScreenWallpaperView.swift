@@ -631,6 +631,7 @@ struct FullScreenWallpaperView: View {
         Task {
             do {
                 try await viewModel.setAsWallpaper(wallpaper)
+                WallpaperSchedulerService.shared.notifyManualWallpaperChange()
             } catch {
                 print("Set wallpaper error: \(error)")
             }

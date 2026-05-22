@@ -336,6 +336,7 @@ struct SceneBakeArtifact: Codable, Hashable, Sendable {
     var fps: Int
     var durationSeconds: Double
     var bakedAt: Date
+    var renderer: SceneBakeRenderer?
 }
 
 struct MediaDownloadRecord: Identifiable, Codable, Hashable {
@@ -384,7 +385,7 @@ struct MediaDownloadRecord: Identifiable, Codable, Hashable {
     var resolvedVideoFileURL: URL? {
         // 优先使用烘焙产物的视频
         if let artifact = sceneBakeArtifact,
-           FileManager.default.fileExists(atPath: artifact.videoPath) {
+           SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath)) {
             return URL(fileURLWithPath: artifact.videoPath)
         }
         // 解析目录→视频文件（壁纸引擎源）

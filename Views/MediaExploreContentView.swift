@@ -7,7 +7,10 @@ private struct MediaLoadMoreSentinelMinYPreferenceKey: PreferenceKey {
     static let defaultValue: CGFloat = .greatestFiniteMagnitude
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+        let next = nextValue()
+        if next < value {
+            value = next
+        }
     }
 }
 
@@ -23,6 +26,8 @@ struct MediaExploreContentView: View {
     @StateObject private var exploreAtmosphere = ExploreAtmosphereController(wallpaperMode: false)
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
     @ObservedObject private var workshopSourceManager = WorkshopSourceManager.shared
+    @ObservedObject private var videoWallpaperManager = VideoWallpaperManager.shared
+    @ObservedObject private var wallpaperEngineBridge = WallpaperEngineXBridge.shared
     @StateObject private var translationBridge = SearchTranslationBridge()
 
     @State private var selectedCategory: MediaCategory = .all
@@ -38,17 +43,19 @@ struct MediaExploreContentView: View {
 
     @State private var searchTask: Task<Void, Never>?
     @State private var loadMoreTask: Task<Void, Never>?
-    @State private var gridRefreshTask: Task<Void, Never>?
     @State private var pendingSearchText: String?
     /// 翻译后的实际搜索词（英文），与 searchText（原始中文）分离
     @State private var mediaSearchQuery: String = ""
+    @State private var sentinelDebounceTask: DispatchWorkItem?
+    @StateObject private var columnCache = ExploreColumnDistributionCache<MediaItem>()
+    @State private var columnLayoutVersion = 0
 
-    // ExploreGridContainer 控制 token
-    @State private var gridScrollToTopToken: Int = 0
-    @State private var gridReloadToken: Int = 0
-    @State private var gridLayoutRefreshToken: Int = 0
-    @State private var gridSavedScrollOffset: CGFloat = 0
-    @State private var gridContentHeight: CGFloat = 600
+    private var shouldUseLightweightEffects: Bool {
+        (videoWallpaperManager.isVideoWallpaperActive && !videoWallpaperManager.isPaused) ||
+        (wallpaperEngineBridge.isControllingExternalEngine && !wallpaperEngineBridge.isExternalPaused)
+    }
+
+    // Grid 控制
     @State private var showScrollToTop: Bool = false
     @State private var outerScrollToTopToken: Int = 0
 
@@ -78,7 +85,6 @@ struct MediaExploreContentView: View {
         GeometryReader { geometry in
             let gridContentWidth = max(0, geometry.size.width - 56)
 
-            let viewportHeight = geometry.size.height
             ZStack {
                 if arcSettings.compactMode {
                     arcSettings.compactBackground
@@ -86,11 +92,12 @@ struct MediaExploreContentView: View {
                 } else {
                     ArcAtmosphereBackground(
                         tint: exploreAtmosphere.tint,
-                        referenceImage: exploreAtmosphere.referenceImage,
+                        referenceImage: shouldUseLightweightEffects ? nil : exploreAtmosphere.referenceImage,
                         isLightMode: arcSettings.isLightMode,
                         dotGridOpacity: arcSettings.dotGridOpacity,
                         useNoise: true,
-                        grainIntensity: arcSettings.exploreGrainMedia
+                        grainIntensity: arcSettings.exploreGrainMedia,
+                        lightweight: shouldUseLightweightEffects
                     )
                     .ignoresSafeArea()
                 }
@@ -132,15 +139,13 @@ struct MediaExploreContentView: View {
         .onChange(of: isVisible) { _, visible in
             if !visible {
                 cancelTasks()
+                columnCache.invalidate()
                 exploreAtmosphere.pause()
             } else {
                 syncAtmosphereIfNeeded()
-                gridLayoutRefreshToken &+= 1
             }
         }
-        .onChange(of: arcSettings.isLightMode) { _, _ in
-            gridReloadToken &+= 1
-        }
+        .onChange(of: arcSettings.isLightMode) { _, _ in }
         .onChange(of: selectedHotTag) { _, _ in handleFilterChange() }
         .onChange(of: selectedWorkshopSort) { _, _ in handleWorkshopSortChange() }
         .onChange(of: selectedDongTaiSort) { _, _ in handleDongTaiSortChange() }
@@ -153,17 +158,14 @@ struct MediaExploreContentView: View {
         }
         .onChange(of: viewModel.isLoading) { _, newValue in
             if newValue {
-                // 加载开始时立即刷新网格，避免旧封面卡住不动
-                bumpReloadToken()
+                // 加载开始时自动刷新
             } else {
                 syncAtmosphereIfNeeded()
-                bumpReloadToken()
             }
         }
-        .onChange(of: viewModel.libraryContentRevision) { _, _ in
-            scheduleGridVisibleRefresh()
-        }
+        .onChange(of: viewModel.libraryContentRevision) { _, _ in }
         .onChange(of: viewModel.items.count) { _, count in
+            columnLayoutVersion &+= 1
             if count > 60 { showScrollToTop = true }
         }
         .onReceive(NotificationCenter.default.publisher(for: .workshopSourceChanged)) { _ in
@@ -185,22 +187,61 @@ struct MediaExploreContentView: View {
                 .transition(.opacity.animation(.easeInOut(duration: 0.3)))
             }
         } else {
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ScrollToTopHelper(trigger: outerScrollToTopToken)
-                        .frame(height: 0)
-                    headerStack
-                    mediaGrid(contentWidth: gridContentWidth)
-                        .frame(height: max(gridContentHeight, 320))
-                    loadMoreSentinel
-                }
+            if #available(macOS 15.0, *) {
+                scrollViewModern(gridContentWidth: gridContentWidth)
+            } else {
+                scrollViewLegacy(gridContentWidth: gridContentWidth, viewportHeight: viewportHeight)
+            }
+        }
+    }
+
+    // MARK: - macOS 15+：使用 onScrollGeometryChange
+
+    @available(macOS 15.0, *)
+    private func scrollViewModern(gridContentWidth: CGFloat) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                ScrollToTopHelper(trigger: outerScrollToTopToken)
+                    .frame(height: 0)
+                headerStack
+                mediaGrid(contentWidth: gridContentWidth)
             }
             .coordinateSpace(name: Self.scrollCoordinateSpaceName)
-            .onPreferenceChange(MediaLoadMoreSentinelMinYPreferenceKey.self) { sentinelMinY in
+        }
+        .onScrollGeometryChange(for: CGFloat.self, of: { geometry in
+            let bottomOffset = geometry.contentOffset.y + geometry.containerSize.height
+            return geometry.contentSize.height - bottomOffset
+        }, action: { _, distanceFromBottom in
+            guard isVisible, distanceFromBottom.isFinite else { return }
+            if distanceFromBottom <= Self.loadMoreTriggerThreshold {
+                triggerLoadMore()
+            }
+        })
+        .scrollDisabled(!isVisible)
+    }
+
+    // MARK: - macOS 14：使用 PreferenceKey
+
+    private func scrollViewLegacy(gridContentWidth: CGFloat, viewportHeight: CGFloat) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                ScrollToTopHelper(trigger: outerScrollToTopToken)
+                    .frame(height: 0)
+                headerStack
+                mediaGrid(contentWidth: gridContentWidth)
+                loadMoreSentinel
+            }
+            .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+        }
+        .onPreferenceChange(MediaLoadMoreSentinelMinYPreferenceKey.self) { sentinelMinY in
+            sentinelDebounceTask?.cancel()
+            let task = DispatchWorkItem {
                 handleLoadMoreSentinelPosition(sentinelMinY, viewportHeight: viewportHeight)
             }
-            .scrollDisabled(!isVisible)
+            sentinelDebounceTask = task
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: task)
         }
+        .scrollDisabled(!isVisible)
     }
 
     /// 仅用于"骨架/空状态"等无网格场景的兜底滚动容器（保留 header）
@@ -242,7 +283,6 @@ struct MediaExploreContentView: View {
                 Spacer()
                 if showScrollToTop {
                     Button {
-                        gridScrollToTopToken &+= 1
                         outerScrollToTopToken &+= 1
                     } label: {
                         Image(systemName: "arrow.up")
@@ -904,7 +944,7 @@ struct MediaExploreContentView: View {
         // SwiftUI 的 .onChange(of: viewModel.isLoading) 无法捕捉到中间状态，
         // 此处显式通知网格重新加载
         syncAtmosphereIfNeeded()
-        bumpReloadToken()
+
     }
 
     private var contentHeader: some View {
@@ -929,105 +969,56 @@ struct MediaExploreContentView: View {
     // MARK: - Grid
 
     private func mediaGrid(contentWidth: CGFloat) -> some View {
+        let spacing: CGFloat = 16
         let columnCount = contentWidth > 1200 ? 4 : (contentWidth > 800 ? 3 : 2)
+        let totalSpacing = spacing * CGFloat(columnCount - 1)
+        let cardWidth = max(1, floor((contentWidth - totalSpacing) / CGFloat(columnCount)))
+        let items = viewModel.items
+        let columnItems = distributeItemsToColumns(items: items, cardWidth: cardWidth, columnCount: columnCount, spacing: spacing)
 
-        return ExploreGridContainer(
-            itemCount: { viewModel.items.count },
-            aspectRatio: { index in
-                let spacing: CGFloat = 16
-                let totalSpacing = spacing * CGFloat(columnCount - 1)
-                let cardWidth = floor((contentWidth - totalSpacing) / CGFloat(columnCount))
-                guard cardWidth > 0 else { return 1.6 }
-                // 从 exactResolution 解析实际宽高比，使竖图/方图获得正确高度
-                let aspect: CGFloat = {
-                    guard index < viewModel.items.count else { return 1.6 }
-                    let item = viewModel.items[index]
-                    let raw = (item.exactResolution ?? item.resolutionLabel ?? "")
-                        .replacingOccurrences(of: " ", with: "")
-                        .replacingOccurrences(of: "X", with: "x")
-                    let parts = raw.split(separator: "x")
-                    guard parts.count == 2,
-                          let w = Double(parts[0]), w > 0,
-                          let h = Double(parts[1]), h > 0 else { return 1.6 }
-                    return min(max(CGFloat(w / h), 0.35), 3.6)
-                }()
-                // 最大图片高度限制：避免极端竖图撑出比屏幕还高的卡片
-                let maxImageHeight: CGFloat = cardWidth * 1.8
-                let imageHeight = min(cardWidth / aspect, maxImageHeight)
-                let totalHeight = imageHeight + 44
-                return cardWidth / max(1, totalHeight)
-            },
-            configureCell: { cell, index in
-                guard index < viewModel.items.count else { return }
-                let item = viewModel.items[index]
-                cell.configure(with: item, isFavorite: viewModel.isFavorite(item))
-            },
-            cellClass: MediaGridCell.self,
-            onSelect: { index in
-                guard index < viewModel.items.count else { return }
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                    selectedMedia = viewModel.items[index]
+        return HStack(alignment: .top, spacing: spacing) {
+            ForEach(0..<columnCount, id: \.self) { columnIndex in
+                let items = columnItems[safe: columnIndex] ?? []
+                LazyVStack(spacing: spacing) {
+                    ForEach(items) { media in
+                        MediaCardView(
+                            media: media,
+                            isFavorite: viewModel.isFavorite(media),
+                            cardWidth: cardWidth
+                        ) {
+                            selectedMedia = media
+                        }
+                    }
                 }
-            },
-            onVisibleItemsChange: { indexPaths in
-                prefetchVisibleMediaDetails(indexPaths: indexPaths)
-            },
-            onScrollOffsetChange: { offset in
-                gridSavedScrollOffset = offset
-            },
-            onReachBottom: triggerLoadMore,
-            scrollToTopToken: gridScrollToTopToken,
-            reloadToken: gridReloadToken,
-            layoutRefreshToken: gridLayoutRefreshToken,
-            allowsScrolling: false,
-            onContentHeightChange: { height in
-                if abs(gridContentHeight - height) > 0.5 {
-                    gridContentHeight = height
-                }
-            },
-            isVisible: isVisible,
-            layoutWidth: contentWidth,
-            gridColumnCount: columnCount,
-            hoverExpansionAllowance: 8
-        )
-    }
-
-    private func bumpReloadToken() {
-        cancelScheduledGridVisibleRefresh()
-        gridReloadToken &+= 1
-    }
-
-    private func scheduleGridVisibleRefresh(delayNanoseconds: UInt64 = 120_000_000) {
-        gridRefreshTask?.cancel()
-        gridRefreshTask = Task {
-            try? await Task.sleep(nanoseconds: delayNanoseconds)
-            guard !Task.isCancelled else { return }
-            gridReloadToken &+= 1
-            gridRefreshTask = nil
+                .frame(width: cardWidth)
+            }
         }
     }
 
-    private func cancelScheduledGridVisibleRefresh() {
-        gridRefreshTask?.cancel()
-        gridRefreshTask = nil
+    /// 瀑布流：将媒体项分配到最短列
+    private func distributeItemsToColumns(items: [MediaItem], cardWidth: CGFloat, columnCount: Int, spacing: CGFloat) -> [[MediaItem]] {
+        columnCache.columns(
+            for: items,
+            version: columnLayoutVersion,
+            columnCount: columnCount,
+            cardWidth: cardWidth,
+            spacing: spacing
+        ) { item in
+            let aspect = parsedMediaAspectRatio(item)
+            let maxImageHeight = cardWidth * 1.8
+            return min(cardWidth / aspect, maxImageHeight) + 44
+        }
     }
 
-    private func prefetchVisibleMediaDetails(indexPaths: Set<IndexPath>) {
-        guard workshopSourceManager.activeSource != .wallpaperEngine,
-              workshopSourceManager.activeSource != .dongtai else { return }
-
-        let candidates = indexPaths
-            .map(\.item)
-            .filter { $0 >= 0 && $0 < viewModel.items.count }
-            .sorted()
-            .prefix(6)
-            .compactMap { index -> MediaItem? in
-                let item = viewModel.items[index]
-                return item.posterURL == nil ? item : nil
-            }
-
-        guard !candidates.isEmpty else { return }
-        viewModel.enqueueDetailPrefetch(for: Array(candidates), prioritizeVisible: true)
+    private func parsedMediaAspectRatio(_ item: MediaItem) -> CGFloat {
+        let raw = (item.exactResolution ?? item.resolutionLabel)
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "X", with: "x")
+        let parts = raw.split(separator: "x")
+        guard parts.count == 2,
+              let w = Double(parts[0]), w > 0,
+              let h = Double(parts[1]), h > 0 else { return 1.6 }
+        return min(max(CGFloat(w / h), 0.35), 3.6)
     }
 
     // MARK: - UI Components
@@ -1108,7 +1099,7 @@ struct MediaExploreContentView: View {
     // MARK: - Actions
 
     private func handleInitialLoad() async {
-        cancelScheduledGridVisibleRefresh()
+
         if viewModel.items.isEmpty {
             isInitialLoading = true
         }
@@ -1121,7 +1112,7 @@ struct MediaExploreContentView: View {
     }
 
     private func performFirstAppearanceLoad() async {
-        cancelScheduledGridVisibleRefresh()
+
         isInitialLoading = true
         searchText = ""
         mediaSearchQuery = ""
@@ -1227,7 +1218,7 @@ struct MediaExploreContentView: View {
             defer {
                 searchTask = nil
                 syncAtmosphereIfNeeded()
-                bumpReloadToken()
+
             }
             switch workshopSourceManager.activeSource {
             case .wallpaperEngine:
@@ -1308,7 +1299,7 @@ struct MediaExploreContentView: View {
                 searchTask = nil
                 // 强制刷新网格（DongTai 查询为同步操作）
                 syncAtmosphereIfNeeded()
-                bumpReloadToken()
+
             }
             await viewModel.setDongTaiSort(sortBy: selectedDongTaiSort)
         }
@@ -1426,7 +1417,7 @@ struct MediaExploreContentView: View {
     private func reloadDefaultFeedAfterReset() {
         searchTask?.cancel()
         loadMoreTask?.cancel()
-        cancelScheduledGridVisibleRefresh()
+
         pendingSearchText = nil
         isLoadingMore = false
         isInitialLoading = viewModel.items.isEmpty
@@ -1448,16 +1439,18 @@ struct MediaExploreContentView: View {
             }
 
             syncAtmosphereIfNeeded()
-            bumpReloadToken()
+
         }
     }
 
     private func cancelTasks() {
         searchTask?.cancel()
         loadMoreTask?.cancel()
-        cancelScheduledGridVisibleRefresh()
+        sentinelDebounceTask?.cancel()
+
         searchTask = nil
         loadMoreTask = nil
+        sentinelDebounceTask = nil
     }
 
     private func syncAtmosphereIfNeeded() {
@@ -1869,4 +1862,4 @@ struct WorkshopURLInputSheet: View {
     }
 }
 
-// (scroll offset tracking removed — showScrollToTop is now driven by gridContentHeight threshold)
+//

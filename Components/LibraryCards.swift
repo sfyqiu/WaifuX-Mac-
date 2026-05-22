@@ -112,9 +112,8 @@ extension MediaItem {
             // Workshop 项目（Scene/Web）已烘焙产物：尝试使用烘焙产物的 MP4 抽帧缓存
             if let record = MediaLibraryService.shared.downloadRecords.first(where: { $0.item.id == id }),
                let bakedPath = record.sceneBakeArtifact?.videoPath,
-               FileManager.default.fileExists(atPath: bakedPath) {
-                let bakedURL = URL(fileURLWithPath: bakedPath)
-                if let extracted = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: bakedURL) {
+               SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: bakedPath)) {
+                if let extracted = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: id) {
                     return extracted
                 }
             }
@@ -150,11 +149,19 @@ public struct MediaVideoCard: View {
     var progressTint: Color? = nil
     var progressLabel: String? = nil
     var cardWidth: CGFloat = LibraryCardMetrics.cardWidth
+    var thumbnailURL: URL? = nil
+    var shouldProbeAnimatedThumbnail: Bool = true
+    var resolvedVideoFileURL: URL? = nil
     let action: () -> Void
 
     @State private var isHovered = false
     /// 异步生成抽帧后更新的本地封面 URL
     @State private var resolvedThumbnailURL: URL?
+    /// GIF 动画检测
+    @State private var detectedGIF = false
+    /// 缩略图刷新计数器（每次重新烘焙后递增，强制 KFImage 重新加载）
+    @State private var thumbnailRefreshID = 0
+    private let maxAnimatedGIFBytes: Int64 = 18 * 1024 * 1024
 
     private static let videoExtensions: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
 
@@ -163,7 +170,7 @@ public struct MediaVideoCard: View {
     }
 
     private var listThumbnailURL: URL {
-        resolvedThumbnailURL ?? item.libraryGridThumbnailURL(localFileURL: localMediaFileURL)
+        resolvedThumbnailURL ?? thumbnailURL ?? item.libraryGridThumbnailURL(localFileURL: localMediaFileURL)
     }
 
     // 降采样目标尺寸（固定 512x512，避免窗口大小变化导致缓存失效）
@@ -172,19 +179,47 @@ public struct MediaVideoCard: View {
     public var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 0) {
-                // 图片区域 - 单独裁剪（仅静态，与壁纸库卡片一致；GIF 为降采样单帧）
+                // 图片区域 - 使用 KFMediaCoverImage 支持 GIF 动效
                 ZStack {
-                    KFImage(listThumbnailURL)
-                        .setProcessor(DownsamplingImageProcessor(size: targetImageSize))
-                        .cacheMemoryOnly(false)
-                        .fade(duration: 0.3)
-                        .placeholder { _ in
-                            SkeletonCard(width: cardWidth, height: thumbnailHeight, cornerRadius: 0)
-                        }
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: cardWidth, height: thumbnailHeight)
-                        .clipped()
+                    if !detectedGIF {
+                        KFImage(listThumbnailURL)
+                            .setProcessor(DownsamplingImageProcessor(size: targetImageSize))
+                            .cacheMemoryOnly(false)
+                            .cancelOnDisappear(true)
+                            .fade(duration: 0.3)
+                            .placeholder { _ in
+                                SkeletonCard(width: cardWidth, height: thumbnailHeight, cornerRadius: 0)
+                            }
+                            .onSuccess { result in
+                                if !detectedGIF, result.image.kf.gifRepresentation() != nil {
+                                    detectedGIF = true
+                                }
+                            }
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: cardWidth, height: thumbnailHeight)
+                            .clipped()
+                            .id(thumbnailRefreshID)
+                    }
+
+                    if detectedGIF {
+                        KFAnimatedImage.url(listThumbnailURL)
+                            .memoryCacheExpiration(.expired)
+                            .diskCacheExpiration(.days(3))
+                            .cancelOnDisappear(true)
+                            .fade(duration: 0.3)
+                            .configure { view in
+                                configureAnimatedGIFViewForAspectFill(
+                                    view,
+                                    autoPlay: true
+                                )
+                            }
+                            .placeholder { _ in Color.clear }
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: cardWidth, height: thumbnailHeight)
+                            .clipped()
+                            .id("gif_\(thumbnailRefreshID)")
+                    }
 
                     // 左上角：编辑模式显示复选框，非编辑模式显示 subtitle tag
                     if isEditing {
@@ -295,12 +330,42 @@ public struct MediaVideoCard: View {
                 isHovered = hovering
             }
         }
+        .task(id: listThumbnailURL.absoluteString) {
+            guard shouldProbeAnimatedThumbnail else {
+                detectedGIF = false
+                return
+            }
+            detectedGIF = false
+            let result = await AnimatedImageProbeCache.shared.isAnimatedGIF(
+                listThumbnailURL,
+                maxByteCount: maxAnimatedGIFBytes
+            )
+            guard !Task.isCancelled else { return }
+            detectedGIF = result
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
+            detectedGIF = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .appDidReceiveMemoryPressure)) { _ in
+            detectedGIF = false
+        }
         .onAppear { triggerThumbnailIfNeeded() }
-        .onChange(of: localMediaFileURL) { _, _ in resolvedThumbnailURL = nil; triggerThumbnailIfNeeded() }
+        .onChange(of: localMediaFileURL) { _, _ in
+            thumbnailRefreshID &+= 1
+            resolvedThumbnailURL = nil
+            triggerThumbnailIfNeeded()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeThumbnailDidUpdate)) { notification in
             guard let updatedItemID = notification.object as? String,
                   updatedItemID == item.id else { return }
-            triggerThumbnailIfNeeded()
+            thumbnailRefreshID &+= 1
+            resolvedThumbnailURL = nil
+            // 通知中的 thumbnailURL（新生成的海报 URL）优先使用，避免被旧的 thumbnailURL 卡住
+            if let posterURL = notification.userInfo?["thumbnailURL"] as? URL {
+                resolvedThumbnailURL = posterURL
+            } else {
+                triggerThumbnailIfNeeded()
+            }
         }
     }
 
@@ -312,6 +377,12 @@ public struct MediaVideoCard: View {
               local.isFileURL,
               FileManager.default.fileExists(atPath: local.path) else { return }
 
+        if let thumbnailURL,
+           thumbnailURL.isFileURL,
+           !Self.videoExtensions.contains(thumbnailURL.pathExtension.lowercased()) {
+            return
+        }
+
         let isWebWorkshop = MediaItem.localWorkshopProjectType(from: local) == "web"
         if isWebWorkshop, let localPreview = MediaItem.resolveLocalWorkshopPreviewImage(from: local) {
             resolvedThumbnailURL = localPreview
@@ -319,7 +390,7 @@ public struct MediaVideoCard: View {
         }
 
         // 解析目录→视频文件/预览图（壁纸引擎源），或直接使用文件
-        if let resolved = MediaItem.resolveLocalVideoFile(from: local) ?? (
+        if let resolved = resolvedVideoFileURL ?? MediaItem.resolveLocalVideoFile(from: local) ?? (
             Self.videoExtensions.contains(local.pathExtension.lowercased()) ? local : nil
         ) {
             // 已有缓存则直接使用
@@ -342,14 +413,17 @@ public struct MediaVideoCard: View {
         // 尝试使用烘焙产物的 MP4 视频进行抽帧
         if let record = MediaLibraryService.shared.downloadRecords.first(where: { $0.item.id == item.id }),
            let bakedVideo = record.sceneBakeArtifact.flatMap({ $0.videoPath }).map({ URL(fileURLWithPath: $0) }),
-           FileManager.default.fileExists(atPath: bakedVideo.path) {
-            if let cached = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: bakedVideo) {
+           SceneOfflineBakeService.isUsableBakedVideo(at: bakedVideo) {
+            if let cached = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: item.id) {
                 resolvedThumbnailURL = cached
                 return
             }
             if Self.videoExtensions.contains(bakedVideo.pathExtension.lowercased()) {
                 Task { @MainActor in
-                    if let poster = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: bakedVideo) {
+                    if let poster = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                        forLocalVideo: bakedVideo,
+                        itemID: item.id
+                    ) {
                         resolvedThumbnailURL = poster
                     }
                 }

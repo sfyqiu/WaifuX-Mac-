@@ -75,6 +75,10 @@ swiftc -parse-as-library \
   "$SRC_MAIN" "$SRC_EMBED" \
   "$ROOT/Resources/zip_data.o" "$ROOT/Resources/zip_accessor.o"
 
+# The renderer dylib may carry an @loader_path install name from local builds,
+# but our CLI is shipped both at repo root and under Resources/.
+install_name_tool -change "@loader_path/liblinux-wallpaperengine-renderer.dylib" "@rpath/liblinux-wallpaperengine-renderer.dylib" "$OUT_CLI" 2>/dev/null || true
+
 if command -v codesign >/dev/null 2>&1; then
   echo "[build-wallpaperengine-cli] codesign (ad hoc)..."
   codesign --force -s - "$OUT_CLI" 2>/dev/null || true

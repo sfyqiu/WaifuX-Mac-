@@ -10,10 +10,13 @@ struct MediaDetailSheet: View {
     @ObservedObject var viewModel: MediaExploreViewModel
     let contextItems: [MediaItem]?
     let onClose: () -> Void
+    /// 当需要在 NavigationStack 中 push 新媒体项时调用（如作者列表点击）
+    let onNavigateToItem: ((MediaItem) -> Void)?
 
     @ObservedObject private var wallpaperManager = VideoWallpaperManager.shared
     @ObservedObject private var mediaLibrary = MediaLibraryService.shared
     @ObservedObject private var loopService = VideoLoopPreprocessingService.shared
+    @ObservedObject private var displaySelectorManager = DisplaySelectorManager.shared
     @State private var resolvedItem: MediaItem
     @State private var isDownloading = false
     @State private var isSettingWallpaper = false
@@ -31,6 +34,11 @@ struct MediaDetailSheet: View {
     @State private var showSessionExpiredAlert = false
     @State private var pendingSteamGuardCode = ""
     @State private var isBakingScene = false
+    @State private var showSceneBakeRendererDialog = false
+    @State private var sceneBakeShouldClearCachedArtifact = false
+    @State private var activeScenePreviewRenderer: SceneBakeRenderer?
+    /// 烘焙进度 0.0 ~ 1.0
+    @State private var bakeProgress: Double = 0
 
     // MARK: - 作者壁纸弹窗相关
     @State private var showAuthorSheet = false
@@ -48,8 +56,9 @@ struct MediaDetailSheet: View {
     private enum SlideDirection {
         case up, down
     }
-    /// 烘焙并应用 MP4 成功后短暂显示在底部状态行（约 4s）
+    /// 烘焙成功后短暂显示在底部状态行（约 4s）
     @State private var sceneBakeStatusFlash: String?
+    @State private var applyingWallpaperStatusKey = "applyingWallpaper"
     @State private var sharePickerAnchorView: NSView?
     @State private var showCopyLinkToast = false
     @State private var showMoreOptionsPopover = false
@@ -69,11 +78,12 @@ struct MediaDetailSheet: View {
     // 计算属性：当前媒体项
     var item: MediaItem { resolvedItem }
 
-    init(item: MediaItem, viewModel: MediaExploreViewModel, contextItems: [MediaItem]? = nil, onClose: @escaping () -> Void) {
+    init(item: MediaItem, viewModel: MediaExploreViewModel, contextItems: [MediaItem]? = nil, onClose: @escaping () -> Void, onNavigateToItem: ((MediaItem) -> Void)? = nil) {
         self.initialItem = item
         self.viewModel = viewModel
         self.contextItems = contextItems
         self.onClose = onClose
+        self.onNavigateToItem = onNavigateToItem
         _resolvedItem = State(initialValue: item)
     }
 
@@ -94,6 +104,13 @@ struct MediaDetailSheet: View {
 
     private var currentDownloadRecord: MediaDownloadRecord? {
         mediaLibrary.downloadedItems.first { $0.item.id == resolvedItem.id }
+    }
+
+    private var cachedSceneBakeVideoURL: URL? {
+        guard let art = currentDownloadRecord?.sceneBakeArtifact else { return nil }
+        let url = URL(fileURLWithPath: art.videoPath)
+        guard SceneOfflineBakeService.isUsableBakedVideo(at: url) else { return nil }
+        return url
     }
 
     private var sceneOfflineBakeButtonVisible: Bool {
@@ -119,7 +136,7 @@ struct MediaDetailSheet: View {
 
                 if isVisible {
                     fixedMediaBackground(width: viewW, height: viewH)
-                        .id("media-bg-\(resolvedItem.id)")
+                        .id("media-bg-\(resolvedItem.id)-\(previewVideoURL?.path ?? heroImageURL.path)")
                         .transition(
                             AnyTransition.asymmetric(
                                 insertion: .offset(y: slideIncomingOffset).combined(with: .opacity),
@@ -296,6 +313,14 @@ struct MediaDetailSheet: View {
         .overlay {
             authorSheetOverlay
         }
+        .overlay {
+            sceneBakeRendererOverlay
+        }
+        .onExitCommand {
+            if showSceneBakeRendererDialog {
+                showSceneBakeRendererDialog = false
+            }
+        }
         .alert("Steam 登录已过期", isPresented: $showSessionExpiredAlert) {
             Button("确定", role: .cancel) {}
         } message: {
@@ -314,6 +339,7 @@ struct MediaDetailSheet: View {
             isVisible = false
             ForegroundPrefetchManager.shared.stop(namespace: prefetchNamespace)
             removeKeyboardMonitor()
+            SceneOfflineBakeService.stopPreview()
         }
     }
 
@@ -323,9 +349,8 @@ struct MediaDetailSheet: View {
 
     private var previewVideoURL: URL? {
         // 优先使用已烘焙的 Scene MP4 作为背景视频
-        if let artifact = currentDownloadRecord?.sceneBakeArtifact,
-           FileManager.default.fileExists(atPath: artifact.videoPath) {
-            return URL(fileURLWithPath: artifact.videoPath)
+        if let cachedSceneBakeVideoURL {
+            return cachedSceneBakeVideoURL
         }
         // 已下载的视频文件优先使用本地路径，避免从网络加载
         if let localURL = currentDownloadRecord?.localFileURL,
@@ -357,16 +382,22 @@ struct MediaDetailSheet: View {
                     }
                 )
             } else {
+                let heroLayoutSize = CGSize(width: width, height: viewH)
+                let heroDownsampleSize = CGSize(
+                    width: min(max(width * 2, 1), 2400),
+                    height: min(max(viewH * 2, 1), 2400)
+                )
                 KFMediaCoverImage(
                     url: heroImageURL,
                     animated: resolvedItem.shouldRenderThumbnailAsAnimatedImage,
-                    downsampleSize: nil,
+                    downsampleSize: heroDownsampleSize,
                     fadeDuration: 0.3,
                     loadFinished: {
                         withAnimation(.easeInOut(duration: 0.3)) {
                             isMediaLoaded = true
                         }
                     },
+                    layoutSize: heroLayoutSize,
                     playAnimatedImage: true
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -454,24 +485,29 @@ struct MediaDetailSheet: View {
 
     // MARK: - 顶部返回按钮（设置壁纸中禁用，下载时可返回）
     private var floatingBackButton: some View {
-        Button {
-            if isSettingWallpaper {
-                AppLogger.warn(.ui, "返回被阻止：设置壁纸进行中",
-                    metadata: ["isSettingWallpaper": isSettingWallpaper])
+        let shouldBlockBack = isSettingWallpaper || displaySelectorManager.isShowingSelector
+        return Button {
+            if shouldBlockBack {
+                AppLogger.warn(.ui, "返回被阻止：设置壁纸或选择显示器进行中",
+                    metadata: [
+                        "isSettingWallpaper": isSettingWallpaper,
+                        "isShowingDisplaySelector": displaySelectorManager.isShowingSelector
+                    ])
                 return
             }
             onClose()
         } label: {
             DetailSheetCircleIconLabel(
                 systemName: "chevron.left",
-                foreground: isSettingWallpaper ? .white.opacity(0.35) : .white.opacity(0.95),
+                foreground: shouldBlockBack ? .white.opacity(0.35) : .white.opacity(0.95),
                 fontSize: 15,
                 frameSide: 38
             )
             .detailGlassCircleChrome()
-            .opacity(isSettingWallpaper ? 0.5 : 1)
+            .opacity(shouldBlockBack ? 0.5 : 1)
         }
         .buttonStyle(.plain)
+        .disabled(shouldBlockBack)
     }
 
     private func floatingInfoOverlay(viewportWidth: CGFloat, topBarTopInset: CGFloat) -> some View {
@@ -558,8 +594,8 @@ struct MediaDetailSheet: View {
 
         // Workshop 源显示丰富的元数据胶囊（作者、订阅、浏览、评分、大小、类型）
         if resolvedItem.sourceName == t("wallpaperEngine") {
-            if let author = resolvedItem.authorName {
-                items.append((t("author"), author))
+            if resolvedItem.authorSteamID != nil || resolvedItem.authorName != nil {
+                items.append((t("author"), resolvedItem.authorName ?? t("unknown")))
             }
             items.append((t("fileType"), resolvedItem.resolutionLabel))
             if let subs = resolvedItem.subscriptionCount, subs > 0 {
@@ -592,7 +628,7 @@ struct MediaDetailSheet: View {
         return items
     }
 
-    private func detailMetaCapsule(label: String, value: String, isLast: Bool = false) -> some View {
+    private func detailMetaCapsule(label: String, value: String, isLast: Bool = false, isInteractive: Bool = false) -> some View {
         HStack(spacing: 4) {
             Text(label)
                 .font(.system(size: 12, weight: .medium))
@@ -600,6 +636,9 @@ struct MediaDetailSheet: View {
             Text(value)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.9))
+            if isInteractive {
+                detailDisclosureIndicator
+            }
         }
         .padding(.horizontal, 14)
         .frame(height: 32)
@@ -618,7 +657,8 @@ struct MediaDetailSheet: View {
                     detailMetaCapsule(
                         label: item.label,
                         value: item.value,
-                        isLast: index == metadataItems.count - 1
+                        isLast: index == metadataItems.count - 1,
+                        isInteractive: true
                     )
                 }
                 .buttonStyle(.plain)
@@ -637,29 +677,60 @@ struct MediaDetailSheet: View {
 
     private var sceneBakeActionRow: some View {
         VStack(spacing: 8) {
-            Text(t("sceneBake.tierHint"))
+            Text(isBakingScene ? sceneBakeProgressSubtitle : t("sceneBake.tierHint"))
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.white.opacity(0.5))
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 520)
 
+            if !isBakingScene {
+                Text(t("sceneBake.memoryHint"))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.42))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+            }
+
             Button {
-                runSceneOfflineBake()
+                if let cachedSceneBakeVideoURL {
+                    applyWorkshopVideoWallpaper(
+                        videoURL: cachedSceneBakeVideoURL,
+                        preferPosterFrameFromVideo: true
+                    )
+                } else {
+                    presentSceneBakeRendererDialog(clearCachedArtifact: false)
+                }
             } label: {
                 HStack(spacing: 8) {
                     if isBakingScene {
-                        Circle()
-                            .trim(from: 0, to: 0.75)
-                            .stroke(.white, lineWidth: 2.5)
-                            .rotationEffect(.degrees(isBakingScene ? 360 : 0))
-                            .frame(width: 16, height: 16)
-                            .animation(.linear(duration: 0.8).repeatForever(autoreverses: false), value: isBakingScene)
+                        // 圆形进度条
+                        ZStack {
+                            // 背景圆圈
+                            Circle()
+                                .stroke(.white.opacity(0.2), lineWidth: 2.5)
+                                .frame(width: 16, height: 16)
+
+                            // 进度圆弧
+                            Circle()
+                                .trim(from: 0, to: bakeProgress)
+                                .stroke(.white, lineWidth: 2.5)
+                                .rotationEffect(.degrees(-90))
+                                .frame(width: 16, height: 16)
+                                .animation(.easeInOut(duration: 0.2), value: bakeProgress)
+                        }
+                        .frame(width: 16, height: 16)
                     } else {
                         Image(systemName: "film.stack")
                             .font(.system(size: 14, weight: .semibold))
                     }
-                    Text(isBakingScene ? t("sceneBake.progressTitle") : t("sceneBake.button"))
-                        .font(.system(size: 14, weight: .semibold))
+                    if isBakingScene {
+                        Text("\(Int(bakeProgress * 100))%")
+                            .font(.system(size: 14, weight: .semibold))
+                            .monospacedDigit()
+                    } else {
+                        Text(t("sceneBake.button"))
+                            .font(.system(size: 14, weight: .semibold))
+                    }
                 }
                 .foregroundStyle(.white.opacity(0.95))
                 .padding(.horizontal, 20)
@@ -670,8 +741,8 @@ struct MediaDetailSheet: View {
             .buttonStyle(.plain)
             .disabled(isBakingScene)
 
-            if let art = currentDownloadRecord?.sceneBakeArtifact {
-                Text("\(t("sceneBake.cached")) · \(URL(fileURLWithPath: art.videoPath).lastPathComponent)")
+            if let cachedSceneBakeVideoURL {
+                Text("\(t("sceneBake.cached")) · \(cachedSceneBakeVideoURL.lastPathComponent)")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.45))
                     .lineLimit(2)
@@ -689,16 +760,165 @@ struct MediaDetailSheet: View {
         .padding(.top, 4)
     }
 
-    /// 重新烘焙：清除已有缓存后重新执行烘焙
-    private func reBakeScene() {
-        guard let record = currentDownloadRecord else { return }
-        // 清除现有烘焙产物
-        mediaLibrary.clearSceneBakeArtifact(itemID: record.item.id)
-        // 执行完整烘焙
-        runSceneOfflineBake()
+    private var sceneBakeRendererOverlay: some View {
+        Group {
+            if showSceneBakeRendererDialog {
+                ZStack {
+                    Color.black.opacity(0.58)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            showSceneBakeRendererDialog = false
+                        }
+
+                    VStack(alignment: .leading, spacing: 18) {
+                        HStack(alignment: .top, spacing: 12) {
+                            Image(systemName: "film.stack")
+                                .font(.system(size: 20, weight: .semibold))
+                                .foregroundStyle(LiquidGlassColors.primaryPink)
+                                .frame(width: 34, height: 34)
+                                .liquidGlassSurface(
+                                    .prominent,
+                                    tint: LiquidGlassColors.primaryPink.opacity(0.15),
+                                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                )
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(t("sceneBake.rendererDialog.title"))
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundStyle(LiquidGlassColors.textPrimary)
+                                Text(t("sceneBake.rendererDialog.message"))
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(LiquidGlassColors.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            Spacer()
+
+                            Button {
+                                showSceneBakeRendererDialog = false
+                            } label: {
+                                DetailSheetCircleIconLabel(
+                                    systemName: "xmark",
+                                    foreground: LiquidGlassColors.textPrimary,
+                                    fontSize: 12,
+                                    frameSide: 30
+                                )
+                                .detailGlassCircleChrome()
+                            }
+                            .buttonStyle(.plain)
+                            .help(t("cancel"))
+                        }
+
+                        VStack(spacing: 12) {
+                            sceneBakeRendererRow(renderer: .wallpaperWgpu)
+                            sceneBakeRendererRow(renderer: .legacyCLI)
+                        }
+                    }
+                    .padding(22)
+                    .frame(width: 520)
+                    .liquidGlassSurface(
+                        .prominent,
+                        in: RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 26, style: .continuous)
+                            .stroke(.white.opacity(0.18), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.38), radius: 28, x: 0, y: 20)
+                }
+                .zIndex(1200)
+            }
+        }
     }
 
-    private func runSceneOfflineBake() {
+    private func sceneBakeRendererRow(renderer: SceneBakeRenderer) -> some View {
+        let available = SceneOfflineBakeService.isRendererAvailable(renderer)
+        let isPreviewing = activeScenePreviewRenderer == renderer
+        return HStack(spacing: 12) {
+            Button {
+                showSceneBakeRendererDialog = false
+                runSceneOfflineBake(renderer: renderer, clearCachedArtifact: sceneBakeShouldClearCachedArtifact)
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: renderer == .wallpaperWgpu ? "sparkles.tv" : "terminal")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(available ? .white : .white.opacity(0.34))
+                        .frame(width: 24)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(renderer == .wallpaperWgpu ? t("sceneBake.renderer.wgpu") : t("sceneBake.renderer.legacy"))
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(available ? LiquidGlassColors.textPrimary : LiquidGlassColors.textQuaternary)
+                            .lineLimit(1)
+                        Text(renderer == .wallpaperWgpu ? "metal / live" : "legacy / offline")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(LiquidGlassColors.textTertiary)
+                    }
+
+                    Spacer()
+                }
+                .frame(height: 52)
+                .padding(.horizontal, 14)
+                .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .liquidGlassSurface(
+                    available ? (isBakingScene ? .subtle : .prominent) : .subtle,
+                    tint: available ? (renderer == .wallpaperWgpu ? LiquidGlassColors.primaryPink.opacity(0.10) : LiquidGlassColors.accentCyan.opacity(0.10)) : nil,
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(available ? Color.white.opacity(0.10) : Color.clear, lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .disabled(!available || isBakingScene)
+
+            Button {
+                previewSceneRenderer(renderer)
+            } label: {
+                Image(systemName: isPreviewing ? "eye.fill" : "eye")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(available ? LiquidGlassColors.textPrimary : LiquidGlassColors.textQuaternary)
+                    .frame(width: 46, height: 52)
+                    .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .liquidGlassSurface(
+                        .regular,
+                        in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .help(t("sceneBake.preview"))
+            .disabled(!available)
+        }
+    }
+
+    /// 重新烘焙：清除已有缓存后重新执行烘焙
+    private func reBakeScene() {
+        presentSceneBakeRendererDialog(clearCachedArtifact: true)
+    }
+
+    private func presentSceneBakeRendererDialog(clearCachedArtifact: Bool) {
+        guard currentDownloadRecord != nil else { return }
+        sceneBakeShouldClearCachedArtifact = clearCachedArtifact
+        showSceneBakeRendererDialog = true
+    }
+
+    private func previewSceneRenderer(_ renderer: SceneBakeRenderer) {
+        guard let record = currentDownloadRecord else { return }
+        do {
+            try SceneOfflineBakeService.preview(record: record, renderer: renderer)
+            activeScenePreviewRenderer = renderer
+        } catch {
+            errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+            showError = true
+        }
+    }
+
+    private func runSceneOfflineBake(renderer: SceneBakeRenderer, clearCachedArtifact: Bool) {
         guard let record = currentDownloadRecord else { return }
         if isBakingScene { return }
         guard SystemMemoryPressure.hasRoomForSceneOfflineBake() else {
@@ -707,23 +927,58 @@ struct MediaDetailSheet: View {
             return
         }
         isBakingScene = true
+        bakeProgress = 0
         errorMessage = ""
+        let shouldAutoApplyAfterBake = NSScreen.screens.count <= 1
         Task {
-            // 有缓存则立即关闭加载状态
-            if SceneOfflineBakeService.hasCachedArtifact(record: record) {
-                await MainActor.run { isBakingScene = false }
+            if clearCachedArtifact {
+                await MainActor.run {
+                    mediaLibrary.clearSceneBakeArtifact(itemID: record.item.id)
+                }
             }
-            do {
-                let artifact = try await SceneOfflineBakeService.bake(record: record)
+            if !clearCachedArtifact, SceneOfflineBakeService.hasCachedArtifact(record: record, renderer: renderer) {
+                let artifact = record.sceneBakeArtifact!
                 let videoURL = URL(fileURLWithPath: artifact.videoPath)
+                _ = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                    forLocalVideo: videoURL,
+                    itemID: record.item.id
+                )
                 await MainActor.run {
                     isBakingScene = false
-                    scheduleSceneBakeSuccessFlash()
-                    applyWorkshopVideoWallpaper(videoURL: videoURL, preferPosterFrameFromVideo: true)
+                    bakeProgress = 0
+                    if shouldAutoApplyAfterBake {
+                        applyWorkshopVideoWallpaper(videoURL: videoURL, preferPosterFrameFromVideo: true)
+                    } else {
+                        sceneBakeStatusFlash = t("sceneBake.cached")
+                    }
+                }
+                return
+            }
+            do {
+                let artifact = try await SceneOfflineBakeService.bake(record: record, renderer: renderer) { progress in
+                    bakeProgress = progress
+                }
+                let videoURL = URL(fileURLWithPath: artifact.videoPath)
+
+                await MainActor.run {
+                    isBakingScene = false
+                    bakeProgress = 0
+                    if shouldAutoApplyAfterBake {
+                        scheduleSceneBakeSuccessFlash()
+                        applyWorkshopVideoWallpaper(videoURL: videoURL, preferPosterFrameFromVideo: true)
+                    } else {
+                        sceneBakeStatusFlash = t("sceneBake.cached")
+                    }
+                }
+            } catch let error as BakeError where error == .cancelled {
+                await MainActor.run {
+                    isBakingScene = false
+                    bakeProgress = 0
                 }
             } catch {
                 await MainActor.run {
                     isBakingScene = false
+                    bakeProgress = 0
                     errorMessage = Self.truncateErrorMessage(error.localizedDescription)
                     showError = true
                 }
@@ -734,6 +989,20 @@ struct MediaDetailSheet: View {
     /// Workshop 视频/烘焙成片：锁屏海报优先用本地 project 预览图，其次 item.posterURL
     private var preferredWorkshopPosterForVideo: URL? {
         localWorkshopPreviewImageURL(for: resolvedItem) ?? resolvedItem.posterURL
+    }
+
+    @MainActor
+    private func preferredPosterFrame(for videoURL: URL, preferPosterFrameFromVideo: Bool) async -> URL? {
+        guard preferPosterFrameFromVideo else { return nil }
+        if let record = currentDownloadRecord,
+           let artifact = record.sceneBakeArtifact,
+           artifact.videoPath == videoURL.path {
+            return await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                forLocalVideo: videoURL,
+                itemID: record.item.id
+            )
+        }
+        return await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL)
     }
 
     private var buttonRowWithDividers: some View {
@@ -769,7 +1038,7 @@ struct MediaDetailSheet: View {
                 setAsDesktopWallpaper()
             } label: {
                 HStack(spacing: 10) {
-                    if isSettingWallpaper || isBakingScene {
+                    if isSettingWallpaper {
                         CustomProgressView(tint: .white)
                             .scaleEffect(0.8)
                     } else {
@@ -788,7 +1057,7 @@ struct MediaDetailSheet: View {
                 .detailPrimaryGlassButtonChrome()
             }
             .buttonStyle(.plain)
-            .disabled(isSettingWallpaper || isBakingScene)
+            .disabled(isSettingWallpaper)
 
             // 循环视频预处理提示（已临时关闭自动预处理，待后续增加手动开关后恢复）
             // if loopService.isProcessing {
@@ -1019,17 +1288,18 @@ struct MediaDetailSheet: View {
             if resolvedItem.sourceName == t("wallpaperEngine"),
                resolvedItem.subscriptionCount != nil || resolvedItem.favoriteCount != nil
                || resolvedItem.viewCount != nil || resolvedItem.ratingScore != nil
-               || resolvedItem.authorName != nil || resolvedItem.fileSize != nil
+               || resolvedItem.authorName != nil || resolvedItem.authorSteamID != nil || resolvedItem.fileSize != nil
                || resolvedItem.createdAt != nil || resolvedItem.updatedAt != nil {
                 dividerLine.opacity(0.7)
 
                 infoSection(title: t("wallpaperEngine")) {
-                    if let author = resolvedItem.authorName {
+                    if resolvedItem.authorName != nil || resolvedItem.authorSteamID != nil {
+                        let author = resolvedItem.authorName ?? t("unknown")
                         if resolvedItem.authorSteamID != nil {
                             Button {
                                 openAuthorSheet()
                             } label: {
-                                compactFact(label: t("author"), value: author)
+                                compactFact(label: t("author"), value: author, isInteractive: true)
                             }
                             .buttonStyle(.plain)
                             .onHover { hovering in
@@ -1126,21 +1396,33 @@ struct MediaDetailSheet: View {
             .tracking(2)
     }
 
-    private func compactFact(label: String, value: String) -> some View {
+    private func compactFact(label: String, value: String, isInteractive: Bool = false) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.white.opacity(0.45))
                 .frame(width: 72, alignment: .leading)
 
-            Text(value)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.9))
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if isInteractive {
+                    detailDisclosureIndicator
+                }
+            }
 
             Spacer(minLength: 0)
         }
+    }
+
+    private var detailDisclosureIndicator: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white.opacity(0.32))
     }
 
     private var mediaTitle: String {
@@ -1184,7 +1466,7 @@ struct MediaDetailSheet: View {
             return flash
         }
         if isSettingWallpaper {
-            return t("applyingWallpaper")
+            return t(applyingWallpaperStatusKey)
         }
         if isDownloading {
             return t("downloadingMedia")
@@ -1200,7 +1482,8 @@ struct MediaDetailSheet: View {
 
     private func loadDetailIfNeeded() async {
         let detail = await viewModel.ensureDetail(for: initialItem)
-        resolvedItem = itemWithLocalWorkshopVideo(detail)
+        let merged = mediaItemByMergingAuthorMetadata(detail, fallback: initialItem)
+        resolvedItem = itemWithLocalWorkshopVideo(merged)
         viewModel.recordViewed(resolvedItem)
         // 来源数据已加载并排序完成
         withAnimation(.easeInOut(duration: 0.3)) {
@@ -1312,8 +1595,12 @@ struct MediaDetailSheet: View {
                 guard !self.isNavigating else { return nil }
                 self.navigateToNextMedia()
                 return nil
-            case 53: // ESC：优先关闭预览弹窗，否则关闭详情页
-                if PreviewWindowManager.shared.isPresented {
+            case 53: // ESC：优先关闭当前弹窗，再关闭预览，最后返回详情栈
+                if self.showSceneBakeRendererDialog {
+                    self.showSceneBakeRendererDialog = false
+                } else if self.showAuthorSheet {
+                    self.dismissAuthorSheet()
+                } else if PreviewWindowManager.shared.isPresented {
                     PreviewWindowManager.shared.closePreview()
                 } else {
                     self.onClose()
@@ -1357,12 +1644,53 @@ struct MediaDetailSheet: View {
 
     private func loadDetailIfNeededFor(_ item: MediaItem) async {
         let detail = await viewModel.ensureDetail(for: item)
-        resolvedItem = itemWithLocalWorkshopVideo(detail)
+        let updated = itemWithLocalWorkshopVideo(mediaItemByMergingAuthorMetadata(detail, fallback: item))
+        resolvedItem = updated
         viewModel.recordViewed(resolvedItem)
         // 来源数据已加载并排序完成
         withAnimation(.easeInOut(duration: 0.3)) {
             isSourcesReady = true
         }
+    }
+
+    private func mediaItemByMergingAuthorMetadata(_ item: MediaItem, fallback: MediaItem) -> MediaItem {
+        let mergedAuthorName = item.authorName ?? fallback.authorName
+        let mergedAuthorSteamID = item.authorSteamID ?? fallback.authorSteamID
+        let mergedAuthorAvatarURL = item.authorAvatarURL ?? fallback.authorAvatarURL
+
+        guard mergedAuthorName != item.authorName
+              || mergedAuthorSteamID != item.authorSteamID
+              || mergedAuthorAvatarURL != item.authorAvatarURL else {
+            return item
+        }
+
+        return MediaItem(
+            slug: item.slug,
+            title: item.title,
+            pageURL: item.pageURL,
+            thumbnailURL: item.thumbnailURL,
+            resolutionLabel: item.resolutionLabel,
+            collectionTitle: item.collectionTitle,
+            summary: item.summary,
+            previewVideoURL: item.previewVideoURL,
+            posterURL: item.posterURL,
+            tags: item.tags,
+            exactResolution: item.exactResolution,
+            durationSeconds: item.durationSeconds,
+            downloadOptions: item.downloadOptions,
+            sourceName: item.sourceName,
+            isAnimatedImage: item.isAnimatedImage,
+            subscriptionCount: item.subscriptionCount,
+            favoriteCount: item.favoriteCount,
+            viewCount: item.viewCount,
+            ratingScore: item.ratingScore,
+            authorName: mergedAuthorName,
+            authorSteamID: mergedAuthorSteamID,
+            authorAvatarURL: mergedAuthorAvatarURL,
+            fileSize: item.fileSize,
+            createdAt: item.createdAt,
+            updatedAt: item.updatedAt
+        )
     }
 
     private func downloadMedia() {
@@ -1460,7 +1788,7 @@ struct MediaDetailSheet: View {
         }
     }
 
-    private static func truncateErrorMessage(_ message: String, maxLength: Int = 600) -> String {
+    private static func truncateErrorMessage(_ message: String, maxLength: Int = 2_000) -> String {
         if message.count <= maxLength { return message }
         let endIndex = message.index(message.startIndex, offsetBy: maxLength)
         return String(message[..<endIndex]) + "\n\n[日志已截断，完整错误请查看控制台]"
@@ -1531,28 +1859,26 @@ struct MediaDetailSheet: View {
                 title: t("setWallpaper"),
                 message: t("multiDisplayDetected")
             ) { [self] selectedScreen in
+                applyingWallpaperStatusKey = "applyingWallpaper.video"
                 isSettingWallpaper = true
                 errorMessage = ""
-                Task {
+                Task { @MainActor in
                     do {
                         try await viewModel.applyDynamicWallpaper(resolvedItem, muted: isMuted, targetScreen: selectedScreen)
                         WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
+                        isSettingWallpaper = false
                     } catch {
-                        await MainActor.run {
-                            errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                            showError = true
-                            isSettingWallpaper = false
-                        }
-                    }
-                    await MainActor.run {
+                        errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+                        showError = true
                         isSettingWallpaper = false
                     }
                 }
             }
         } else {
+            applyingWallpaperStatusKey = "applyingWallpaper.video"
             isSettingWallpaper = true
             errorMessage = ""
-            Task {
+            Task { @MainActor in
                 do {
                     try await viewModel.applyDynamicWallpaper(resolvedItem, muted: isMuted)
                     WallpaperSchedulerService.shared.notifyManualWallpaperChange(
@@ -1653,7 +1979,15 @@ struct MediaDetailSheet: View {
 
         switch contentType {
         case .scene:
-            applySceneWallpaperPreferringBake(sceneContentRoot: contentRoot, cliPath: localURL.path)
+            // Scene 壁纸始终走 wallpaper-wgpu 实时渲染（--background）
+            // 烘焙产物仅通过「烘焙视频」按钮使用
+            applyWorkshopRendererWallpaper(
+                path: localURL.path,
+                posterURL: preferredWorkshopPosterForVideo,
+                statusKey: "applyingWallpaper.realtime"
+            )
+        case .web:
+            applyWorkshopWebWallpaper(webDirPath: localURL.path, posterURL: preferredWorkshopPosterForVideo)
         case .image:
             applyWorkshopImageWallpaper(imageURL: localURL)
         case .video:
@@ -1662,10 +1996,18 @@ struct MediaDetailSheet: View {
             if let videoURL = findVideoFile(in: contentRoot) {
                 applyWorkshopVideoWallpaper(videoURL: videoURL, preferPosterFrameFromVideo: true)
             } else {
-                applyWorkshopRendererWallpaper(path: localURL.path, posterURL: preferredWorkshopPosterForVideo)
+                applyWorkshopRendererWallpaper(
+                    path: localURL.path,
+                    posterURL: preferredWorkshopPosterForVideo,
+                    statusKey: "applyingWallpaper.realtime"
+                )
             }
         default:
-            applyWorkshopRendererWallpaper(path: localURL.path, posterURL: preferredWorkshopPosterForVideo)
+            applyWorkshopRendererWallpaper(
+                path: localURL.path,
+                posterURL: preferredWorkshopPosterForVideo,
+                statusKey: "applyingWallpaper.realtime"
+            )
         }
     }
 
@@ -1742,9 +2084,8 @@ struct MediaDetailSheet: View {
         var isWebPreview = false
 
         // 1. 已烘焙的 Scene MP4
-        if let artifact = currentDownloadRecord?.sceneBakeArtifact,
-           FileManager.default.fileExists(atPath: artifact.videoPath) {
-            targetURL = URL(fileURLWithPath: artifact.videoPath)
+        if let cachedSceneBakeVideoURL {
+            targetURL = cachedSceneBakeVideoURL
         }
         // 2. 本地 Workshop 文件/目录
         else if let localURL = findLocalWorkshopFile() {
@@ -1822,121 +2163,6 @@ struct MediaDetailSheet: View {
         var isDir: ObjCBool = false
         _ = FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDir)
         return isDir.boolValue ? localURL : localURL.deletingLastPathComponent()
-    }
-
-    /// Scene：优先已烘焙的组合 Web 目录（video + overlay）→ 无则现场烘焙 → 失败再回退 CLI 实时渲染
-    private func applySceneWallpaperPreferringBake(sceneContentRoot: URL, cliPath: String) {
-        let itemID = resolvedItem.id
-        let fm = FileManager.default
-
-        // 1. 已有烘焙产物：优先使用 .web 组合目录（视频背景 + Web overlay）
-        if let record = currentDownloadRecord,
-           let art = record.sceneBakeArtifact,
-           art.analysisId == record.sceneBakeEligibility?.analysisId {
-            let webDirPath = art.videoPath.replacingOccurrences(of: ".mp4", with: ".web")
-            if fm.fileExists(atPath: webDirPath) {
-                applyWorkshopWebWallpaper(webDirPath: webDirPath, posterURL: preferredWorkshopPosterForVideo)
-                return
-            }
-            // _fallback_：无 .web 目录但视频存在，直接播放视频
-            if fm.fileExists(atPath: art.videoPath) {
-                applyWorkshopVideoWallpaper(
-                    videoURL: URL(fileURLWithPath: art.videoPath),
-                    preferPosterFrameFromVideo: true
-                )
-                return
-            }
-        }
-
-        if isBakingScene { return }
-        isBakingScene = true
-        Task {
-            do {
-                let snapshotRecord = await MainActor.run {
-                    mediaLibrary.downloadedItems.first { $0.item.id == itemID }
-                }
-                let needsFreshAnalyze: Bool = {
-                    guard let existing = snapshotRecord?.sceneBakeEligibility,
-                          existing.contentRootPath == sceneContentRoot.path else { return true }
-                    return false
-                }()
-                if needsFreshAnalyze, !SystemMemoryPressure.hasRoomForSceneEligibilityAnalysis() {
-                    await MainActor.run {
-                        isBakingScene = false
-                        errorMessage = t("sceneBake.error.insufficientMemory.analysis")
-                        showError = true
-                        applyWorkshopRendererWallpaper(path: cliPath, posterURL: preferredWorkshopPosterForVideo)
-                    }
-                    return
-                }
-
-                let eligibility: SceneBakeEligibilitySnapshot
-                if let existing = snapshotRecord?.sceneBakeEligibility,
-                   existing.contentRootPath == sceneContentRoot.path {
-                    eligibility = existing
-                } else {
-                    eligibility = try await Task.detached(priority: .userInitiated) {
-                        try SceneBakeEligibilityAnalyzer.analyze(contentRoot: sceneContentRoot)
-                    }.value
-                }
-
-                await MainActor.run {
-                    MediaLibraryService.shared.attachSceneBakeEligibility(
-                        itemID: itemID,
-                        snapshot: eligibility,
-                        triggerAutoBake: false
-                    )
-                }
-
-                if !SystemMemoryPressure.hasRoomForSceneOfflineBake() {
-                    await MainActor.run {
-                        isBakingScene = false
-                        errorMessage = t("sceneBake.error.insufficientMemory.bake")
-                        showError = true
-                        applyWorkshopRendererWallpaper(path: cliPath, posterURL: preferredWorkshopPosterForVideo)
-                    }
-                    return
-                }
-
-                let persistID = await MainActor.run {
-                    mediaLibrary.downloadedItems.first { $0.item.id == itemID && $0.isActive }?.id
-                }
-                let cacheKey =
-                    persistID ?? SceneOfflineBakeService.stableOrphanCacheItemID(contentRootPath: sceneContentRoot.path)
-
-                let artifact = try await SceneOfflineBakeService.bake(
-                    eligibility: eligibility,
-                    contentRoot: sceneContentRoot,
-                    cacheItemID: cacheKey,
-                    persistArtifactToItemID: persistID
-                )
-                let webDirPath = artifact.videoPath.replacingOccurrences(of: ".mp4", with: ".web")
-                await MainActor.run {
-                    isBakingScene = false
-                    scheduleSceneBakeSuccessFlash()
-                    if fm.fileExists(atPath: webDirPath) {
-                        applyWorkshopWebWallpaper(webDirPath: webDirPath, posterURL: preferredWorkshopPosterForVideo)
-                    } else {
-                        applyWorkshopVideoWallpaper(videoURL: URL(fileURLWithPath: artifact.videoPath), preferPosterFrameFromVideo: true)
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    isBakingScene = false
-                    if let bakeErr = error as? SceneOfflineBakeError, case .insufficientMemory = bakeErr {
-                        errorMessage = t("sceneBake.error.insufficientMemory.bake")
-                        showError = true
-                        applyWorkshopRendererWallpaper(path: cliPath, posterURL: preferredWorkshopPosterForVideo)
-                    } else {
-                        let detail = Self.truncateErrorMessage(error.localizedDescription)
-                        errorMessage = detail + "\n\n" + t("sceneBake.error.afterBakeFailureHint")
-                        showError = true
-                        applyWorkshopRendererWallpaper(path: cliPath, posterURL: preferredWorkshopPosterForVideo)
-                        print("[SceneWallpaper] 离线烘焙失败，已回退实时渲染: \(error.localizedDescription)")
-                    }
-                }
-            }
-        }
     }
 
     private func resolveWorkshopContentPath(_ url: URL, workshopID: String) -> URL? {
@@ -2342,9 +2568,15 @@ struct MediaDetailSheet: View {
         }
     }
 
+    private var sceneBakeProgressSubtitle: String {
+        if NSScreen.screens.count > 1 {
+            return t("sceneBake.progressSubtitleMultiDisplay")
+        }
+        return t("sceneBake.progressSubtitle")
+    }
+
     /// 直接应用 Workshop / 烘焙 MP4 视频壁纸（须在主线程调用；内部 `Task` 使用 `@MainActor` 以匹配 `VideoWallpaperManager`）
     /// - Parameter preferPosterFrameFromVideo: 为 true 时从该 MP4 抽一帧作静态桌面/锁屏（与 Workshop 预览图逻辑一致，失败则回退 `preferredWorkshopPosterForVideo`）。
-    /// - Parameter onApplyFinished: 成功应用到桌面后回调（用于离线烘焙完成后的文案提示）。
     private func applyWorkshopVideoWallpaper(
         videoURL: URL,
         preferPosterFrameFromVideo: Bool = true,
@@ -2368,13 +2600,13 @@ struct MediaDetailSheet: View {
                 title: t("setWallpaper"),
                 message: t("multiDisplayDetected")
             ) { [self] selectedScreen in
+                applyingWallpaperStatusKey = "applyingWallpaper.video"
                 isSettingWallpaper = true
                 Task { @MainActor in
-                    let posterFromVideo: URL? = if preferPosterFrameFromVideo {
-                        await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL)
-                    } else {
-                        nil
-                    }
+                    let posterFromVideo = await preferredPosterFrame(
+                        for: videoURL,
+                        preferPosterFrameFromVideo: preferPosterFrameFromVideo
+                    )
                     let posterURL = posterFromVideo ?? preferredWorkshopPosterForVideo
                     do {
                         try wallpaperManager.applyVideoWallpaper(
@@ -2393,13 +2625,13 @@ struct MediaDetailSheet: View {
                 }
             }
         } else {
+            applyingWallpaperStatusKey = "applyingWallpaper.video"
             isSettingWallpaper = true
             Task { @MainActor in
-                let posterFromVideo: URL? = if preferPosterFrameFromVideo {
-                    await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL)
-                } else {
-                    nil
-                }
+                let posterFromVideo = await preferredPosterFrame(
+                    for: videoURL,
+                    preferPosterFrameFromVideo: preferPosterFrameFromVideo
+                )
                 let posterURL = posterFromVideo ?? preferredWorkshopPosterForVideo
                 do {
                     try wallpaperManager.applyVideoWallpaper(
@@ -2421,50 +2653,67 @@ struct MediaDetailSheet: View {
     }
 
     private func applyWorkshopWebWallpaper(webDirPath: String, posterURL: URL?) {
-        applyWorkshopRendererWallpaper(path: webDirPath, posterURL: posterURL)
+        applyWorkshopRendererWallpaper(
+            path: webDirPath,
+            posterURL: posterURL,
+            statusKey: "applyingWallpaper.web"
+        )
     }
 
-    private func applyWorkshopRendererWallpaper(path: String, posterURL: URL?) {
+    private func applyWorkshopRendererWallpaper(
+        path: String,
+        posterURL: URL?,
+        statusKey: String = "applyingWallpaper.realtime"
+    ) {
         let screens = NSScreen.screens
-        if screens.count > 1 {
-            DisplaySelectorManager.shared.showSelector(
-                title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
-            ) { [self] selectedScreen in
-                isSettingWallpaper = true
-                Task { @MainActor in
-                    do {
-                        try await WallpaperEngineXBridge.shared.setWallpaper(
-                            path: path,
-                            posterURL: posterURL,
-                            targetScreens: selectedScreen.map { [$0] }
-                        )
-                        WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
-                    } catch {
-                        errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                        showError = true
-                    }
-                    isSettingWallpaper = false
-                }
-            }
-        } else {
+        print("[MediaDetailSheet] applyWorkshopRendererWallpaper path=\(path) screens=\(screens.count)")
+
+        // 检查二进制是否存在
+        if WallpaperEngineXBridge.resolvedCLIExecutableURL() == nil {
+            print("[MediaDetailSheet] ❌ wallpaper-wgpu 二进制不存在")
+            errorMessage = "wallpaper-wgpu 渲染器未找到"
+            showError = true
+            return
+        }
+
+        // 检查路径是否存在
+        if !FileManager.default.fileExists(atPath: path) {
+            print("[MediaDetailSheet] ❌ 壁纸路径不存在: \(path)")
+            errorMessage = "壁纸文件不存在"
+            showError = true
+            return
+        }
+
+        let runSetWallpaper: (NSScreen?) -> Void = { [self] selectedScreen in
+            applyingWallpaperStatusKey = statusKey
             isSettingWallpaper = true
             Task { @MainActor in
                 do {
+                    print("[MediaDetailSheet] 调用 WallpaperEngineXBridge.setWallpaper...")
                     try await WallpaperEngineXBridge.shared.setWallpaper(
                         path: path,
-                        posterURL: posterURL,
-                        targetScreens: nil
+                        targetScreens: selectedScreen.map { [$0] }
                     )
-                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(
-                        screenID: NSScreen.screens.first?.wallpaperScreenIdentifier
-                    )
+                    print("[MediaDetailSheet] ✅ 壁纸设置成功")
+                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
                 } catch {
+                    print("[MediaDetailSheet] ❌ 设置壁纸失败: \(error.localizedDescription)")
                     errorMessage = Self.truncateErrorMessage(error.localizedDescription)
                     showError = true
                 }
                 isSettingWallpaper = false
             }
+        }
+
+        if screens.count > 1 {
+            DisplaySelectorManager.shared.showSelector(
+                title: t("setWallpaper"),
+                message: t("multiDisplayDetected")
+            ) { selectedScreen in
+                runSetWallpaper(selectedScreen)
+            }
+        } else {
+            runSetWallpaper(nil)
         }
     }
 
@@ -2486,6 +2735,7 @@ struct MediaDetailSheet: View {
                 title: t("setWallpaper"),
                 message: t("multiDisplayDetected")
             ) { [self] selectedScreen in
+                applyingWallpaperStatusKey = "applyingWallpaper.static"
                 isSettingWallpaper = true
                 Task { @MainActor in
                     do {
@@ -2503,6 +2753,7 @@ struct MediaDetailSheet: View {
                 }
             }
         } else {
+            applyingWallpaperStatusKey = "applyingWallpaper.static"
             isSettingWallpaper = true
             Task { @MainActor in
                 do {
@@ -2527,10 +2778,9 @@ struct MediaDetailSheet: View {
     @ViewBuilder
     private var authorSheetOverlay: some View {
         if showAuthorSheet,
-           let authorName = resolvedItem.authorName,
            let steamID = resolvedItem.authorSteamID {
             AuthorMediaSheet(
-                authorName: authorName,
+                authorName: resolvedItem.authorName ?? t("unknown"),
                 authorSteamID: steamID,
                 authorAvatarURL: resolvedItem.authorAvatarURL,
                 items: authorMediaItems,
@@ -2539,10 +2789,7 @@ struct MediaDetailSheet: View {
                     navigateToAuthorMedia(selectedItem)
                 },
                 onDismiss: {
-                    showAuthorSheet = false
-                    authorMediaItems = []
-                    authorItemsPage = 1
-                    hasMoreAuthorItems = true
+                    dismissAuthorSheet()
                 },
                 onLoadMore: {
                     self.loadMoreAuthorMedia()
@@ -2569,6 +2816,11 @@ struct MediaDetailSheet: View {
                     page: 1
                 )
                 await MainActor.run {
+                    if let authorItem = results.first(where: {
+                        $0.authorName != nil || $0.authorSteamID != nil || $0.authorAvatarURL != nil
+                    }) {
+                        resolvedItem = mediaItemByMergingAuthorMetadata(resolvedItem, fallback: authorItem)
+                    }
                     // 过滤掉当前正在查看的项
                     authorMediaItems = results.filter { $0.id != resolvedItem.id }
                     hasMoreAuthorItems = results.count >= 30
@@ -2582,6 +2834,14 @@ struct MediaDetailSheet: View {
                 }
             }
         }
+    }
+
+    private func dismissAuthorSheet() {
+        showAuthorSheet = false
+        authorMediaItems = []
+        authorItemsPage = 1
+        hasMoreAuthorItems = true
+        isLoadingAuthorItems = false
     }
 
     /// 加载更多作者壁纸（分页）
@@ -2618,17 +2878,23 @@ struct MediaDetailSheet: View {
     /// 从作者壁纸弹窗导航到壁纸详情（关闭弹窗）
     private func navigateToAuthorMedia(_ item: MediaItem) {
         // 关闭作者弹窗
-        showAuthorSheet = false
-        authorMediaItems = []
-        authorItemsPage = 1
-        hasMoreAuthorItems = true
+        dismissAuthorSheet()
 
-        // 导航到该壁纸
-        if let index = viewModel.items.firstIndex(where: { $0.id == item.id }) {
+        // 作者列表所有项目同属一个作者，按字段补齐作者信息，避免只因 authorName 已存在就漏掉头像。
+        let patchedItem = mediaItemByMergingAuthorMetadata(item, fallback: resolvedItem)
+
+        // 如果有 push 回调，使用 NavigationStack 入栈（保留当前详情页在栈中）
+        if let onNavigateToItem {
+            onNavigateToItem(patchedItem)
+            return
+        }
+
+        // 否则在当前详情页内替换壁纸
+        if let index = viewModel.items.firstIndex(where: { $0.id == patchedItem.id }) {
             navigateToIndex(index)
         } else {
             prepareSlideTransition(direction: .down)
-            reloadMedia(item)
+            reloadMedia(patchedItem)
         }
     }
 }
@@ -2791,6 +3057,9 @@ struct WallpaperPreviewSheet: View {
                         .onAppear {
                             previewPlayer.load(url: url, isMuted: isMuted)
                         }
+                        .onDisappear {
+                            previewPlayer.cleanup()
+                        }
 
                     // 底部控制栏
                     VStack {
@@ -2896,22 +3165,29 @@ struct WallpaperPreviewSheet: View {
 
 // MARK: - 预览播放器（可拖拽进度条）
 
-final class PreviewPlayer: ObservableObject {
+@MainActor
+final class PreviewPlayer: ObservableObject, @unchecked Sendable {
     let player = AVPlayer()
     @Published var currentTime: TimeInterval = 0
     @Published var totalDuration: TimeInterval = 0
-    private var timeObserver: Any?
+    nonisolated(unsafe) private var timeObserver: Any?
 
     func load(url: URL, isMuted: Bool) {
+        removeTimeObserver()
+
         player.isMuted = isMuted
         let item = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: item)
         player.play()
 
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
-            guard let self, item.duration.seconds.isFinite, item.duration.seconds > 0 else { return }
-            self.currentTime = time.seconds
-            self.totalDuration = item.duration.seconds
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let duration = self.player.currentItem?.duration.seconds ?? 0
+                guard duration.isFinite, duration > 0 else { return }
+                self.currentTime = time.seconds
+                self.totalDuration = duration
+            }
         }
     }
 
@@ -2919,8 +3195,25 @@ final class PreviewPlayer: ObservableObject {
         player.seek(to: CMTime(seconds: time, preferredTimescale: 600))
     }
 
+    func cleanup() {
+        removeTimeObserver()
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+    }
+
+    private func removeTimeObserver() {
+        if let observer = timeObserver {
+            player.removeTimeObserver(observer)
+            timeObserver = nil
+        }
+    }
+
     deinit {
-        if let observer = timeObserver { player.removeTimeObserver(observer) }
+        if let observer = timeObserver {
+            DispatchQueue.main.async { [player] in
+                player.removeTimeObserver(observer)
+            }
+        }
     }
 }
 
