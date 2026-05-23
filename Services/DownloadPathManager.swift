@@ -317,4 +317,5 @@ extension Notification.Name {
     static let appDidHideWindow = Notification.Name("appDidHideWindow")
     static let appShouldReleaseForegroundMemory = Notification.Name("appShouldReleaseForegroundMemory")
     static let appDidReceiveMemoryPressure = Notification.Name("appDidReceiveMemoryPressure")
+    static let switchToLibraryTab = Notification.Name("switchToLibraryTab")
 }

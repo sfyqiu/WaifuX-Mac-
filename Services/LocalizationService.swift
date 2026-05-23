@@ -253,6 +253,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.muteWallpaper": "Mute Wallpaper",
         "statusbar.unmuteWallpaper": "Unmute Wallpaper",
         "statusbar.autoPauseFullscreen": "Auto-pause on Fullscreen",
+        "statusbar.openMyLibrary": "Open My Library",
         "statusbar.quit": "Quit",
         // Tabs
         "tab.all": "ALL",
@@ -1299,6 +1300,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.muteWallpaper": "静音动态壁纸",
         "statusbar.unmuteWallpaper": "取消静音",
         "statusbar.autoPauseFullscreen": "全屏时自动暂停",
+        "statusbar.openMyLibrary": "打开我的库",
         "statusbar.quit": "退出",
         // Tabs
         "tab.all": "全部",
@@ -2347,6 +2349,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.autoPauseFullscreen": "全画面時に自動一時停止",
         "statusbar.enableWallpaper": "動的壁紙を有効にする",
         "statusbar.disableWallpaper": "動的壁紙を無効にする",
+        "statusbar.openMyLibrary": "マイライブラリを開く",
         "statusbar.quit": "終了",
         // Tabs
         "tab.all": "すべて",

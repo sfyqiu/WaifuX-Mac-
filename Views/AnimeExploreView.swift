@@ -507,6 +507,12 @@ struct AnimeExploreView: View {
     // MARK: - Actions
 
     private func performFirstAppearanceLoad() async {
+        // ⚠️ 防止 NavigationStack pop 后视图被重建导致丢失已加载的多页数据
+        guard viewModel.animeItems.isEmpty else {
+            isFirstAppearance = false
+            return
+        }
+
         isInitialLoading = true
         searchText = ""
         selectedHotTag = nil

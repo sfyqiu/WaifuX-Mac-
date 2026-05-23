@@ -335,6 +335,20 @@ struct MediaDetailSheet: View {
             setupKeyboardMonitor()
             await loadDetailIfNeeded()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeProgressDidUpdate)) { notification in
+            guard let notifItemID = notification.object as? String,
+                  notifItemID == resolvedItem.id else { return }
+            if let progress = notification.userInfo?["progress"] as? Double {
+                if !isBakingScene {
+                    isBakingScene = true
+                }
+                bakeProgress = progress
+                if progress >= 1.0 {
+                    isBakingScene = false
+                    bakeProgress = 0
+                }
+            }
+        }
         .onDisappear {
             isVisible = false
             ForegroundPrefetchManager.shared.stop(namespace: prefetchNamespace)
@@ -1979,13 +1993,8 @@ struct MediaDetailSheet: View {
 
         switch contentType {
         case .scene:
-            // Scene 壁纸始终走 wallpaper-wgpu 实时渲染（--background）
-            // 烘焙产物仅通过「烘焙视频」按钮使用
-            applyWorkshopRendererWallpaper(
-                path: localURL.path,
-                posterURL: preferredWorkshopPosterForVideo,
-                statusKey: "applyingWallpaper.realtime"
-            )
+            // Scene 壁纸不再使用实时渲染，始终走烘焙产物
+            applySceneWallpaperPreferringBake(sceneContentRoot: contentRoot, cliPath: localURL.path)
         case .web:
             applyWorkshopWebWallpaper(webDirPath: localURL.path, posterURL: preferredWorkshopPosterForVideo)
         case .image:
@@ -2008,6 +2017,127 @@ struct MediaDetailSheet: View {
                 posterURL: preferredWorkshopPosterForVideo,
                 statusKey: "applyingWallpaper.realtime"
             )
+        }
+    }
+
+    /// Scene 壁纸设置：优先使用烘焙产物，无缓存时自动用 legacyCLI 烘焙后应用
+    /// 不再使用 wallpaper-wgpu 实时渲染
+    private func applySceneWallpaperPreferringBake(sceneContentRoot: URL, cliPath: String) {
+        let itemID = resolvedItem.id
+        let fm = FileManager.default
+
+        // 1. 已有烘焙产物 → 直接应用
+        if let record = currentDownloadRecord,
+           let art = record.sceneBakeArtifact,
+           art.analysisId == record.sceneBakeEligibility?.analysisId {
+            // 优先使用 .web 组合目录（视频背景 + Web overlay）
+            let webDirPath = art.videoPath.replacingOccurrences(of: ".mp4", with: ".web")
+            if fm.fileExists(atPath: webDirPath) {
+                applyWorkshopWebWallpaper(webDirPath: webDirPath, posterURL: preferredWorkshopPosterForVideo)
+                return
+            }
+            // 回退到纯视频
+            if fm.fileExists(atPath: art.videoPath) {
+                applyWorkshopVideoWallpaper(
+                    videoURL: URL(fileURLWithPath: art.videoPath),
+                    preferPosterFrameFromVideo: true
+                )
+                return
+            }
+        }
+
+        // 2. 无烘焙产物 → 自动用 legacyCLI 烘焙后应用
+        guard !isBakingScene else { return }
+        isBakingScene = true
+        bakeProgress = 0
+        applyingWallpaperStatusKey = "applyingWallpaper.video"
+        isSettingWallpaper = true
+
+        Task {
+            do {
+                // 获取或分析烘焙资格
+                let snapshotRecord = await MainActor.run {
+                    mediaLibrary.downloadedItems.first { $0.item.id == itemID }
+                }
+                let eligibility: SceneBakeEligibilitySnapshot
+                if let existing = snapshotRecord?.sceneBakeEligibility,
+                   existing.contentRootPath == sceneContentRoot.path {
+                    eligibility = existing
+                } else {
+                    guard SystemMemoryPressure.hasRoomForSceneEligibilityAnalysis() else {
+                        await MainActor.run {
+                            isBakingScene = false
+                            isSettingWallpaper = false
+                            errorMessage = t("sceneBake.error.insufficientMemory.analysis")
+                            showError = true
+                        }
+                        return
+                    }
+                    eligibility = try await Task.detached(priority: .userInitiated) {
+                        try SceneBakeEligibilityAnalyzer.analyze(contentRoot: sceneContentRoot)
+                    }.value
+                    await MainActor.run {
+                        MediaLibraryService.shared.attachSceneBakeEligibility(
+                            itemID: itemID,
+                            snapshot: eligibility,
+                            triggerAutoBake: false
+                        )
+                    }
+                }
+
+                guard SystemMemoryPressure.hasRoomForSceneOfflineBake() else {
+                    await MainActor.run {
+                        isBakingScene = false
+                        isSettingWallpaper = false
+                        errorMessage = t("sceneBake.error.insufficientMemory.bake")
+                        showError = true
+                    }
+                    return
+                }
+
+                let persistID = await MainActor.run {
+                    mediaLibrary.downloadedItems.first { $0.item.id == itemID && $0.isActive }?.id
+                }
+                let cacheKey = persistID ?? SceneOfflineBakeService.stableOrphanCacheItemID(contentRootPath: sceneContentRoot.path)
+
+                // 使用 legacyCLI 烘焙
+                let artifact = try await SceneOfflineBakeService.bake(
+                    eligibility: eligibility,
+                    contentRoot: sceneContentRoot,
+                    cacheItemID: cacheKey,
+                    renderer: .legacyCLI,
+                    persistArtifactToItemID: persistID,
+                    progress: { [self] progress in
+                        Task { @MainActor in
+                            bakeProgress = progress
+                        }
+                    }
+                )
+
+                let webDirPath = artifact.videoPath.replacingOccurrences(of: ".mp4", with: ".web")
+                await MainActor.run {
+                    isBakingScene = false
+                    isSettingWallpaper = false
+                    scheduleSceneBakeSuccessFlash()
+                    if fm.fileExists(atPath: webDirPath) {
+                        applyWorkshopWebWallpaper(webDirPath: webDirPath, posterURL: preferredWorkshopPosterForVideo)
+                    } else {
+                        applyWorkshopVideoWallpaper(
+                            videoURL: URL(fileURLWithPath: artifact.videoPath),
+                            preferPosterFrameFromVideo: true
+                        )
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isBakingScene = false
+                    isSettingWallpaper = false
+                    let detail = Self.truncateErrorMessage(error.localizedDescription)
+                    errorMessage = detail
+                    showError = true
+                    print("[SceneWallpaper] 离线烘焙失败: \(error.localizedDescription)")
+                }
+            }
         }
     }
 

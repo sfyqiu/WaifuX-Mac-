@@ -127,6 +127,7 @@ final class StatusBarController: NSObject {
     private let menu = NSMenu()
 
     private lazy var openWindowItem = NSMenuItem(title: t("statusbar.showWindow"), action: #selector(showMainWindow), keyEquivalent: "")
+    private lazy var openLibraryItem = NSMenuItem(title: t("statusbar.openMyLibrary"), action: #selector(openMyLibrary), keyEquivalent: "")
     private lazy var releaseMemoryItem = NSMenuItem(title: t("statusbar.releaseMemory"), action: #selector(releaseForegroundMemory), keyEquivalent: "")
     private lazy var toggleWallpaperItem = NSMenuItem(title: t("statusbar.enableWallpaper"), action: #selector(toggleDynamicWallpaper), keyEquivalent: "")
     private lazy var playPauseItem = NSMenuItem(title: t("statusbar.pauseWallpaper"), action: #selector(togglePlayback), keyEquivalent: "")
@@ -199,11 +200,13 @@ final class StatusBarController: NSObject {
         button.toolTip = "WaifuX"
 
         openWindowItem.target = self
+        openLibraryItem.target = self
         releaseMemoryItem.target = self
         muteItem.target = self
         quitItem.target = self
 
         menu.addItem(openWindowItem)
+        menu.addItem(openLibraryItem)
         menu.addItem(releaseMemoryItem)
         menu.addItem(.separator())
         // toggleWallpaperItem 和 playPauseItem 在 refreshMenuState 中动态构建
@@ -337,6 +340,13 @@ final class StatusBarController: NSObject {
 
     @objc private func showMainWindow() {
         showWindowHandler?()
+    }
+
+    @objc private func openMyLibrary() {
+        showWindowHandler?()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .switchToLibraryTab, object: nil)
+        }
     }
 
     @objc private func releaseForegroundMemory() {

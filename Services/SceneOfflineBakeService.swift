@@ -40,6 +40,8 @@ extension Notification.Name {
     static let sceneOfflineBakeDidComplete = Notification.Name("sceneOfflineBakeDidComplete")
     /// 烘焙视频抽帧封面已生成。`object` 为 `String`（itemID），`userInfo["thumbnailURL"]` 为 `URL`。
     static let sceneOfflineBakeThumbnailDidUpdate = Notification.Name("sceneOfflineBakeThumbnailDidUpdate")
+    /// 烘焙进度更新。`object` 为 `String`（itemID），`userInfo["progress"]` 为 `Double`（0.0 ~ 1.0）。
+    static let sceneOfflineBakeProgressDidUpdate = Notification.Name("sceneOfflineBakeProgressDidUpdate")
 }
 
 @discardableResult
@@ -264,7 +266,7 @@ enum SceneOfflineBakeService {
         cacheItemID: String,
         durationSeconds: Double = 15,
         fps: Int32 = 30,
-        renderer: SceneBakeRenderer = .wallpaperWgpu,
+        renderer: SceneBakeRenderer = .legacyCLI,
         persistArtifactToItemID: String? = nil,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
@@ -401,15 +403,32 @@ enum SceneOfflineBakeService {
                 progress: progress
             )
         case .legacyCLI:
-            artifact = try await bakeWithLegacyCLI(
-                contentRoot: contentRoot,
-                outURL: outURL,
-                eligibility: eligibility,
-                width: evenW,
-                height: evenH,
-                fps: fps,
-                durationSeconds: durationSeconds
-            )
+            // legacyCLI 没有进度回调，在调用处模拟 10 秒假进度
+            let fakeProgressTask = Task.detached(priority: .background) { [progress] in
+                let totalSteps = 100
+                for step in 1 ... totalSteps {
+                    if Task.isCancelled { return }
+                    let p = min(0.99, Double(step) / Double(totalSteps) * 0.99)
+                    await MainActor.run { progress?(p) }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+            do {
+                artifact = try await bakeWithLegacyCLI(
+                    contentRoot: contentRoot,
+                    outURL: outURL,
+                    eligibility: eligibility,
+                    width: evenW,
+                    height: evenH,
+                    fps: fps,
+                    durationSeconds: durationSeconds
+                )
+                fakeProgressTask.cancel()
+                await MainActor.run { progress?(1.0) }
+            } catch {
+                fakeProgressTask.cancel()
+                throw error
+            }
         }
         if let itemID = persistArtifactToItemID {
             await MainActor.run {
@@ -632,7 +651,7 @@ enum SceneOfflineBakeService {
         record: MediaDownloadRecord,
         durationSeconds: Double = 15,
         fps: Int32 = 30,
-        renderer: SceneBakeRenderer = .wallpaperWgpu,
+        renderer: SceneBakeRenderer = .legacyCLI,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
         guard let eligibility = record.sceneBakeEligibility else {
@@ -671,7 +690,13 @@ enum SceneOfflineBakeService {
                 return
             }
             do {
-                _ = try await bake(record: record)
+                _ = try await bake(record: record) { @MainActor progress in
+                    NotificationCenter.default.post(
+                        name: .sceneOfflineBakeProgressDidUpdate,
+                        object: itemID,
+                        userInfo: ["progress": progress]
+                    )
+                }
                 print("[SceneOfflineBake] auto-bake finished \(itemID)")
             } catch {
                 if case SceneOfflineBakeError.concurrentBakeInProgress = error {

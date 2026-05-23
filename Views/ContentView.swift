@@ -377,6 +377,9 @@ struct ContentView: View {
             .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
                 releaseForegroundMemory()
             }
+            .onReceive(NotificationCenter.default.publisher(for: .switchToLibraryTab)) { _ in
+                navigationState.selectedTab = .myMedia
+            }
             .id(localization.currentLanguage)
 
             VStack {

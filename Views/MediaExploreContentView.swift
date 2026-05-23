@@ -138,6 +138,8 @@ struct MediaExploreContentView: View {
                 cancelTasks()
                 exploreAtmosphere.pause()
             } else {
+                // 恢复可见时复位 isLoadingMore，防止之前 task 被取消后状态卡死
+                isLoadingMore = false
                 syncAtmosphereIfNeeded()
             }
         }
@@ -1134,6 +1136,11 @@ struct MediaExploreContentView: View {
     }
 
     private func performFirstAppearanceLoad() async {
+        // ⚠️ 防止 NavigationStack pop 后视图被重建导致丢失已加载的多页数据
+        guard viewModel.items.isEmpty else {
+            isFirstAppearance = false
+            return
+        }
 
         isInitialLoading = true
         searchText = ""
@@ -1489,6 +1496,7 @@ struct MediaExploreContentView: View {
         searchTask = nil
         loadMoreTask = nil
         sentinelDebounceTask = nil
+        isLoadingMore = false
     }
 
     private func syncAtmosphereIfNeeded() {
