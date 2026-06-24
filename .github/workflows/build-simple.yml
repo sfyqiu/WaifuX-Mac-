@@ -1,0 +1,30 @@
+name: Build WaifuX
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install tools
+        run: |
+          which xcodegen || brew install xcodegen
+          brew install create-dmg || true
+      - name: Generate
+        run: xcodegen generate
+      - name: Build & Package
+        run: |
+          chmod +x ./scripts/package.sh
+          ./scripts/package.sh 2>&1
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaifuX-build
+          path: build/WaifuX.dmg
+          retention-days: 7
