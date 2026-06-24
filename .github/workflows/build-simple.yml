@@ -1,27 +1,14 @@
 name: Build WaifuX
-on:
-  workflow_dispatch:
-  push:
-    branches: [main]
-permissions:
-  contents: write
+on: workflow_dispatch
 jobs:
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v5
-      - name: Install tools
-        run: |
-          which xcodegen || brew install xcodegen
-          brew install create-dmg || true
-      - name: Generate
-        run: xcodegen generate
-      - name: Build & Package
-        run: |
-          chmod +x ./scripts/package.sh
-          ./scripts/package.sh 2>&1
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen create-dmg || true
+      - run: xcodegen generate
+      - run: chmod +x ./scripts/package.sh && ./scripts/package.sh 2>&1
+      - uses: actions/upload-artifact@v4
         with:
           name: WaifuX-build
           path: build/WaifuX.dmg
