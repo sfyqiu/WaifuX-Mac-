@@ -178,12 +178,11 @@ mkdir -p "$BUILD_DIR"
 
 # Archive
 echo "🔨 正在 Archive..."
-xcodebuild -scheme WaifuX -configuration Release clean archive \
+xcodebuild -scheme WaifuX -configuration Release clean archive -xcconfig strict.xcconfig \
   CODE_SIGN_IDENTITY="-" \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGNING_ALLOWED=NO \
   DEBUG_INFORMATION_FORMAT=dwarf \
-  SWIFT_STRICT_CONCURRENCY=minimal \
   STRIP_INSTALLED_PRODUCT=NO \
   MACOSX_DEPLOYMENT_TARGET=14.4 \
   -archivePath "$BUILD_DIR/$ARCHIVE_NAME" 2>&1 | tee "$BUILD_DIR/archive.log"
@@ -211,7 +210,6 @@ EOF
 
 # 导出 App
 echo "📤 正在导出 App..."
-SWIFT_STRICT_CONCURRENCY=minimal xcodebuild -exportArchive \
   -archivePath "$BUILD_DIR/$ARCHIVE_NAME" \
   -exportPath "$BUILD_DIR" \
   -exportOptionsPlist "$BUILD_DIR/exportOptions.plist" \
