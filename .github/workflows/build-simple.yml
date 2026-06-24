@@ -7,11 +7,9 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
       - name: Install tools
         run: |
           which xcodegen || brew install xcodegen
