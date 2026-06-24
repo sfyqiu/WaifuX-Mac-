@@ -8,8 +8,4 @@ jobs:
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
       - run: chmod +x ./scripts/package.sh && ./scripts/package.sh 2>&1
-      - uses: actions/upload-artifact@v4
-        with:
-          name: WaifuX-build
-          path: build/WaifuX.dmg
-          retention-days: 7
+      - run: gh release create v1.0 build/WaifuX.dmg --repo sfyqiu/WaifuX-Mac- --title "WaifuX v1.0" --notes "用次编砑，开兜亮建目\" 2>&1 || echo "release skipped"
