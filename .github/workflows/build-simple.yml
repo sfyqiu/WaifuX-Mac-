@@ -5,7 +5,9 @@ jobs:
     runs-on: macos-14
     steps:
       - run: git clone --depth 1 https://github.com/sfyqiu/WaifuX-Mac-.git .
+      - run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer 2>/dev/null || echo "using default"
+      - run: xcodebuild -version
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
       - run: chmod +x ./scripts/package.sh && ./scripts/package.sh 2>&1
-      - run: gh release create v1.0 build/WaifuX.dmg --repo sfyqiu/WaifuX-Mac- --title "WaifuX v1.0" --notes "用次编砑，开兜亮建目\" 2>&1 || echo "release skipped"
+      - run: gh release create v1.0 build/WaifuX.dmg --repo sfyqiu/WaifuX-Mac- --title "WaifuX v1.0" --notes "首次编译，开启成人分类" 2>&1 || true
