@@ -92,7 +92,7 @@ struct MediaExploreContentView: View {
     // Workshop 筛选
     @State private var selectedWorkshopTags: Set<WorkshopSourceManager.WorkshopTag> = []
     @State private var selectedWorkshopType: WorkshopSourceManager.WorkshopTypeFilter = .all
-    @State private var selectedWorkshopContentLevel: WorkshopSourceManager.WorkshopContentLevel? = .everyone
+    @State private var selectedWorkshopContentLevel: WorkshopSourceManager.WorkshopContentLevel? = nil
     @State private var selectedWorkshopResolution: WorkshopSourceManager.WorkshopResolution? = nil
     @State private var selectedWorkshopSort: WorkshopSortOption = .trendWeek
     @State private var showWorkshopURLSheet = false
