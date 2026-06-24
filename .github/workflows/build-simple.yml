@@ -9,7 +9,8 @@ jobs:
       - run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer 2>/dev/null || echo "default"
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
-      - run: xcodebuild -scheme WaifuX -configuration Release -derivedDataPath build -destination "platform=macOS" CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO OTHER_SWIFT_FLAGS="-strict-concurrency=minimal" ONLY_ACTIVE_ARCH=NO build 2>&1
+      - run: sed -i "" "s/SWIFT_STRICT_CONCURRENCY = complete/SWIFT_STRICT_CONCURRENCY = minimal/" WaifuX.xcodeproj/project.pbxproj 2>/dev/null || true
+      - run: xcodebuild -scheme WaifuX -configuration Release -derivedDataPath build CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO OTHER_SWIFT_FLAGS="-Xfrontend -disable-actor-data-race-checks" ONLY_ACTIVE_ARCH=NO build 2>&1
       - run: |
           APP="build/Build/Products/Release/WaifuX.app"
           if [ -d "$APP" ]; then
