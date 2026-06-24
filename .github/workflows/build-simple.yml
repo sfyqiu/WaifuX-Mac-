@@ -1,7 +1,5 @@
 name: Build WaifuX
 on: workflow_dispatch
-env:
-  SWIFT_STRICT_CONCURRENCY: minimal
 jobs:
   build:
     runs-on: macos-14
@@ -11,9 +9,8 @@ jobs:
       - run: xcodebuild -version
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
-      - run: chmod +x ./scripts/package.sh
-      - run: SWIFT_STRICT_CONCURRENCY=minimal ./scripts/package.sh 2>&1
-      - name: Create Release
+      - run: chmod +x ./scripts/package.sh && ./scripts/package.sh 2>&1
+      - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create v1.0 build/WaifuX.dmg --repo ${{ github.repository }} --title "WaifuX v1.0" --notes "首次编译，开启成人分类" 2>&1
