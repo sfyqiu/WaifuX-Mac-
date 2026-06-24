@@ -481,15 +481,16 @@ class WorkshopService: ObservableObject {
         if !params.tags.isEmpty {
             requiredTags.append(contentsOf: params.tags)
         }
-        // 新版 browse 页面中内容级别通过 requiredtags[]=Mature/Questionable/Everyone 实现
-        // 内容级别由开关控制：开启时放行 Mature，关闭时强制降级为 Everyone
-        let effectiveContentLevel = params.contentLevel ?? "Everyone"
-        let showAllContent = UserDefaults.standard.bool(forKey: "show_all_workshop_content")
-        if effectiveContentLevel == "Everyone" || effectiveContentLevel == "Questionable" || (effectiveContentLevel == "Mature" && showAllContent) {
-            requiredTags.append(effectiveContentLevel)
-        } else {
-            requiredTags.append("Everyone")
+        // 内容级别：nil = 不限制（显示所有级别），否则按指定级别过滤
+        if let effectiveContentLevel = params.contentLevel {
+            let showAllContent = UserDefaults.standard.bool(forKey: "show_all_workshop_content")
+            if effectiveContentLevel == "Everyone" || effectiveContentLevel == "Questionable" || (effectiveContentLevel == "Mature" && showAllContent) {
+                requiredTags.append(effectiveContentLevel)
+            } else {
+                requiredTags.append("Everyone")
+            }
         }
+        // 当 contentLevel 为 nil 时不添加内容级别过滤，显示所有内容
         // 分辨率/比例筛选通过 requiredtags[] 发送（Steam Workshop 分辨率以标签形式存在）
         if let resolution = params.resolution {
             requiredTags.append(resolution)
