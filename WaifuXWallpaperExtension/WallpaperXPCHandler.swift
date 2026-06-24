@@ -1,8 +1,8 @@
 //  XPC handler implementing WallpaperExtensionXPCProtocol
 
-import AppKit
-import AVFoundation
-import CoreMedia
+@preconcurrency import AppKit
+@preconcurrency import AVFoundation
+@preconcurrency import CoreMedia
 import ImageIO
 import os
 import QuartzCore
