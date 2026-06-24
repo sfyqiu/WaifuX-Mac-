@@ -4,9 +4,7 @@ jobs:
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+      - run: git clone --depth 1 https://github.com/sfyqiu/WaifuX-Mac-.git .
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
       - run: chmod +x ./scripts/package.sh && ./scripts/package.sh 2>&1
