@@ -4,7 +4,7 @@ import Kingfisher
 
 // MARK: - SwiftUI 动漫卡片
 
-struct AnimeCardView: View {
+struct AnimeCardView: View, @preconcurrency Equatable {
     let anime: AnimeSearchResult
     let cardWidth: CGFloat
     let onTap: (() -> Void)?
@@ -13,6 +13,11 @@ struct AnimeCardView: View {
 
     private let bottomBarHeight: CGFloat = 44
     private let cornerRadius: CGFloat = 14
+
+    static func == (lhs: AnimeCardView, rhs: AnimeCardView) -> Bool {
+        lhs.anime.id == rhs.anime.id &&
+        lhs.cardWidth == rhs.cardWidth
+    }
 
     /// 固定 10:14 竖版封面
     private var imageHeight: CGFloat {
@@ -32,8 +37,7 @@ struct AnimeCardView: View {
                 bottomBar
                     .frame(height: bottomBarHeight)
             }
-            .background(Color.white.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+            .background(Color(hex: "1A1D24"))
 
             RoundedRectangle(cornerRadius: cornerRadius)
                 .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
@@ -44,6 +48,8 @@ struct AnimeCardView: View {
                     .padding(8)
             }
         }
+        .drawingGroup(opaque: true)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         .frame(width: cardWidth, height: cardHeight)
         .contentShape(Rectangle())
         .onTapGesture { onTap?() }
@@ -61,9 +67,9 @@ struct AnimeCardView: View {
 
         KFImage(url)
             .setProcessor(DownsamplingImageProcessor(size: CGSize(width: targetWidth, height: targetHeight)))
-            .backgroundDecode()
+            // DownsamplingImageProcessor 已通过 CGImageSourceCreateThumbnailAtIndex 解码
             .cacheMemoryOnly(false)
-            .cancelOnDisappear(true)
+            .memoryCacheExpiration(.seconds(300))
             .placeholder { Color.black.opacity(0.4) }
             .fade(duration: 0.25)
             .resizable()
@@ -108,7 +114,9 @@ struct AnimeCardView: View {
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
-        .background(Color.black.opacity(0.5))
-        .cornerRadius(11)
+        .background(
+            RoundedRectangle(cornerRadius: 11)
+                .fill(Color.black.opacity(0.5))
+        )
     }
 }

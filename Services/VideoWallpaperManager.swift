@@ -3,6 +3,7 @@ import AppKit
 import AVFoundation
 import CoreGraphics
 import QuartzCore
+import CoreAudio
 
 @MainActor
 final class VideoWallpaperManager: ObservableObject {
@@ -37,13 +38,16 @@ final class VideoWallpaperManager: ObservableObject {
     @Published private(set) var currentVideoURL: URL?
     /// 是否有任何屏幕正在播放视频壁纸（外部使用）
     var isVideoWallpaperActive: Bool {
-        !videoURLByScreen.isEmpty || !videoURLByScreenFingerprint.isEmpty
+        return !videoURLByScreen.isEmpty || !videoURLByScreenFingerprint.isEmpty
     }
     /// 已废弃：多屏场景下请使用 `posterURL(for:)` 获取指定屏幕的 poster
     @Published private(set) var currentPosterURL: URL?
     @Published private(set) var isMuted = true
     @Published private(set) var isPaused = false
     @Published private(set) var volume: Double = 1.0
+    /// 壁纸变更计数器（每次 applyVideoWallpaper 成功切换后自增）。
+    /// 外部订阅此属性可感知任意壁纸切换事件，不受 `currentVideoURL` 值是否变化影响。
+    @Published private(set) var wallpaperChangeCount: UInt64 = 0
 
     /// 每个屏幕的独立 poster（key 为 screenID），解决多屏自动更换时 poster 被覆盖的问题
     private var posterURLByScreen: [String: URL] = [:]
@@ -63,6 +67,8 @@ final class VideoWallpaperManager: ObservableObject {
     private var windows: [String: WallpaperVideoWindow] = [:]
     private var players: [String: AVQueuePlayer] = [:]
     private var loopers: [String: AVPlayerLooper] = [:]
+    /// 每屏视频真实尺寸缓存（naturalSize），供 crop 计算用。设置壁纸时填充。
+    private var videoSizes: [String: CGSize] = [:]
     /// 延迟释放的工作项，用于取消上一次未执行的清理，避免快速切换时多组 AVPlayer 并发驻留
     private var pendingPlayerCleanups: [DispatchWorkItem] = []
     private var pendingWindowCleanups: [DispatchWorkItem] = []
@@ -75,6 +81,67 @@ final class VideoWallpaperManager: ObservableObject {
 
     /// "播完即换"模式下的播放器播放结束观察者（key: screenID）
     private var playbackEndObservers: [String: Any] = [:]
+
+    /// macOS 26+：WallpaperExtensionKit 锁屏实例是否处于活跃状态。
+    /// 这里仅表示锁屏镜像链路已建立，不代表扩展接管桌面渲染。
+    /// 桌面动态壁纸仍由主应用自己的视频窗口负责。
+    /// 非 macOS 26 系统始终为 false。
+    private(set) var isLockScreenExtensionActive = false
+
+    /// 锁屏镜像是否实际可用（结合文件状态和 Socket 管线活跃度）。
+    /// `isLockScreenExtensionActive` 由扩展写入的 state JSON 驱动，
+    /// 但该文件可能因时序未及时写出；额外检查 `hasActivePipeline` 确保不遗漏已注册 surface 的活跃实例。
+    /// 同时受 `dynamic_lock_screen_enabled` 开关控制 — 关闭时返回 false。
+    ///
+    /// ⚠️ 此属性仅在锁屏扩展**当前正在运行**时返回 true（即屏幕已锁定）。
+    /// 桌面场景下扩展未运行，始终返回 false。
+    /// 如需判断用户是否已启用动态锁屏功能（持久化设置），请使用 `isLockScreenEnabled`。
+    var isLockScreenMirroringActive: Bool {
+        if #available(macOS 26.0, *) {
+            // 用户在设置中关闭了动态锁屏 → 视作未激活
+            guard UserDefaults.standard.object(forKey: "dynamic_lock_screen_enabled") as? Bool ?? true else {
+                return false
+            }
+            // 先检查内存标志（避免不必要的文件 I/O）
+            guard isLockScreenExtensionActive || WallpaperExtensionSocketServer.shared.hasActivePipeline else {
+                // 内存标志为 false 时主动回退读 state 文件，
+                // 防止 clearExtensionState 后未收到通知导致标志过期
+                checkExtensionState()
+                guard isLockScreenExtensionActive || WallpaperExtensionSocketServer.shared.hasActivePipeline else {
+                    return false
+                }
+                return true
+            }
+            return true
+        }
+        return false
+    }
+
+    /// 用户是否已启用动态锁屏功能（持久化 UserDefaults 设置，与扩展当前是否运行无关）。
+    /// 用于在切换桌面壁纸时保护锁屏实例状态不被清除。
+    /// - 返回 true：用户已在设置中开启动态锁屏 → 不清除锁屏镜像帧源缓存
+    /// - 返回 false：用户已关闭或从未配置 → 正常清理
+    var isLockScreenEnabled: Bool {
+        if #available(macOS 26.0, *) {
+            return UserDefaults.standard.object(forKey: "dynamic_lock_screen_enabled") as? Bool ?? false
+        }
+        return false
+    }
+
+    /// 系统壁纸同步是否启用（默认开启）。关闭后冻结 setDesktopImageURL 链路，
+    /// App 不再写入系统桌面/锁屏静态壁纸；mp4/场景/web 动态壁纸引擎不受影响。
+    var isSystemWallpaperSyncEnabled: Bool {
+        UserDefaults.standard.object(forKey: "system_wallpaper_sync_enabled") as? Bool ?? true
+    }
+
+    /// 动态锁屏启用后，任何静态 poster 写入都会通过 macOS 桌面壁纸接口覆盖用户手动选择的锁屏实例。
+    /// 因此这里看“用户设置是否启用”，而不是看扩展此刻是否正在锁屏运行。
+    private var shouldSkipStaticPosterForDynamicLockScreen: Bool {
+        if #available(macOS 26.0, *) {
+            return isLockScreenEnabled
+        }
+        return false
+    }
 
     /// 应挂载 MP4 壁纸层的屏幕 ID（`NSScreen.wallpaperScreenIdentifier`）。唤醒 / 分辨率变化时全局 `rebuildWindows()` 只重建这些屏，避免「只设一块屏动态」却给所有显示器都建了视频窗。
     private var videoTargetScreenIDs = Set<String>()
@@ -94,6 +161,12 @@ final class VideoWallpaperManager: ObservableObject {
     private let localVideoForwardBufferDuration: TimeInterval = 3.0
     private let automaticSwitchTransitionDuration: TimeInterval = 0.28
     private let automaticSwitchReadyTimeout: TimeInterval = 1.2
+
+    // MARK: - 音频设备管理
+
+    /// 缓存 Built-in Speaker（或非蓝牙输出设备）的 UID，
+    /// 用于静音时将 AVPlayer 音频强制路由到此设备，防止 macOS 因检测到本 App 的音频会话而自动连接 AirPods。
+    private var cachedBuiltInOutputDeviceUID: String? = nil
 
     /// 持久化预览图存储目录（避免被系统清理）
     /// 注意：放在 WallHaven 目录下，与 Cache 分开，避免被清理缓存误删
@@ -149,6 +222,7 @@ final class VideoWallpaperManager: ObservableObject {
 
     private init() {
         setupNotificationObservers()
+        configureAudioSession()
     }
 
     private func setupNotificationObservers() {
@@ -156,6 +230,14 @@ final class VideoWallpaperManager: ObservableObject {
             self,
             selector: #selector(handleScreenParametersChanged),
             name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+
+        // 可视区域 crop 变更（菜单调节 / overlay 拖拽）
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCropDidChange),
+            name: DisplayCropSettingsStore.cropDidChangeNotification,
             object: nil
         )
 
@@ -202,6 +284,11 @@ final class VideoWallpaperManager: ObservableObject {
             name: Notification.Name("com.apple.screenIsUnlocked"),
             object: nil
         )
+
+        // macOS 26+：监听 WallpaperExtension 锁屏镜像实例状态变化
+        if #available(macOS 26.0, *) {
+            observeExtensionStateChanges()
+        }
     }
 
     @MainActor
@@ -213,6 +300,294 @@ final class VideoWallpaperManager: ObservableObject {
         pendingRebuildWorkItem = nil
         pendingWakeRebuildWorkItem?.cancel()
         pendingWakeRebuildWorkItem = nil
+    }
+
+    // MARK: - Audio Session Management
+
+    /// 获取系统 Built-in Speaker（或第一个非蓝牙输出设备）的 UID。
+    /// 用于静音时通过 `AVPlayer.audioOutputDeviceUniqueID` 将音频强制路由到该设备，
+    /// 使 macOS 不会因检测到本 App 的音频会话而自动连接 AirPods 等蓝牙设备。
+    private func findBuiltInOutputDeviceUID() -> String? {
+        if let cached = cachedBuiltInOutputDeviceUID { return cached }
+
+        var propertySize: UInt32 = 0
+        var devicesProperty = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &devicesProperty,
+            0, nil,
+            &propertySize
+        ) == noErr, propertySize > 0 else { return nil }
+
+        let deviceCount = Int(propertySize) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = [AudioDeviceID](repeating: 0, count: deviceCount)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &devicesProperty,
+            0, nil,
+            &propertySize, &deviceIDs
+        ) == noErr else { return nil }
+
+        for deviceID in deviceIDs {
+            guard deviceID != kAudioObjectUnknown else { continue }
+
+            // 确保设备有输出能力
+            var outputStreamProperty = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var outputStreamSize: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(
+                deviceID,
+                &outputStreamProperty,
+                0, nil,
+                &outputStreamSize
+            ) == noErr, outputStreamSize > 0 else { continue }
+
+            // 获取设备 UID（CFStringRef）
+            var uidProperty = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var uidRef: Unmanaged<CFString>?
+            var uidSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            guard AudioObjectGetPropertyData(
+                deviceID,
+                &uidProperty,
+                0, nil,
+                &uidSize, &uidRef
+            ) == noErr, let retainedUID = uidRef?.takeRetainedValue() as String? else { continue }
+
+            let uid = retainedUID
+
+            // 优先选择 Built-In Speaker（非蓝牙设备）
+            if uid.localizedCaseInsensitiveContains("built") || uid.localizedCaseInsensitiveContains("speaker") {
+                cachedBuiltInOutputDeviceUID = uid
+                return uid
+            }
+
+            // 兜底：跳过蓝牙设备，选择第一个可用输出设备
+            if !uid.localizedCaseInsensitiveContains("bluetooth")
+                && !uid.localizedCaseInsensitiveContains("airpods")
+                && !uid.localizedCaseInsensitiveContains("beats") {
+                if cachedBuiltInOutputDeviceUID == nil {
+                    cachedBuiltInOutputDeviceUID = uid
+                }
+            }
+        }
+
+        return cachedBuiltInOutputDeviceUID
+    }
+
+    /// 配置音频会话：初始化时缓存 Built-in Speaker UID。
+    private func configureAudioSession() {
+        // 预缓存内置扬声器 UID，便于后续静音时快速使用
+        _ = findBuiltInOutputDeviceUID()
+    }
+
+    /// 根据静音状态更新每个 AVPlayer 的音频输出设备路由：
+    /// - 静音时：将所有 AVPlayer 的音频强制路由到 Built-in Speaker（非蓝牙设备），
+    ///   使 macOS 不会因本 App 的音频会话而自动连接蓝牙耳机。
+    /// - 取消静音时：恢复为系统默认输出设备（`audioOutputDeviceUniqueID = nil`）。
+    private func updateAudioSession() {
+        guard hasActiveVideoWallpaper else { return }
+
+        if isMuted {
+            let builtInUID = findBuiltInOutputDeviceUID()
+            for player in players.values {
+                player.audioOutputDeviceUniqueID = builtInUID
+            }
+        } else {
+            for player in players.values {
+                player.audioOutputDeviceUniqueID = nil
+            }
+        }
+    }
+
+    /// 停用音频会话：恢复所有 AVPlayer 的音频输出为系统默认，清理缓存。
+    private func deactivateAudioSession() {
+        for player in players.values {
+            player.audioOutputDeviceUniqueID = nil
+        }
+    }
+
+    // MARK: - macOS 26+ Extension State Monitoring
+
+    /// 监听 WallpaperExtension 的状态变化（通过 Darwin 通知 + 共享容器 JSON）
+    /// 这里只表示锁屏镜像实例是否活跃，不影响桌面本地播放器生命周期。
+    @available(macOS 26.0, *)
+    private func observeExtensionStateChanges() {
+        // 1. 监听 Darwin 通知（扩展 post 的 stateChanged）
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(
+            center,
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer else { return }
+                let manager = Unmanaged<VideoWallpaperManager>.fromOpaque(observer).takeUnretainedValue()
+                Task { @MainActor in
+                    manager.checkExtensionState()
+                }
+            },
+            "com.waifux.app.wallpaper.stateChanged" as CFString,
+            nil,
+            .deliverImmediately
+        )
+
+        // 2. 初始检查一次
+        checkExtensionState()
+    }
+
+    /// 从共享容器读取扩展状态，判断锁屏镜像实例是否活跃。
+    @available(macOS 26.0, *)
+    private func checkExtensionState() {
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: "group.com.waifux.app"
+        ) else { return }
+
+        let stateURL = container.appendingPathComponent("waifux-wallpaper-state.json")
+        guard let data = try? Data(contentsOf: stateURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let isActive = json["isActive"] as? Bool else {
+            // 无法读取状态 → 认为扩展未激活
+            if isLockScreenExtensionActive {
+                isLockScreenExtensionActive = false
+                print("[VideoWallpaperManager] Lock screen extension state unreadable → inactive")
+            }
+            return
+        }
+
+        let wasActive = isLockScreenExtensionActive
+        isLockScreenExtensionActive = isActive
+
+        if isActive && !wasActive {
+            print("[VideoWallpaperManager] Lock screen extension became active")
+            if hasActiveVideoWallpaper {
+                syncAllDisplayVideosToExtension()
+            }
+        } else if !isActive && wasActive {
+            print("[VideoWallpaperManager] Lock screen extension became inactive")
+        }
+
+        // 检测 videoID 变化（表示扩展已完成视频切换）
+        // 延迟 3 秒再发一次 prefsChanged 通知，让扩展再次调用 updateSettingsViewModels()
+        // 通知系统刷新壁纸设置，更新系统 UI 的壁纸颜色缓存
+        let currentVideoID = json["currentVideoID"] as? String
+        let previousVideoID = Self.lastCheckedExtensionVideoID
+        Self.lastCheckedExtensionVideoID = currentVideoID
+
+        if isActive, let newID = currentVideoID, newID != previousVideoID {
+            print("[VideoWallpaperManager] 🎨 检测到扩展视频切换: \(previousVideoID ?? "nil") → \(newID)，延迟 3 秒通知系统刷新 UI")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self, self.isLockScreenExtensionActive else { return }
+                print("[VideoWallpaperManager] 🎨 发送延迟 prefsChanged 通知，触发系统刷新壁纸颜色")
+                LockScreenWallpaperService.shared.notifyExtensionPrefsChanged()
+            }
+        }
+    }
+
+    /// 上次检查到的扩展 videoID，用于检测视频切换
+    private static var lastCheckedExtensionVideoID: String?
+
+    /// 将所有显示器的当前视频源同步到锁屏扩展。
+    /// 用户在系统设置中手动为每个显示器选择一次 WaifuX 实例后，
+    /// 锁屏侧使用扩展本地解码播放当前桌面视频，不再依赖 App 逐帧推送。
+    @available(macOS 26.0, *)
+    private func syncAllDisplayVideosToExtension() {
+        guard UserDefaults.standard.object(forKey: "dynamic_lock_screen_enabled") as? Bool ?? true else {
+            print("[VideoWallpaperManager] syncAllDisplayVideosToExtension: 动态锁屏已关闭，跳过")
+            return
+        }
+        var displayVideoPairs: [(displayID: UInt32, videoURL: URL)] = []
+
+        for screen in NSScreen.screens {
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                continue
+            }
+            guard let videoURL = videoURL(for: screen), FileManager.default.fileExists(atPath: videoURL.path) else {
+                continue
+            }
+            displayVideoPairs.append((displayID: screenNumber.uint32Value, videoURL: videoURL))
+        }
+
+        if displayVideoPairs.isEmpty, let globalURL = currentVideoURL,
+           FileManager.default.fileExists(atPath: globalURL.path) {
+            for screen in NSScreen.screens {
+                guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                    continue
+                }
+                displayVideoPairs.append((displayID: screenNumber.uint32Value, videoURL: globalURL))
+            }
+        }
+
+        guard !displayVideoPairs.isEmpty else {
+            print("[VideoWallpaperManager] syncAllDisplayVideosToExtension: 没有可同步的显示器视频源，跳过")
+            return
+        }
+
+        print("[VideoWallpaperManager] syncAllDisplayVideosToExtension: 同步 \(displayVideoPairs.count) 个显示器自解码源到锁屏扩展")
+
+        // 递增世代号并清空旧命令，防止前一次异步 Task 入队的过期命令被扩展执行
+        let generation = WallpaperExtensionSocketServer.nextVideoSyncGeneration()
+        WallpaperExtensionSocketServer.shared.clearCommands()
+
+        // ⚠️ 关键时序修复：先不同步实例到 Socket（不同步也就不会发 prefsChanged 通知），
+        // 等视频缓存+注册完成后，在 switchActiveInstancesToLocalDecode 末尾统一发通知。
+        // 这样扩展收到通知时 localDecodeVideoLock 中已有视频路径，不会出现时序窗口。
+        // 同步实例目录到 Socket（纯同步，不发送通知 — 避免在视频注册前就触发扩展的 prefsChanged）
+        // 确保扩展调用 list_videos 时能立即拿到最新的显示器实例列表（即使视频还未部署到共享容器）
+        LockScreenWallpaperService.shared.syncInstanceCatalogToSocketServer(notify: false)
+        WallpaperExtensionSocketServer.shared.clearDisplayVideos()
+
+        let grouped = Dictionary(grouping: displayVideoPairs, by: { $0.videoURL })
+        // ⚠️ 必须串行 await 每个视频组，不能并行启动多个 Task：
+        // switchActiveInstancesToLocalDecode 会写入共享 prefs 文件（cacheMirroringSource），
+        // 并发写入会导致：1) prefs 文件互相覆盖，只剩最后一路；2) deployedVideoIDs 集合
+        // 有 ABA 问题，可能误删另一路正在使用的视频文件。
+        // 串行执行代价很小（每个调用主要耗时在 hard link + 通知，非视频解码），但能彻底消除竞态。
+        Task {
+            for (videoURL, pairs) in grouped {
+                let videoID = videoURL.deletingPathExtension().lastPathComponent
+                let displayIDs = pairs.map(\.displayID)
+                await LockScreenWallpaperService.shared.switchActiveInstancesToLocalDecode(
+                    videoURL: videoURL,
+                    videoID: videoID,
+                    displayIDs: displayIDs,
+                    generation: generation
+                )
+                print("[VideoWallpaperManager] 📺 请求锁屏自解码 display=\(displayIDs) video=\(videoID)")
+            }
+        }
+    }
+
+    /// 扩展已注册 IOSurface 时从 socket 侧反向触发同步。
+    /// 这条路径不依赖扩展 state 文件，避免 state 写入缺失时 App 永远不启动 FramePusher。
+    @available(macOS 26.0, *)
+    func syncCurrentVideosToActiveLockScreenPipeline(reason: String) {
+        guard hasActiveVideoWallpaper else {
+            print("[VideoWallpaperManager] \(reason): 当前没有桌面视频源，暂不同步锁屏帧源")
+            return
+        }
+        print("[VideoWallpaperManager] \(reason): 扩展管线就绪，主动同步锁屏帧源")
+        syncAllDisplayVideosToExtension()
+    }
+
+    /// 锁屏镜像模式下的全局暂停/恢复切换（仅更新本地 isPaused 状态，prefs 由调用方写入）
+    func toggleExtensionGlobalPause() {
+        isPaused.toggle()
+    }
+
+    /// 清除锁屏镜像活跃状态（供外部调用方在清空镜像帧源后调用）
+    func clearExtensionState() {
+        isLockScreenExtensionActive = false
     }
 
     func applyVideoWallpaper(
@@ -258,11 +633,14 @@ final class VideoWallpaperManager: ObservableObject {
             throw NSError(domain: "VideoWallpaper", code: 1002, userInfo: [NSLocalizedDescriptionKey: "视频文件不存在。"])
         }
 
+        // 设视频壁纸时关闭并清除静态图 overlay（视频窗口本身覆盖桌面，静态 overlay 无意义且浪费窗口）
+        StaticImageWallpaperOverlayManager.shared.clearState()
+
         // 本机视频不经过 CLI：如果设到全局或目标屏幕恰好被 CLI 管理时 stop CLI。
         // 多屏场景下，如果 CLI 正在渲染另一块屏的壁纸而本屏不需要 CLI，不杀 CLI 进程。
         if let targetScreen {
             if WallpaperEngineXBridge.shared.isManaging(screen: targetScreen) {
-                WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
+                WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: targetScreen)
             }
         } else {
             WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
@@ -292,7 +670,14 @@ final class VideoWallpaperManager: ObservableObject {
                     player.play()
                 }
             }
+            DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+
+            // 即使复用已有播放器，也要同步锁屏镜像的 per-display 帧源。
+            if #available(macOS 26.0, *) {
+                LockScreenWallpaperService.shared.syncInstanceCatalogToSocketServer()
+                syncAllDisplayVideosToExtension()
+            }
             return
         }
 
@@ -308,10 +693,11 @@ final class VideoWallpaperManager: ObservableObject {
 
         discardOriginalWallpaperSnapshot()
 
-        // 如果有预览图，设置为桌面壁纸（锁屏会显示这个）
-        // 注意：此处 fire-and-forget，不阻塞主线程；poster 为 nil 时保持当前桌面不变。
-        // 视频窗口会覆盖在桌面壁纸上方。
-        if let posterURL = posterURL {
+        // 如果有预览图，设置为桌面壁纸（锁屏默认会沿用桌面 poster 作静态兜底）。
+        // 动态锁屏启用时必须跳过；否则 setDesktopImageURLForAllSpaces 会覆盖用户选择的锁屏实例。
+        if shouldSkipStaticPosterForDynamicLockScreen {
+            print("[VideoWallpaperManager] 🔒 动态锁屏已启用，跳过设置静态桌面 poster")
+        } else if let posterURL = posterURL {
             setPosterAsDesktopWallpaper(posterURL, targetScreen: targetScreen)
         }
 
@@ -340,18 +726,28 @@ final class VideoWallpaperManager: ObservableObject {
             },
             animatedTransition: animatedTransition
         )
+        updateAudioSession()
         syncCurrentVideoURL()
         persistState()
+        wallpaperChangeCount &+= 1
+        DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+
+        // 同步到锁屏镜像实例（macOS 26+）
+        if #available(macOS 26.0, *) {
+            LockScreenWallpaperService.shared.syncInstanceCatalogToSocketServer()
+            syncAllDisplayVideosToExtension()
+        }
     }
 
     func setMuted(_ muted: Bool) {
         isMuted = muted
         for (screenID, player) in players {
-            player.isMuted = muted
             let screenVolume = volumeByScreen[screenID] ?? volume
-            player.volume = muted ? 0 : Float(screenVolume)
+            // 工具栏静音需要同时处理播放器音量和已排队 item 的音频轨，避免只静音音量仍唤醒 AirPods。
+            applyPlayerAudioPolicy(player, muted: muted, volume: screenVolume)
         }
+        updateAudioSession()
         persistState()
     }
 
@@ -453,6 +849,42 @@ final class VideoWallpaperManager: ObservableObject {
         return players[screenID] != nil
     }
 
+    /// 对指定屏应用当前可视区域 crop 配置。在设置壁纸、布局变化、crop 变更时调用。
+    /// 注：CropLayoutEngine 实际只用 screenSize（壁纸 crop 是归一化值，由 contentsRect 处理），
+    /// 因此无需异步等待视频 track 加载完成。
+    func applyCropToScreen(_ screen: NSScreen) {
+        let screenID = screen.wallpaperScreenIdentifier
+        guard let window = windows[screenID],
+              let containerView = window.contentView as? WallpaperVideoContainerView,
+              players[screenID] != nil else { return }
+
+        let settings = DisplayCropSettingsStore.shared.settings(for: screen)
+        guard settings.shouldApplyCrop else {
+            containerView.applyCropLayout(nil)
+            window.backgroundColor = .black
+            return
+        }
+        // wallpaperSize 用视频真实 naturalSize（取不到 fallback 屏尺寸，保证不崩）。
+        let wallpaperSize = videoSizes[screenID] ?? screen.frame.size
+        let layout = CropLayoutEngine.compute(
+            wallpaperSize: wallpaperSize,
+            screenSize: screen.frame.size,
+            settings: settings)
+        containerView.applyCropLayout(layout)
+        window.backgroundColor = NSColor(cgColor: layout.letterboxColor) ?? .black
+    }
+
+    @objc private func handleCropDidChange(_ note: Notification) {
+        guard let screenID = note.userInfo?["screenID"] as? String,
+              let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else { return }
+        applyCropToScreen(screen)
+    }
+
+    /// 供 overlay 预览取视频真实尺寸（naturalSize）。
+    func videoSize(for screen: NSScreen) -> CGSize? {
+        videoSizes[screen.wallpaperScreenIdentifier]
+    }
+
     /// 检测指定屏幕当前是否处于暂停状态。
     func isPaused(on screen: NSScreen) -> Bool {
         let screenID = screen.wallpaperScreenIdentifier
@@ -503,7 +935,18 @@ final class VideoWallpaperManager: ObservableObject {
             // 全局停止（原有逻辑）
             WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
 
+            // macOS 26+：仅当用户未启用动态锁屏时才清空帧源映射。
+            // 使用持久化设置 isLockScreenEnabled 而非 isLockScreenMirroringActive，
+            // 因为后者在桌面场景（屏幕未锁定）下始终为 false。
+            if #available(macOS 26.0, *) {
+                if !isLockScreenEnabled {
+                    LockScreenWallpaperService.shared.clearMirroringSourceCache()
+                }
+            }
+
             teardownAllWindows()
+            // 对称关闭静态图 overlay（保持久化，便于用户再次开启时恢复，与 stopWallpaper 保留 video 状态语义一致）
+            StaticImageWallpaperOverlayManager.shared.hideAll()
             currentVideoURL = nil
             currentPosterURL = nil
             posterURLByScreen.removeAll()
@@ -515,6 +958,8 @@ final class VideoWallpaperManager: ObservableObject {
             videoTargetScreenFingerprints = []
             discardOriginalWallpaperSnapshot()
             syncCurrentVideoURL()
+            // 停止所有壁纸 → 停用音频会话，释放音频设备
+            deactivateAudioSession()
             // 不删除保存的状态，以便下次可以恢复
             return
         }
@@ -522,6 +967,43 @@ final class VideoWallpaperManager: ObservableObject {
         // 单屏停止：只拆掉该屏幕的视频层，不回退到旧静态壁纸
         let screenID = targetScreen.wallpaperScreenIdentifier
         let screenFingerprint = targetScreen.wallpaperScreenFingerprint
+        // 对称关闭该屏静态图 overlay（保持久化，便于再次开启时恢复）
+        StaticImageWallpaperOverlayManager.shared.hide(for: targetScreen)
+
+        // 锁屏镜像实例活跃时，也只需要清理该屏帧源追踪；动态锁屏开启时不能回退到静态 poster。
+        if isLockScreenExtensionActive {
+            videoTargetScreenIDs.remove(screenID)
+            videoTargetScreenFingerprints.remove(screenFingerprint)
+            videoURLByScreen.removeValue(forKey: screenID)
+            videoURLByScreenFingerprint.removeValue(forKey: screenFingerprint)
+            if let posterURL = posterURLByScreen.removeValue(forKey: screenID) {
+                if shouldSkipStaticPosterForDynamicLockScreen {
+                    print("[VideoWallpaperManager] 🔒 动态锁屏已启用，停止单屏时跳过静态 poster 回退")
+                } else {
+                    setPosterAsDesktopWallpaper(posterURL, targetScreen: targetScreen)
+                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: targetScreen)
+                }
+            }
+            posterURLByScreenFingerprint.removeValue(forKey: screenFingerprint)
+
+            if videoURLByScreen.isEmpty {
+                // 所有屏幕都停止了；仅在动态锁屏关闭时清空锁屏镜像帧源映射。
+                if #available(macOS 26.0, *) {
+                    if !isLockScreenEnabled {
+                        LockScreenWallpaperService.shared.clearMirroringSourceCache()
+                    }
+                }
+                currentVideoURL = nil
+                currentPosterURL = nil
+                isPaused = false
+                videoTargetScreenIDs = []
+                videoTargetScreenFingerprints = []
+            }
+            persistState()
+            syncCurrentVideoURL()
+            return
+        }
+
         guard windows[screenID] != nil || players[screenID] != nil else {
             // 该屏幕没有视频壁纸在播放，无需操作
             return
@@ -547,8 +1029,14 @@ final class VideoWallpaperManager: ObservableObject {
             videoTargetScreenIDs = []
             videoTargetScreenFingerprints = []
             WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
+            // 最后一块屏停止 → 停用音频会话，释放音频设备，防止 macOS 因本 App 残留音频会话而自动连接蓝牙设备
+            deactivateAudioSession()
         } else {
             lastAppliedScreenConfigurations = currentTargetScreenConfigurations()
+        }
+        if #available(macOS 26.0, *),
+           let screenNumber = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            WallpaperExtensionSocketServer.shared.unregisterDisplayVideo(displayID: screenNumber.uint32Value)
         }
         syncCurrentVideoURL()
     }
@@ -562,12 +1050,15 @@ final class VideoWallpaperManager: ObservableObject {
         posterTasks.values.forEach { $0.cancel() }
         posterTasks.removeAll()
 
-        // 退出前为每个目标屏幕持久化其 poster，确保拆掉视频窗口后
-        // 每块屏的桌面壁纸（含锁屏底图）仍显示各自对应的 poster，而不是所有屏同步为主屏。
-        for screen in screensForVideoWallpaperTargets() {
-            if let posterURL = posterURL(for: screen) {
-                applyPosterAsDesktopWallpaperSync(posterURL, targetScreen: screen)
-                DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
+        // 退出前为每个目标屏幕持久化其 poster。动态锁屏启用时跳过，避免覆盖锁屏实例选择。
+        if shouldSkipStaticPosterForDynamicLockScreen {
+            print("[VideoWallpaperManager] 🔒 动态锁屏已启用，退出前跳过静态 poster 写入")
+        } else {
+            for screen in screensForVideoWallpaperTargets() {
+                if let posterURL = posterURL(for: screen) {
+                    applyPosterAsDesktopWallpaperSync(posterURL, targetScreen: screen)
+                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
+                }
             }
         }
 
@@ -607,6 +1098,7 @@ final class VideoWallpaperManager: ObservableObject {
         windows.removeAll()
         players.removeAll()
         loopers.removeAll()
+        videoSizes.removeAll()
         lastAppliedScreenConfigurations.removeAll()
     }
 
@@ -617,6 +1109,7 @@ final class VideoWallpaperManager: ObservableObject {
             // 全局停止（原有逻辑）
             teardownAllWindows()
             currentVideoURL = nil
+            wallpaperChangeCount &+= 1
             currentPosterURL = nil
             posterURLByScreen.removeAll()
             posterURLByScreenFingerprint.removeAll()
@@ -628,12 +1121,49 @@ final class VideoWallpaperManager: ObservableObject {
             discardOriginalWallpaperSnapshot()
             defaults.removeObject(forKey: stateKey)
             syncCurrentVideoURL()
+            // macOS 26+：仅当用户未启用动态锁屏时才清空锁屏镜像帧源缓存。
+            // 使用持久化设置 isLockScreenEnabled 而非 isLockScreenMirroringActive，
+            // 因为后者在桌面场景（屏幕未锁定）下始终为 false。
+            if #available(macOS 26.0, *) {
+                if !isLockScreenEnabled {
+                    LockScreenWallpaperService.shared.clearMirroringSourceCache()
+                }
+            }
+            // 停止所有本机视频壁纸 → 停用音频会话，释放音频设备，防止 macOS 因本 App 残留音频会话而自动连接蓝牙设备
+            deactivateAudioSession()
             return
         }
 
         // 单屏停止：只拆掉该屏幕的视频层，不回退到旧静态壁纸
         let screenID = targetScreen.wallpaperScreenIdentifier
         let screenFingerprint = targetScreen.wallpaperScreenFingerprint
+
+        // 锁屏镜像实例活跃时，也只需要清理 per-screen 帧源追踪。
+        if isLockScreenExtensionActive {
+            videoTargetScreenIDs.remove(screenID)
+            videoTargetScreenFingerprints.remove(screenFingerprint)
+            videoURLByScreen.removeValue(forKey: screenID)
+            videoURLByScreenFingerprint.removeValue(forKey: screenFingerprint)
+            posterURLByScreen.removeValue(forKey: screenID)
+            posterURLByScreenFingerprint.removeValue(forKey: screenFingerprint)
+
+            if videoURLByScreen.isEmpty {
+                if #available(macOS 26.0, *) {
+                    LockScreenWallpaperService.shared.clearMirroringSourceCache()
+                }
+                currentVideoURL = nil
+                currentPosterURL = nil
+                isPaused = false
+                videoTargetScreenIDs = []
+                videoTargetScreenFingerprints = []
+                defaults.removeObject(forKey: stateKey)
+                // 最后一块屏停止 → 停用音频会话，释放音频设备，防止 macOS 因本 App 残留音频会话而自动连接蓝牙设备
+                deactivateAudioSession()
+            }
+            syncCurrentVideoURL()
+            return
+        }
+
         guard windows[screenID] != nil || players[screenID] != nil else {
             // 该屏幕没有视频壁纸在播放，无需操作（避免自动切换时误恢复旧壁纸导致闪烁）
             return
@@ -661,6 +1191,10 @@ final class VideoWallpaperManager: ObservableObject {
             defaults.removeObject(forKey: stateKey)
         } else {
             lastAppliedScreenConfigurations = currentTargetScreenConfigurations()
+        }
+        if #available(macOS 26.0, *),
+           let screenNumber = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            WallpaperExtensionSocketServer.shared.unregisterDisplayVideo(displayID: screenNumber.uint32Value)
         }
         syncCurrentVideoURL()
     }
@@ -719,6 +1253,7 @@ final class VideoWallpaperManager: ObservableObject {
             looper.disableLooping()
             loopers.removeValue(forKey: screenID)
         }
+        videoSizes.removeValue(forKey: screenID)
         playerItemObservers[screenID]?.invalidate()
         playerItemObservers.removeValue(forKey: screenID)
         playerItemObserverTokens.removeValue(forKey: screenID)
@@ -755,6 +1290,18 @@ final class VideoWallpaperManager: ObservableObject {
 
     /// 恢复场景专用的同步 poster 设置，确保桌面/锁屏底图在视频窗口重建前已就绪
     private func applyPosterAsDesktopWallpaperSync(_ posterURL: URL, targetScreen: NSScreen? = nil) {
+        // 安全兜底：动态锁屏启用时绝不设置静态桌面壁纸。
+        if shouldSkipStaticPosterForDynamicLockScreen {
+            print("[VideoWallpaperManager] 🔒 [sync poster safety] 动态锁屏已启用，跳过静态桌面 poster 设置")
+            return
+        }
+
+        // 系统壁纸同步关闭时，冻结 setDesktopImageURL 链路（mp4/场景/web 动态壁纸不受影响）
+        if !isSystemWallpaperSyncEnabled {
+            print("[VideoWallpaperManager] 🧊 [sync poster safety] 系统壁纸同步已关闭，跳过静态桌面 poster 设置")
+            return
+        }
+
         let workspace = NSWorkspace.shared
         do {
             let data = try Data(contentsOf: posterURL)
@@ -792,6 +1339,19 @@ final class VideoWallpaperManager: ObservableObject {
         // 检查是否已被取消（快速连续切换壁纸时，旧任务应放弃）
         try? await Task.sleep(nanoseconds: 0)
         guard !Task.isCancelled else { return }
+
+        // 安全兜底：动态锁屏启用时绝不设置静态桌面壁纸，避免覆盖用户手动选择的锁屏实例。
+        if shouldSkipStaticPosterForDynamicLockScreen {
+            print("[VideoWallpaperManager] 🔒 [poster safety] 动态锁屏已启用，跳过静态桌面 poster 设置")
+            return
+        }
+
+        // 系统壁纸同步关闭时，冻结 setDesktopImageURL 链路（mp4/场景/web 动态壁纸不受影响）
+        if !isSystemWallpaperSyncEnabled {
+            print("[VideoWallpaperManager] 🧊 [poster safety] 系统壁纸同步已关闭，跳过静态桌面 poster 设置")
+            return
+        }
+
         let workspace = NSWorkspace.shared
         do {
             // 1. 读取预览图（本地文件或网络）
@@ -944,18 +1504,60 @@ final class VideoWallpaperManager: ObservableObject {
                 isPaused = false
                 videoTargetScreenIDs = Set(savedState.videoScreenIDs ?? [])
                 videoTargetScreenFingerprints = Set(savedState.videoScreenFingerprints ?? [])
-                // 恢复场景下异步设置 poster，不阻塞主线程；视频窗口会覆盖在 poster 上方
+                // 恢复场景下异步设置 poster，不阻塞主线程；视频窗口会覆盖在 poster 上方。
+                // 动态锁屏启用时跳过，避免触发 setDesktopImageURL 导致系统重置扩展选择。
+                let shouldSkipPosterForRestore = shouldSkipStaticPosterForDynamicLockScreen
                 for screen in screensForVideoWallpaperTargets() {
                     if let posterURL = posterURL(for: screen) {
-                        setPosterAsDesktopWallpaper(posterURL, targetScreen: screen)
-                        DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
+                        if !shouldSkipPosterForRestore {
+                            setPosterAsDesktopWallpaper(posterURL, targetScreen: screen)
+                            DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
+                        } else {
+                            print("[VideoWallpaperManager] 🔒 动态锁屏已启用，恢复时跳过静态 poster 写入")
+                        }
                     }
                 }
                 try rebuildWindows()
+                updateAudioSession()
                 if savedState.isPaused {
                     pauseWallpaper()
                 }
                 persistState()
+
+                // 恢复完成后,如果扩展已激活,需要同步视频源到扩展
+                // 开机时扩展可能先于 App 视频源恢复而启动,此时 checkExtensionState() 因 hasActiveVideoWallpaper=false 未触发同步
+                if #available(macOS 26.0, *) {
+                    if isLockScreenExtensionActive {
+                        print("[VideoWallpaperManager] 📺 视频源恢复完成,扩展已激活,同步视频源到锁屏扩展")
+                        syncAllDisplayVideosToExtension()
+                    } else {
+                        // 扩展未激活，可能是开机后系统未自动启动扩展
+                        // 延迟 2 秒后发送系统桌面通知，尝试触发系统刷新壁纸设置从而启动扩展
+                        print("[VideoWallpaperManager] ⏳ 扩展未激活，延迟触发系统壁纸刷新")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                            guard let self else { return }
+                            print("[VideoWallpaperManager] 📢 发送 com.apple.desktop 通知，尝试触发扩展启动")
+                            // 发送系统桌面壁纸刷新通知，可能触发系统重新启动扩展
+                            DistributedNotificationCenter.default().postNotificationName(
+                                NSNotification.Name("com.apple.desktop"),
+                                object: nil,
+                                userInfo: nil,
+                                deliverImmediately: true
+                            )
+                            // 再延迟 3 秒后检查扩展是否被启动
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                                guard let self else { return }
+                                self.checkExtensionState()
+                                if self.isLockScreenExtensionActive {
+                                    print("[VideoWallpaperManager] 📺 系统通知触发后扩展已激活，同步视频源")
+                                    self.syncAllDisplayVideosToExtension()
+                                } else {
+                                    print("[VideoWallpaperManager] ⚠️ 系统通知未能触发扩展启动，等待用户手动打开设置")
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 try applyVideoWallpaper(from: url, posterURL: globalPosterURL, muted: savedState.isMuted)
                 volume = savedState.volume ?? (savedState.isMuted ? 0 : 1)
@@ -1020,6 +1622,9 @@ final class VideoWallpaperManager: ObservableObject {
         // ⚠️ NSNotification 回调可能不在主线程，dispatch 到主线程
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            if #available(macOS 26.0, *) {
+                LockScreenWallpaperService.shared.syncDisplayInstancesToSocketServer()
+            }
             guard self.hasActiveVideoWallpaper else { return }
 
             // 防抖：延迟 300ms 执行，避免屏幕参数变化时的频繁重建
@@ -1063,6 +1668,10 @@ final class VideoWallpaperManager: ObservableObject {
         // ⚠️ NSWorkspace 通知可能不在主线程，dispatch 到主线程
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            if #available(macOS 26.0, *) {
+                LockScreenWallpaperService.shared.syncDisplayInstancesToSocketServer()
+            }
+
             // 屏幕唤醒时防抖重建
             self.pendingWakeRebuildWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
@@ -1122,6 +1731,10 @@ final class VideoWallpaperManager: ObservableObject {
         // 系统唤醒后防抖重建并恢复播放
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            if #available(macOS 26.0, *) {
+                LockScreenWallpaperService.shared.syncDisplayInstancesToSocketServer()
+            }
+
             self.pendingWakeRebuildWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
@@ -1401,8 +2014,14 @@ final class VideoWallpaperManager: ObservableObject {
                 let schedulerConfig = WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: targetScreenID)
                 let isOnEndMode = schedulerConfig.isEnabled && schedulerConfig.isOnEndMode
 
-                let hdrEnabled = UserDefaults.standard.object(forKey: "hdr_enabled") as? Bool ?? true
-                let components = makePlayerComponents(for: targetScreen, videoURL: videoURL, muted: isMuted, hdrEnabled: hdrEnabled, enableLooping: !isOnEndMode)
+                let hdrMetadataEnabled = UserDefaults.standard.object(forKey: "hdr_enabled") as? Bool ?? true
+                let components = makePlayerComponents(
+                    for: targetScreen,
+                    videoURL: videoURL,
+                    muted: isMuted,
+                    hdrMetadataEnabled: hdrMetadataEnabled,
+                    enableLooping: !isOnEndMode
+                )
                 if let looper = components.looper {
                     self.loopers[targetScreenID] = looper
                 } else {
@@ -1424,6 +2043,7 @@ final class VideoWallpaperManager: ObservableObject {
                     guard let self, let containerView else { return }
                     containerView.playerLayer.player = components.player
                     containerView.playerLayer.videoGravity = .resizeAspectFill
+                    self.applyCropToScreen(targetScreen)
 
                     if let oldLooper {
                         oldLooper.disableLooping()
@@ -1468,6 +2088,9 @@ final class VideoWallpaperManager: ObservableObject {
                             self.fadeInTimeouts[targetScreenID]?.cancel()
                             self.fadeInTimeouts.removeValue(forKey: targetScreenID)
 
+                            // AVPlayerLooper 可能在 ready 前后插入新的循环 item，播放前重新应用音频策略。
+                            let screenVolume = self.volumeByScreen[targetScreenID] ?? self.volume
+                            self.applyPlayerAudioPolicy(components.player, muted: self.isMuted, volume: screenVolume)
                             if !self.isPaused {
                                 components.player.play()
                             }
@@ -1490,6 +2113,9 @@ final class VideoWallpaperManager: ObservableObject {
                         self.fadeInTimeouts[targetScreenID]?.cancel()
                         self.fadeInTimeouts.removeValue(forKey: targetScreenID)
 
+                        // 超时兜底路径也要在 play() 前重新禁用静音状态下的音频轨。
+                        let screenVolume = self.volumeByScreen[targetScreenID] ?? self.volume
+                        self.applyPlayerAudioPolicy(components.player, muted: self.isMuted, volume: screenVolume)
                         if !self.isPaused {
                             components.player.play()
                         }
@@ -1506,6 +2132,10 @@ final class VideoWallpaperManager: ObservableObject {
                     containerView.cancelPlayerTransitionIfNeeded()
                     containerView.playerLayer.player = components.player
                     containerView.playerLayer.videoGravity = .resizeAspectFill
+                    applyCropToScreen(targetScreen)
+                    // 非动画替换会立即播放，新播放器绑定到 layer 后先同步静音音频轨状态。
+                    let screenVolume = volumeByScreen[targetScreenID] ?? volume
+                    applyPlayerAudioPolicy(components.player, muted: isMuted, volume: screenVolume)
                     if !isPaused {
                         components.player.play()
                     }
@@ -1641,23 +2271,38 @@ final class VideoWallpaperManager: ObservableObject {
     ///   - screen: 目标屏幕
     ///   - videoURL: 视频文件 URL
     ///   - muted: 是否静音
-    ///   - hdrEnabled: 是否启用 HDR
+    ///   - hdrMetadataEnabled: 是否应用源视频逐帧 HDR 显示元数据；这是 AVPlayerItem 原生属性，不引入 videoComposition。
     ///   - enableLooping: 是否启用循环播放（"播完即换"模式下为 false）
-    private func makePlayerComponents(for screen: NSScreen, videoURL: URL, muted: Bool, hdrEnabled: Bool = true, enableLooping: Bool = true) -> (player: AVQueuePlayer, looper: AVPlayerLooper?, item: AVPlayerItem) {
+    private func makePlayerComponents(
+        for screen: NSScreen,
+        videoURL: URL,
+        muted: Bool,
+        hdrMetadataEnabled: Bool = true,
+        enableLooping: Bool = true
+    ) -> (player: AVQueuePlayer, looper: AVPlayerLooper?, item: AVPlayerItem) {
         let playerItem = AVPlayerItem(url: videoURL)
-
-        // HDR 关闭时强制 SDR 渲染
-        if !hdrEnabled {
-            applySDRVideoComposition(to: playerItem)
+        if #available(macOS 11.0, *) {
+            playerItem.appliesPerFrameHDRDisplayMetadata = hdrMetadataEnabled
         }
 
-        // 配置播放设置
-        playerItem.preferredPeakBitRate = 0
-        // 将分辨率上限设为屏幕物理像素分辨率，防止 8K 等超屏分辨率视频超出 GPU 解码能力导致卡顿或黑屏
+        // 计算屏幕物理像素分辨率，用于后续所有与分辨率/码率相关的限制
         let scaleFactor = screen.backingScaleFactor
         let screenPixelWidth = screen.frame.width * scaleFactor
         let screenPixelHeight = screen.frame.height * scaleFactor
+
+        // 1) 动态峰值码率限制
+        // 根据屏幕分辨率计算合理的峰值码率上限，避免超大码率视频导致持续性磁盘 I/O 和内存带宽压力。
+        // 桌面壁纸通常远距离观看，可容忍较低码率。
+        let totalPixels = screenPixelWidth * screenPixelHeight
+        // 估算：~0.05 bits/pixel/s（H.265 良好质量），
+        // 4K@30fps → ~20 Mbps, 5K → ~37 Mbps, 6K → ~51 Mbps
+        let estimatedBitrate = Double(totalPixels) * 0.05
+        let maxBitrate: Double = 50_000_000 // 50 Mbps 硬上限
+        playerItem.preferredPeakBitRate = min(estimatedBitrate, maxBitrate)
+
+        // 2) 解码分辨率上限
         playerItem.preferredMaximumResolution = CGSize(width: screenPixelWidth, height: screenPixelHeight)
+
         if #available(macOS 10.15, *) {
             playerItem.seekingWaitsForVideoCompositionRendering = false
         }
@@ -1665,14 +2310,25 @@ final class VideoWallpaperManager: ObservableObject {
         if videoURL.isFileURL {
             // 桌面壁纸只需要持续顺序播放。较短的本地缓冲能降低大码率 MP4 对内存和磁盘 I/O 的占用，
             // 避免前台 SwiftUI 列表滚动时与视频解码争抢资源。
-            playerItem.preferredForwardBufferDuration = localVideoForwardBufferDuration
+            let effectiveBufferDuration: TimeInterval = {
+                // 对于超大文件（>1GB），进一步缩减缓冲以降低持续性磁盘 I/O 和 page cache 压力
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: videoURL.path),
+                   let fileSize = attrs[.size] as? UInt64,
+                   fileSize > 1_000_000_000 {
+                    return 1.0
+                }
+                return localVideoForwardBufferDuration
+            }()
+            playerItem.preferredForwardBufferDuration = effectiveBufferDuration
         }
 
         let queuePlayer = AVQueuePlayer()
         queuePlayer.actionAtItemEnd = .none
         let screenVolume = volume(for: screen)
-        queuePlayer.isMuted = muted
-        queuePlayer.volume = muted ? 0 : Float(screenVolume)
+        // 先设置播放器级音量；此时队列通常为空，所以还需要单独处理模板 item。
+        applyPlayerAudioPolicy(queuePlayer, muted: muted, volume: screenVolume)
+        // AVPlayerLooper 会基于 templateItem 复制循环 item，模板本身必须先禁用音频轨。
+        applyPlayerItemAudioPolicy(playerItem, muted: muted)
         // 本地文件设为 false：循环切换时不等待缓冲，立即切到下一副本，减少停顿感
         queuePlayer.automaticallyWaitsToMinimizeStalling = !videoURL.isFileURL
         queuePlayer.preventsDisplaySleepDuringVideoPlayback = false
@@ -1687,17 +2343,35 @@ final class VideoWallpaperManager: ObservableObject {
         return (queuePlayer, looper, playerItem)
     }
 
-    /// 为 AVPlayerItem 应用 SDR 视频合成（强制非 HDR 渲染）
-    private func applySDRVideoComposition(to playerItem: AVPlayerItem) {
-        let asset = playerItem.asset
-        let composition = AVMutableVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
-            request.finish(with: request.sourceImage, context: nil)
-        })
-        // 设置 SDR 色域：Rec.709
-        composition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
-        composition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
-        composition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
-        playerItem.videoComposition = composition
+    private func applyPlayerAudioPolicy(_ player: AVQueuePlayer, muted: Bool, volume: Double) {
+        // 播放器级策略负责系统可见的静音/音量，以及当前已进入队列的 item。
+        player.isMuted = muted
+        player.volume = muted ? 0 : Float(volume)
+        for item in player.items() {
+            applyPlayerItemAudioPolicy(item, muted: muted)
+        }
+    }
+
+    private func applyPlayerItemAudioPolicy(_ item: AVPlayerItem, muted: Bool) {
+        // item 级策略负责直接禁用音频轨，避免静音壁纸仍建立音频输出链路。
+        setLoadedAudioTracksEnabled(!muted, for: item)
+
+        if muted {
+            Task { @MainActor [weak self, weak item] in
+                guard let self, let item else { return }
+                _ = try? await item.asset.loadTracks(withMediaType: .audio)
+                guard self.isMuted else { return }
+                // asset 音频轨可能稍后才加载完成，异步返回后再禁用一次 item tracks。
+                setLoadedAudioTracksEnabled(false, for: item)
+            }
+        }
+    }
+
+    private func setLoadedAudioTracksEnabled(_ enabled: Bool, for item: AVPlayerItem) {
+        // 只切换音频轨，不影响视频轨播放，确保静音壁纸仍能正常渲染画面。
+        for track in item.tracks where track.assetTrack?.mediaType == .audio {
+            track.isEnabled = enabled
+        }
     }
 
     private func createWindow(for screen: NSScreen, videoURL: URL, muted: Bool) throws {
@@ -1732,8 +2406,14 @@ final class VideoWallpaperManager: ObservableObject {
         // 统一使用 AVPlayerLooper 简单循环播放原视频，不做 crossfade composition。
         // 复杂的首尾帧 crossfade 渲染逻辑已保留在 makeLoopingCompositionItem / exportLoopedVideo 中，
         // 待后续增加用户手动开关后再决定是否恢复调用。
-        let hdrEnabled = UserDefaults.standard.object(forKey: "hdr_enabled") as? Bool ?? true
-        let components = makePlayerComponents(for: screen, videoURL: videoURL, muted: muted, hdrEnabled: hdrEnabled, enableLooping: !isOnEndMode)
+        let hdrMetadataEnabled = UserDefaults.standard.object(forKey: "hdr_enabled") as? Bool ?? true
+        let components = makePlayerComponents(
+            for: screen,
+            videoURL: videoURL,
+            muted: muted,
+            hdrMetadataEnabled: hdrMetadataEnabled,
+            enableLooping: !isOnEndMode
+        )
         if let looper = components.looper {
             self.loopers[screenID] = looper
         } else {
@@ -1742,6 +2422,20 @@ final class VideoWallpaperManager: ObservableObject {
 
         containerView.playerLayer.player = components.player
         containerView.playerLayer.videoGravity = .resizeAspectFill
+        applyCropToScreen(screen)
+
+        // 异步加载视频真实尺寸并缓存，加载完后重算 crop（首次用 fallback 屏尺寸）。
+        Task { [weak self, videoURL] in
+            let asset = AVURLAsset(url: videoURL)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let size = try? await track.load(.naturalSize),
+                  size.width > 0, size.height > 0 else { return }
+            await MainActor.run {
+                guard let self = self, self.players[screenID] != nil else { return }
+                self.videoSizes[screenID] = size
+                self.applyCropToScreen(screen)
+            }
+        }
 
         // 应用噪点纹理叠加（桌面壁纸颗粒蒙层，由 Settings 开关独立控制）
         let grainEnabled = ArcBackgroundSettings.shared.grainTextureEnabled
@@ -1767,6 +2461,9 @@ final class VideoWallpaperManager: ObservableObject {
                 self.playerItemObserverTokens.removeValue(forKey: screenID)
                 self.fadeInTimeouts[screenID]?.cancel()
                 self.fadeInTimeouts.removeValue(forKey: screenID)
+                // 首帧 ready 后、真正播放前再次同步音频策略，覆盖 looper 后续插入的 item。
+                let screenVolume = self.volumeByScreen[screenID] ?? self.volume
+                self.applyPlayerAudioPolicy(player, muted: self.isMuted, volume: screenVolume)
                 // 仅在非暂停状态下播放（restoreIfNeeded 中可能已设为暂停）
                 if !self.isPaused {
                     player.play()
@@ -1788,6 +2485,9 @@ final class VideoWallpaperManager: ObservableObject {
             self.playerItemObservers.removeValue(forKey: screenID)
             self.playerItemObserverTokens.removeValue(forKey: screenID)
             self.fadeInTimeouts.removeValue(forKey: screenID)
+            // ready 超时时也会直接播放，所以这里同样要先禁用静音状态下的音频轨。
+            let screenVolume = self.volumeByScreen[screenID] ?? self.volume
+            self.applyPlayerAudioPolicy(player, muted: self.isMuted, volume: screenVolume)
             if !self.isPaused {
                 player.play()
             }
@@ -1887,6 +2587,7 @@ final class VideoWallpaperManager: ObservableObject {
             player.removeAllItems()
         }
         players.removeAll()
+        videoSizes.removeAll()
 
         // 延迟释放 player，让 MediaToolbox 后台线程完成 FigNotificationCenter 清理。
         // 延迟完成后必须移除 work item，否则闭包会继续持有旧 player。
@@ -2075,6 +2776,15 @@ private final class WallpaperVideoContainerView: NSView {
     private var grainOverlayView: NSView?
     private var transitionPlayerLayer: AVPlayerLayer?
 
+    /// 实际播放视频的 AVPlayerLayer。作为容器 backing layer 的子层，
+    /// 通过修改它的 frame 实现 pan/zoom 裁切（容器 backing layer masksToBounds 自然裁剪）。
+    private let avPlayerLayer = AVPlayerLayer()
+
+    /// 上一次 layout() 后的 viewport 矩形（容器 bounds 坐标系），用于 layout 时复用。
+    private var currentViewportRect: CGRect?
+    /// 上一次 layout() 后的 wallpaperCropRect（归一化），用于 layout 时复用。
+    private var currentWallpaperCropRect: UnitRect?
+
     var isShowingPoster: Bool {
         posterImageView != nil
     }
@@ -2082,23 +2792,95 @@ private final class WallpaperVideoContainerView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer = AVPlayerLayer()
-        playerLayer.videoGravity = .resizeAspectFill
-        playerLayer.needsDisplayOnBoundsChange = true
+        // 容器 backing layer：CALayer + masksToBounds，作为 viewport 裁剪盒
+        let container = CALayer()
+        container.masksToBounds = true
+        layer = container
+        avPlayerLayer.videoGravity = .resizeAspectFill
+        avPlayerLayer.needsDisplayOnBoundsChange = true
+        avPlayerLayer.frame = bounds
+        container.addSublayer(avPlayerLayer)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    var playerLayer: AVPlayerLayer {
-        guard let layer = layer as? AVPlayerLayer else {
-            let replacementLayer = AVPlayerLayer()
-            replacementLayer.videoGravity = .resizeAspectFill
-            self.layer = replacementLayer
-            return replacementLayer
+    var playerLayer: AVPlayerLayer { avPlayerLayer }
+
+    /// 应用已算好的 CropLayout；nil 回现状 aspect-fill。
+    /// 实现：
+    /// 1. viewport（可视框）通过 avPlayerLayer.frame 限制到 viewport 区域；容器 backing layer
+    ///    masksToBounds=true 让 viewport 之外可见 view 背景（letterbox 由 window.backgroundColor 提供）。
+    /// 2. pan/zoom 通过把 avPlayerLayer.frame 在 viewport 内 放大并偏移 实现：
+    ///    layer.frame.size = viewport.size / wallpaperCropRect.size
+    ///    layer.frame.origin = viewport.origin - wallpaperCropRect.origin × layer.frame.size
+    ///    然后 backing layer masksToBounds 把溢出的部分裁掉。
+    ///    注意：CALayer y 向上、CropLayout y 向下，需做 y 翻转。
+    func applyCropLayout(_ layout: CropLayout?) {
+        let viewBounds = bounds
+        guard let layout, viewBounds.width > 0, viewBounds.height > 0 else {
+            currentViewportRect = nil
+            currentWallpaperCropRect = nil
+            avPlayerLayer.videoGravity = .resizeAspectFill
+            avPlayerLayer.frame = viewBounds
+            transitionPlayerLayer?.frame = avPlayerLayer.bounds
+            // 回退：mask 清除，poster/grain 恢复全 bounds + autoresize
+            layer?.mask = nil
+            posterImageView?.autoresizingMask = [.width, .height]
+            posterImageView?.frame = viewBounds
+            posterImageView?.imageScaling = .scaleAxesIndependently
+            grainOverlayView?.autoresizingMask = [.width, .height]
+            grainOverlayView?.frame = viewBounds
+            return
         }
-        return layer
+        // 视频不变形 → aspect-fill 到 layer bounds
+        avPlayerLayer.videoGravity = .resizeAspectFill
+
+        // viewport 在 view 坐标系（y 向上）。CropLayout.viewportRect y 向下需翻转。
+        let vpW = layout.viewportRect.w * viewBounds.width
+        let vpH = layout.viewportRect.h * viewBounds.height
+        let vpX = layout.viewportRect.x * viewBounds.width
+        let vpY = (1.0 - layout.viewportRect.y - layout.viewportRect.h) * viewBounds.height
+        let viewport = CGRect(x: vpX, y: vpY, width: vpW, height: vpH)
+        currentViewportRect = viewport
+        currentWallpaperCropRect = layout.wallpaperCropRect
+
+        // layer frame：放大到 viewport.size / cropRect.size，再偏移使得 viewport 看到 cropRect
+        let crop = layout.wallpaperCropRect
+        let cropW = max(0.0001, crop.w)
+        let cropH = max(0.0001, crop.h)
+        let layerW = vpW / cropW
+        let layerH = vpH / cropH
+        // cropRect.y 向下 → 翻转：从 wallpaper 顶部移除 (1-y-h) 高度 ⇔ layer 上沿移动到 viewport 顶之上 crop.y × layerH
+        let layerX = vpX - crop.x * layerW
+        let layerY = vpY - (1.0 - crop.y - crop.h) * layerH
+        avPlayerLayer.frame = CGRect(x: layerX, y: layerY, width: layerW, height: layerH)
+        transitionPlayerLayer?.frame = avPlayerLayer.bounds
+
+        // ⚠️ 关键：当 cropRect 不是正方形时（如 viewport 比例窗口），avPlayerLayer 在某个方向
+        // 被放大后会超出 viewport 边界。容器 backing layer 的 masksToBounds 只裁到 view bounds（全屏），
+        // 不会裁到 viewport，所以视频内容会"漏"进 letterbox 区域，盖掉 window.backgroundColor。
+        // 解决方案：给容器 layer 装一个 viewport 矩形的 mask，把所有子层裁到 viewport 内。
+        // viewport 等于 bounds（无 letterbox）时不装 mask，避免无谓开销。
+        let isFullViewport = abs(vpX) < 0.5 && abs(vpY) < 0.5
+            && abs(vpW - viewBounds.width) < 0.5 && abs(vpH - viewBounds.height) < 0.5
+        if isFullViewport {
+            layer?.mask = nil
+        } else {
+            let mask = (layer?.mask as? CALayer) ?? CALayer()
+            mask.backgroundColor = CGColor(gray: 1, alpha: 1)
+            mask.frame = viewport
+            layer?.mask = mask
+        }
+
+        // poster / grain 也同步到 viewport（subview 不被 backing layer 的 masksToBounds 裁剪）
+        // crop 模式下必须关 autoresize，否则 view 系统会把 frame 拉回 bounds
+        posterImageView?.autoresizingMask = []
+        posterImageView?.frame = viewport
+        posterImageView?.imageScaling = .scaleProportionallyUpOrDown
+        grainOverlayView?.autoresizingMask = []
+        grainOverlayView?.frame = viewport
     }
 
     func cancelPlayerTransitionIfNeeded() {
@@ -2114,7 +2896,7 @@ private final class WallpaperVideoContainerView: NSView {
         overlayLayer.player = newPlayer
         overlayLayer.videoGravity = playerLayer.videoGravity
         overlayLayer.needsDisplayOnBoundsChange = true
-        overlayLayer.frame = bounds
+        overlayLayer.frame = playerLayer.bounds   // 跟随 playerLayer（含 crop）几何
         overlayLayer.opacity = 0
         playerLayer.addSublayer(overlayLayer)
         transitionPlayerLayer = overlayLayer
@@ -2143,10 +2925,15 @@ private final class WallpaperVideoContainerView: NSView {
     func showPoster(_ image: NSImage) {
         hidePoster()
 
-        let imageView = NSImageView(frame: bounds)
+        // poster 限制在 viewport 区域（若存在 crop），否则铺满 bounds
+        let targetFrame = currentViewportRect ?? bounds
+        let imageView = NSImageView(frame: targetFrame)
         imageView.image = image
-        imageView.imageScaling = .scaleAxesIndependently
-        imageView.autoresizingMask = [.width, .height]
+        // crop 时 viewport 已是目标比例的区域，poster 在框内 aspect-fill；
+        // 无 crop 时维持旧行为 scaleAxesIndependently 拉伸填满
+        imageView.imageScaling = currentViewportRect != nil ? .scaleProportionallyUpOrDown : .scaleAxesIndependently
+        // crop 模式下不能 autoresize（会被拉回 bounds），由 layout() 手动同步到 viewport
+        imageView.autoresizingMask = currentViewportRect != nil ? [] : [.width, .height]
         addSubview(imageView)
         posterImageView = imageView
     }
@@ -2162,9 +2949,11 @@ private final class WallpaperVideoContainerView: NSView {
         hideGrainOverlay()
         guard intensity > 0.01 else { return }
 
-        let overlayView = GrainPatternOverlayView(frame: bounds)
+        let targetFrame = currentViewportRect ?? bounds
+        let overlayView = GrainPatternOverlayView(frame: targetFrame)
         overlayView.intensity = intensity
-        overlayView.autoresizingMask = [.width, .height]
+        // crop 模式下不能 autoresize（会被拉回 bounds），由 layout() 手动同步到 viewport
+        overlayView.autoresizingMask = currentViewportRect != nil ? [] : [.width, .height]
         addSubview(overlayView)
         grainOverlayView = overlayView
     }
@@ -2177,10 +2966,23 @@ private final class WallpaperVideoContainerView: NSView {
 
     override func layout() {
         super.layout()
-        playerLayer.frame = bounds
-        transitionPlayerLayer?.frame = bounds
-        posterImageView?.frame = bounds
-        grainOverlayView?.frame = bounds
+        // 无 crop（或回退状态）：avPlayerLayer 铺满 bounds；
+        // 有 crop：avPlayerLayer.frame 由 applyCropLayout 设定，layout 时不动它（外层会在
+        // bounds 变化后调用 applyCropToScreen 重新计算）。
+        if currentWallpaperCropRect == nil {
+            avPlayerLayer.frame = bounds
+        }
+        transitionPlayerLayer?.frame = avPlayerLayer.bounds
+
+        // poster 和 grain 是 subview（非 sublayer），容器 CALayer 的 masksToBounds 裁不到它们。
+        // crop 时把它们的 frame 限制到 viewport 区域，避免超出可视框渲染。
+        if let vp = currentViewportRect {
+            posterImageView?.frame = vp
+            grainOverlayView?.frame = vp
+        } else {
+            posterImageView?.frame = bounds
+            grainOverlayView?.frame = bounds
+        }
     }
 }
 

@@ -63,15 +63,26 @@ struct LibraryFolderCard: View {
     let itemCount: Int
     let cardWidth: CGFloat
     let isEditing: Bool
+    /// 文件夹是否已解锁（仅加密模式下有效）
+    let isUnlocked: Bool
+    let dragPayload: String
     let onTap: () -> Void
     let onDrop: ([String]) -> Void
     let onDisband: () -> Void
+    let onRename: () -> Void
+    let onToggleLock: (() -> Void)?
+    let onRelock: (() -> Void)?
 
     @State private var isHovered = false
     @State private var isDropTarget = false
 
     private var thumbnailHeight: CGFloat {
         LibraryCardMetrics.thumbnailHeight
+    }
+
+    /// 文件夹启用了加密且未解锁
+    private var isLockedAndHidden: Bool {
+        folder.isLocked && !isUnlocked
     }
 
     var body: some View {
@@ -85,6 +96,32 @@ struct LibraryFolderCard: View {
                         imageURLs: previewURLs,
                         size: CGSize(width: cardWidth, height: thumbnailHeight)
                     )
+                    .blur(radius: isLockedAndHidden ? 18 : 0)
+                    .scaleEffect(isLockedAndHidden ? 1.06 : 1)
+                    .saturation(isLockedAndHidden ? 0.82 : 1)
+                    .brightness(isLockedAndHidden ? -0.04 : 0)
+
+                    if isLockedAndHidden {
+                        LockedFolderOverlay(isUnlocked: false, iconSize: 28)
+                    }
+
+                    if folder.isLocked && isUnlocked, let onRelock {
+                        relockButton(onRelock: onRelock)
+                    }
+
+                    // 收纳 drop 仅覆盖卡片缩略图中央 60%，
+                    // 卡片其他区域（左侧间隙、底部信息栏、外缘）让给 grid 的排序插入条 drop zone。
+                    Color.clear
+                        .frame(width: cardWidth * 0.6, height: thumbnailHeight * 0.6)
+                        .contentShape(Rectangle())
+                        .dropDestination(for: String.self) { strings, _ in
+                            let ids = uniqueIDs(strings.flatMap(parseDropPayload))
+                            guard !ids.isEmpty else { return false }
+                            onDrop(ids)
+                            return true
+                        } isTargeted: { isTargeted in
+                            isDropTarget = isTargeted
+                        }
                 }
                 .frame(width: cardWidth, height: thumbnailHeight)
                 .clipped()
@@ -129,25 +166,37 @@ struct LibraryFolderCard: View {
         }
         .buttonStyle(.plain)
         .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .draggable(dragPayload)
         .animation(.easeOut(duration: 0.16), value: isHovered)
         .animation(.easeInOut(duration: 0.15), value: isDropTarget)
         .throttledHover(interval: 0.05) { hovering in
             isHovered = hovering
         }
         .contextMenu {
+            Button(action: onRename) {
+                Label(t("folder.rename"), systemImage: "pencil")
+            }
+            if folder.isLocked, isUnlocked, let onRelock {
+                Button {
+                    onRelock()
+                } label: {
+                    Label(t("folder.relock"), systemImage: "lock.fill")
+                }
+            }
+            if let onToggleLock {
+                Button {
+                    onToggleLock()
+                } label: {
+                    if folder.isLocked {
+                        Label(t("folder.unlock"), systemImage: "lock.open")
+                    } else {
+                        Label(t("folder.lock"), systemImage: "lock")
+                    }
+                }
+            }
             Button(role: .destructive, action: onDisband) {
                 Label(t("disband.folder"), systemImage: "folder.badge.minus")
             }
-        }
-        .dropDestination(for: String.self) { strings, _ in
-            let ids = uniqueIDs(strings.flatMap(parseDropPayload))
-            guard !ids.isEmpty else {
-                return false
-            }
-            onDrop(ids)
-            return true
-        } isTargeted: { isTargeted in
-            isDropTarget = isTargeted
         }
     }
 
@@ -162,6 +211,36 @@ struct LibraryFolderCard: View {
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.7))
         }
+    }
+
+    /// 加密文件夹解锁后，允许只重新锁定本次会话，不改变加密配置。
+    private func relockButton(onRelock: @escaping () -> Void) -> some View {
+        VStack {
+            Spacer()
+            HStack {
+                Button {
+                    onRelock()
+                } label: {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(8)
+                        .background(
+                            Circle()
+                                .fill(Color.black.opacity(0.5))
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(t("folder.relock"))
+
+                Spacer()
+            }
+        }
+        .padding(10)
     }
 
     private func parseDropPayload(_ payload: String) -> [String] {

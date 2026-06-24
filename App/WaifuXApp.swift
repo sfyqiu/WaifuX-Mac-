@@ -4,6 +4,7 @@ import AppIntents
 import Kingfisher
 import ExceptionHandling
 import WebKit
+import Darwin
 
 final class EdgeToEdgeHostingView<Content: View>: NSHostingView<Content> {
     private let edgeToEdgeLayoutGuide = NSLayoutGuide()
@@ -61,6 +62,11 @@ struct WaifuXApp {
     #endif
 
     static func main() {
+        // 全局忽略 SIGPIPE：AVFoundation 内部管道在快速切换视频壁纸时可能写入已关闭的 pipe，
+        // 若不加此保护会导致信号 13 (SIGPIPE) 传递到 NSEventThread 崩溃。
+        // 所有自定义 socket 已通过 SO_NOSIGPIPE 独立防护，全局忽略是安全的。
+        signal(SIGPIPE, SIG_IGN)
+
         // 配置 Kingfisher（高性能图片加载）
         configureKingfisher()
 
@@ -80,9 +86,15 @@ struct WaifuXApp {
 
     /// 配置 Kingfisher 高性能图片加载
     private static func configureKingfisher() {
-        // 内存缓存配置 - 降低到 50MB/80张，减少内存占用
-        ImageCache.default.memoryStorage.config.totalCostLimit = 50 * 1024 * 1024 // 50MB
-        ImageCache.default.memoryStorage.config.countLimit = 80
+        // 内存缓存配置：256MB / 300 张 / 10 分钟过期 / 60 秒一次清理。
+        // 壁纸探索页瀑布流可能滚出几百张缩略图，仅靠 totalCostLimit 不够：
+        // 没有 expiration + cleanInterval 时，长期不访问的条目仍然驻留，
+        // RSS 会持续增长直至触发 macOS 内存压力 → 全量 clearMemoryCache()。
+        // 主动 expiration 让长尾图片自然落到磁盘缓存，缓解抖动。
+        ImageCache.default.memoryStorage.config.totalCostLimit = 256 * 1024 * 1024 // 256MB
+        ImageCache.default.memoryStorage.config.countLimit = 300
+        ImageCache.default.memoryStorage.config.expiration = .seconds(10 * 60) // 10 min
+        ImageCache.default.memoryStorage.config.cleanInterval = 60             // 60s
 
         // 磁盘缓存配置
         ImageCache.default.diskStorage.config.sizeLimit = 500 * 1024 * 1024 // 500MB
@@ -97,8 +109,11 @@ struct WaifuXApp {
         configuration.timeoutIntervalForResource = 180
         downloader.sessionConfiguration = configuration
         downloader.downloadTimeout = 60.0
+        // ⚠️ 不设置全局 .backgroundDecode：
+        // macOS 上某些图片（16bpc、非 RGB 色彩空间等）在后台解码时 CGContext 创建会失败，
+        // 触发 "[Kingfisher] Image context cannot be created." 崩溃。
+        // macOS 14+ Core Graphics 已能高效处理离屏渲染，无需全局后台解码。
         KingfisherManager.shared.defaultOptions = [
-            .backgroundDecode,
             .retryStrategy(DelayRetryStrategy(maxRetryCount: 2, retryInterval: .accumulated(1.0))),
             .requestModifier(AnyModifier { request in
                 var request = request
@@ -182,6 +197,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 窗口隐藏后延迟释放视图树的任务，用于回收 IOSurface / CoreAnimation 等系统图形缓存
     private var delayedReleaseTask: Task<Void, Never>?
 
+    // MARK: - 全局 ViewModel（生命周期与 App 一致）
+    /// 这 3 个 ViewModel 由 AppDelegate 持有，传入 ContentView 时用普通 let 引用而非 @StateObject。
+    /// 设计目的：避免 ContentView 因 @StateObject 响应 ViewModel 的 @Published 变化而重算 body
+    /// （会连锁导致下游 5 个 tab 子视图重建 binding/参数 → 全量重算）。
+    /// 同时让 ViewModel 不再随主窗口隐藏/重建而销毁，避免数据重新加载。
+    let wallpaperViewModel = WallpaperViewModel()
+    let mediaViewModel = MediaExploreViewModel()
+    let animeViewModel = AnimeViewModel()
+
     // MARK: - 窗口尺寸（唯一真实来源，全局统一）
     /// 最小允许的窗口大小
     private static let minimumWindowSize = NSSize(width: 1150, height: 720)
@@ -205,6 +229,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppResponsivenessMonitor.startIfNeeded()
+        AppResponsivenessMonitor.noteScenePhase("didFinishLaunching")
+        AppResponsivenessMonitor.noteAppActive(NSApp.isActive)
         // ⚠️ ⚠️ 关键：所有 UserDefaults 读取都必须在 applicationDidFinishLaunching 中延迟恢复！
         // 绝对不能在任何单例 init() 中读 UserDefaults，macOS 26+ 会触发 _CFXPreferences
         // 隐式递归导致主线程栈溢出崩溃（EXC_BAD_ACCESS SIGSEGV, 174K 层递归）
@@ -233,8 +260,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         )
 
+        // ⚠️ 在创建 ContentView 之前刷新功能模块启动快照。
+        // ContentView 的 MainTabViewController.configure 在 makeNSViewController（视图设置）即跑，
+        // 依赖 ModuleAvailability.shared 决定 addPage 哪些 tab。必须在此之前同步读 UserDefaults。
+        // 直接读 UserDefaults 是安全的（非 @AppStorage、非 init 读取，与已存在的 line 316/399 一致）。
+        ModuleAvailability.shared.refreshFromUserDefaults()
+
         // 2. 立即创建窗口（使用 defer: false 立即渲染，不等待）
-        let contentView = ContentView()
+        let contentView = ContentView(
+            wallpaperViewModel: wallpaperViewModel,
+            mediaViewModel: mediaViewModel,
+            animeViewModel: animeViewModel
+        )
             .frame(
                 minWidth: Self.minimumWindowSize.width,
                 minHeight: Self.minimumWindowSize.height
@@ -281,9 +318,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         window?.delegate = self
 
-        // ⚠️ 关键：立即显示窗口，不要等待
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        // 开机启动时不显示主窗口，仅后台运行（状态栏 + 动态壁纸自动应用）
+        let isLoginLaunch = UserDefaults.standard.bool(forKey: "launch_at_login")
+        if isLoginLaunch {
+            // 窗口已创建但保持隐藏，用户可通过 Dock 图标或状态栏菜单显示
+            // 动态壁纸恢复在 restoreAllDataAsync 中完成
+            // 设置激活策略为 .accessory（无 Dock 图标和菜单栏）
+            NSApp.setActivationPolicy(.accessory)
+            AppResponsivenessMonitor.noteWindowVisible(false)
+            AppResponsivenessMonitor.noteScenePhase("loginLaunchHidden")
+        } else {
+            // ⚠️ 关键：立即显示窗口，不要等待
+            window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            AppResponsivenessMonitor.noteWindowVisible(true)
+            AppResponsivenessMonitor.noteScenePhase("mainWindowVisible")
+        }
 
         // ⚠️ 关键：让出主线程，让 SwiftUI 完成首次布局渲染
         // 所有数据恢复在下一个 run loop 异步执行
@@ -291,12 +341,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.restoreAllDataAsync()
         }
 
-        // 启动探索网格内存监控（800MB / 150 entries 阈值，触发 LRU trim）
-        // ⚠️ 必须异步启动，禁止在 init 路径或 applicationDidFinishLaunching 同步调用，
-        // 避免触发 macOS 26 _CFXPreferences 隐式递归
-        DispatchQueue.main.async {
-            // ExploreGridMemoryMonitor 已移除，Kingfisher 管理自己的缓存
-        }
+        // 预先在后台线程解压内嵌 assets（wallpaper-wgpu 渲染依赖），避免首次设置壁纸时阻塞主线程
+        WallpaperEngineEmbeddedAssets.prepareAssetsInBackground()
 
         // 注：更新检查已移到 ContentView 中处理
     }
@@ -307,6 +353,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // 第1帧：基础设置
         DispatchQueue.main.async { [weak self] in
+            if #available(macOS 26.0, *) {
+                // ⚠️ 延迟到窗口显示后执行，避免启动卡死；在主线程执行避免后台线程调用
+                // Bundle/FileManager/NSWorkspace 等非线程安全 API 触发崩溃
+                self?.repairWallpaperExtensionRegistration()
+            }
+
             LocalizationService.shared.restoreSavedSettings()
             ThemeManager.shared.restoreSavedSettings()
 
@@ -314,6 +366,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             DispatchQueue.main.async {
                 DownloadPathManager.shared.migrateLegacyCustomFolderPreferenceIfNeeded()
                 WorkshopSourceManager.shared.refreshStoredSteamCredentials()
+                WorkshopSourceManager.shared.loadSteamProfileID()
                 WallpaperLibraryService.shared.restoreSavedData()
                 LibraryFolderStore.shared.restoreSavedData()
 
@@ -340,17 +393,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             DownloadTaskService.shared.restoreSavedTasks()
                             WallpaperSchedulerService.shared.restoreSavedConfig()
 
-                            // 恢复动态壁纸（如果用户之前设置了）
-                            VideoWallpaperManager.shared.restoreIfNeeded()
-                            if !VideoWallpaperManager.shared.isVideoWallpaperActive {
-                                Task { await WallpaperEngineXBridge.shared.restoreIfNeeded() }
+                            // 启动锁屏扩展 Socket IPC 服务端（仅 macOS 26+）
+                            if #available(macOS 26.0, *) {
+                                WallpaperExtensionSocketServer.shared.start()
+                                LockScreenWallpaperService.shared.syncInstanceCatalogToSocketServer()
+                                // 通知旧扩展进程退出，macOS WallpaperAgent 从新 bundle 重新加载
+                                WallpaperExtensionSocketServer.shared.notifyExtensionReload()
                             }
+
+                            // 恢复刘海隐藏设置（纯 UI 覆盖层，不依赖壁纸）
+                            let notchHidden = UserDefaults.standard.bool(forKey: "hide_notch")
+                            if notchHidden {
+                                NotchOverlayManager.shared.setEnabled(true)
+                            }
+
+                            // 恢复动态壁纸（如果用户之前设置了）
+                            if WallpaperEngineXBridge.shared.hasPersistedRestoreState() {
+                                Task { await WallpaperEngineXBridge.shared.restoreIfNeeded() }
+                            } else {
+                                VideoWallpaperManager.shared.restoreIfNeeded()
+                                if !VideoWallpaperManager.shared.isVideoWallpaperActive {
+                                    Task { await WallpaperEngineXBridge.shared.restoreIfNeeded() }
+                                }
+                            }
+
+                            // 恢复静态壁纸 overlay（系统壁纸同步关闭时，用 overlay 重新显示上次静态图）
+                            StaticImageWallpaperOverlayManager.shared.restoreIfNeeded()
 
                             // 恢复动态壁纸自动暂停设置
                             DynamicWallpaperAutoPauseManager.shared.restoreSettings()
 
                             // 初始化静态壁纸颗粒蒙层（独立于壁纸设置，开关实时生效）
                             StaticWallpaperGrainManager.shared.updateOverlay()
+
+                            // 初始化液态玻璃时钟 Overlay（桌面壁纸时钟，Metal 渲染）
+                            // 配置持久化由 LiquidGlassClockSettings 自动管理
+                            LiquidGlassClockOverlayManager.shared.refreshAll()
 
                             // 第6帧：其他状态
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -386,10 +464,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        AppResponsivenessMonitor.noteAppActive(true)
+        AppResponsivenessMonitor.noteScenePhase("didBecomeActive")
+        AppResponsivenessMonitor.noteForegroundActivation(reason: "applicationDidBecomeActive")
         guard !isDynamicWallpaperRendering else { return }
         // 备用同步：当应用重新变为活跃时，检查并同步跨 Space 壁纸
         // 因为 activeSpaceDidChangeNotification 在应用后台时可能不可靠
         DesktopWallpaperSyncManager.shared.syncOnAppActivation()
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        AppResponsivenessMonitor.noteAppActive(false)
+        AppResponsivenessMonitor.noteScenePhase("didResignActive")
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -405,7 +491,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateActivationPolicy(showDockIcon: true)
 
         if window == nil {
-            let contentView = ContentView()
+            let contentView = ContentView(
+                wallpaperViewModel: wallpaperViewModel,
+                mediaViewModel: mediaViewModel,
+                animeViewModel: animeViewModel
+            )
                 .frame(
                     minWidth: Self.minimumWindowSize.width,
                     minHeight: Self.minimumWindowSize.height
@@ -442,7 +532,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window?.delegate = self
         } else if window?.contentView == nil {
             // 视图树之前已被释放，重新挂载
-            let contentView = ContentView()
+            let contentView = ContentView(
+                wallpaperViewModel: wallpaperViewModel,
+                mediaViewModel: mediaViewModel,
+                animeViewModel: animeViewModel
+            )
                 .frame(
                     minWidth: Self.minimumWindowSize.width,
                     minHeight: Self.minimumWindowSize.height
@@ -470,11 +564,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 NSApp.activate(ignoringOtherApps: true)
             }
         }
+        AppResponsivenessMonitor.noteWindowVisible(true)
+        AppResponsivenessMonitor.noteScenePhase("showMainWindow")
     }
 
     func hideMainWindow() {
         DynamicWallpaperAutoPauseManager.shared.suppressForegroundPauseForMainWindowHide()
         window?.orderOut(nil)
+        AppResponsivenessMonitor.noteWindowVisible(false)
+        AppResponsivenessMonitor.noteScenePhase("hideMainWindow")
 
         // 主窗口隐藏后尽快卸载前台视图树，后台只保留状态栏、动态壁纸、调度器和下载任务。
         delayedReleaseTask?.cancel()
@@ -492,6 +590,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard !Task.isCancelled else { return }
             guard let window = self.window, !window.isVisible else { return }
             self.releaseForegroundResourcesForHiddenWindow(window)
+
             self.delayedReleaseTask = nil
         }
     }
@@ -519,7 +618,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 await KazumiRuleLoader.shared.clearCache()
                 await AnimeRuleStore.shared.clearInMemoryCache()
                 await RuleLoader.shared.clearInMemoryCache()
-                await RuleRepository.shared.clearCache()
             }
             return
         }
@@ -537,6 +635,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func releaseForegroundResourcesForHiddenWindow(_ window: NSWindow) {
+        AppResponsivenessMonitor.noteScenePhase("releaseForegroundResources")
+        // 窗口隐藏时锁定所有加密文件夹
+        FolderLockService.shared.lockAllFolders()
+
         NotificationCenter.default.post(name: .appShouldReleaseForegroundMemory, object: nil)
         DisplaySelectorManager.shared.cancelForMemoryRelease()
         AnimeWindowManager.shared.closeAllWindowsForMemoryRelease()
@@ -603,6 +705,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // 只清理动态壁纸窗口，不回退到旧静态壁纸
         VideoWallpaperManager.shared.prepareForAppTermination()
+
+        // 通知系统托管的锁屏扩展释放自解码上下文，避免旧扩展进程常驻。
+        if #available(macOS 26.0, *) {
+            WallpaperExtensionSocketServer.shared.notifyAppWillTerminate()
+            WallpaperExtensionSocketServer.shared.clearDisplayVideos()
+            WallpaperExtensionSocketServer.shared.stop()
+        }
+
         WallpaperEngineXBridge.shared.prepareForAppTermination()
     }
 
@@ -667,6 +777,300 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.mainMenu = mainMenu
     }
 
+    @available(macOS 26.0, *)
+    private func repairWallpaperExtensionRegistration() {
+        // 第 1 步：在主线程捕获 Bundle 信息（macOS 26 后台访问 Bundle 会崩溃）
+        let appURL = Bundle.main.bundleURL
+        let extensionURL = appURL
+            .appendingPathComponent("Contents/PlugIns/WaifuXWallpaperExtension.appex", isDirectory: true)
+        let fm = FileManager.default
+
+        guard fm.fileExists(atPath: extensionURL.path) else {
+            print("[WaifuXApp] Wallpaper extension not found in current bundle: \(extensionURL.path)")
+            return
+        }
+
+        let currentAppURL = appURL.standardizedFileURL
+
+        // 第 2 步：Process 系统调用派发到后台，不阻塞主线程。
+        // 先清理旧注册，再注册当前正在运行的 App/appex，避免 WallpaperAgent 继续命中 Debug/临时构建产物。
+        DispatchQueue.global(qos: .utility).async { [appURL, extensionURL, currentAppURL] in
+            let staleCandidates = self.computeStaleWallpaperExtensionCandidates(
+                currentExtensionURL: extensionURL,
+                currentAppURL: currentAppURL
+            )
+
+            for candidate in staleCandidates {
+                self.runRegistrationTool("/usr/bin/pluginkit", arguments: ["-r", candidate.path], label: "pluginkit remove")
+                self.unregisterBundleWithLaunchServices(candidate)
+                if let hostAppURL = self.hostAppURL(forWallpaperExtensionURL: candidate) {
+                    self.unregisterBundleWithLaunchServices(hostAppURL)
+                }
+                print("[WaifuXApp] Removed stale wallpaper extension registration: \(candidate.path)")
+            }
+
+            self.registerBundleWithLaunchServices(appURL)
+            self.registerBundleWithPlugInKit(extensionURL)
+            print("[WaifuXApp] Registered current wallpaper extension: \(extensionURL.path)")
+
+            self.terminateStaleWallpaperExtensionProcessesByPID(currentAppURL: currentAppURL)
+
+            // NSWorkspace 必须在主线程
+            DispatchQueue.main.async {
+                self.terminateStaleWallpaperExtensionProcesses(currentAppURL: currentAppURL)
+            }
+        }
+    }
+
+    /// 计算需要清理的过期扩展列表。
+    /// 只读取当前进程表和 PlugInKit 登记项，避免启动时枚举 `/private/tmp` / build 大目录。
+    nonisolated private func computeStaleWallpaperExtensionCandidates(currentExtensionURL: URL, currentAppURL: URL) -> [URL] {
+        let candidates = wallpaperExtensionRegistrationCandidates(currentAppURL: currentAppURL)
+        return candidates.filter { candidate in
+            guard candidate.standardizedFileURL.path != currentExtensionURL.standardizedFileURL.path else {
+                return false
+            }
+            guard FileManager.default.fileExists(atPath: candidate.path) else {
+                return true
+            }
+            return isStaleWaifuXBuildPath(candidate)
+        }
+    }
+
+    nonisolated private func registerBundleWithLaunchServices(_ url: URL) {
+        let tool = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        guard FileManager.default.isExecutableFile(atPath: tool) else { return }
+        runRegistrationTool(tool, arguments: ["-f", url.path], label: "lsregister")
+    }
+
+    nonisolated private func registerBundleWithPlugInKit(_ url: URL) {
+        runRegistrationTool("/usr/bin/pluginkit", arguments: ["-a", url.path], label: "pluginkit add")
+    }
+
+    nonisolated private func wallpaperExtensionRegistrationCandidates(currentAppURL: URL) -> [URL] {
+        var result: [URL] = []
+        var seen = Set<String>()
+
+        func appendCandidate(_ url: URL) {
+            let standardized = url.standardizedFileURL
+            let path = standardized.path
+            guard seen.insert(path).inserted else { return }
+            guard wallpaperExtensionBundleID(at: standardized) == "com.waifux.app.wallpaperextension" else {
+                return
+            }
+            if !path.hasPrefix(currentAppURL.path + "/") {
+                result.append(standardized)
+            }
+        }
+
+        for url in runningWallpaperExtensionCandidates() {
+            appendCandidate(url)
+        }
+        for url in plugInKitWallpaperExtensionCandidates() {
+            appendCandidate(url)
+        }
+
+        return result
+    }
+
+    nonisolated private func runningWallpaperExtensionCandidates() -> [URL] {
+        let output = processOutput(
+            launchPath: "/bin/ps",
+            arguments: ["-axo", "command="]
+        )
+
+        var result: [URL] = []
+        var seen = Set<String>()
+        let executableSuffix = "/WaifuXWallpaperExtension.appex/Contents/MacOS/WaifuXWallpaperExtension"
+
+        for line in output.split(separator: "\n") {
+            let command = line.trimmingCharacters(in: .whitespaces)
+            guard let range = command.range(of: executableSuffix) else { continue }
+            let appexPath = String(command[..<range.upperBound])
+                .replacingOccurrences(of: "/Contents/MacOS/WaifuXWallpaperExtension", with: "")
+            guard seen.insert(appexPath).inserted else { continue }
+            result.append(URL(fileURLWithPath: appexPath, isDirectory: true))
+        }
+
+        return result
+    }
+
+    nonisolated private func plugInKitWallpaperExtensionCandidates() -> [URL] {
+        let output = processOutput(
+            launchPath: "/usr/bin/pluginkit",
+            arguments: ["-m", "-A", "-D", "-v", "-i", "com.waifux.app.wallpaperextension"]
+        )
+
+        var result: [URL] = []
+        var seen = Set<String>()
+
+        for line in output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let markerRange = trimmed.range(of: "/WaifuXWallpaperExtension.appex") else { continue }
+            let beforeMarker = trimmed[..<markerRange.lowerBound]
+            guard let slashIndex = beforeMarker.lastIndex(of: "/") else { continue }
+            let path = String(trimmed[slashIndex..<markerRange.upperBound])
+            guard seen.insert(path).inserted else { continue }
+            result.append(URL(fileURLWithPath: path, isDirectory: true))
+        }
+
+        return result
+    }
+
+    nonisolated private func unregisterBundleWithLaunchServices(_ url: URL) {
+        let tool = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        guard FileManager.default.isExecutableFile(atPath: tool) else { return }
+        runRegistrationTool(tool, arguments: ["-u", url.path], label: "lsregister unregister")
+    }
+
+    nonisolated private func hostAppURL(forWallpaperExtensionURL url: URL) -> URL? {
+        let plugInsURL = url.deletingLastPathComponent()
+        guard plugInsURL.lastPathComponent == "PlugIns" else { return nil }
+        let contentsURL = plugInsURL.deletingLastPathComponent()
+        guard contentsURL.lastPathComponent == "Contents" else { return nil }
+        let appURL = contentsURL.deletingLastPathComponent()
+        guard appURL.pathExtension == "app" else { return nil }
+        return appURL
+    }
+
+    nonisolated private func wallpaperExtensionBundleID(at url: URL) -> String? {
+        // ⚠️ 只能在后台线程调用，不能使用 Bundle(url:)（非线程安全）
+        let infoURL = url.appendingPathComponent("Contents/Info.plist")
+        return (NSDictionary(contentsOf: infoURL) as? [String: Any])?["CFBundleIdentifier"] as? String
+    }
+
+    nonisolated private func isStaleWaifuXBuildPath(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        if path.hasPrefix("/private/tmp/") {
+            return true
+        }
+        if path.contains("/Build/Products/Debug/") || path.contains("/Build/Products/Release/") {
+            return true
+        }
+        return false
+    }
+
+    private func terminateStaleWallpaperExtensionProcesses(currentAppURL: URL) {
+        let currentPrefix = currentAppURL.standardizedFileURL.path + "/"
+        // ⚠️ NSWorkspace 只能在主线程访问
+        let runningApps = if Thread.isMainThread {
+            NSWorkspace.shared.runningApplications
+        } else {
+            DispatchQueue.main.sync { NSWorkspace.shared.runningApplications }
+        }
+        let staleApps = runningApps.compactMap { app -> (app: NSRunningApplication, path: String)? in
+            guard app.bundleIdentifier == "com.waifux.app.wallpaperextension",
+                  let executableURL = app.executableURL?.standardizedFileURL,
+                  !executableURL.path.hasPrefix(currentPrefix) else {
+                return nil
+            }
+            return (app, executableURL.path)
+        }
+        for stale in staleApps {
+            let pid = stale.app.processIdentifier
+            let sentTerminate = stale.app.terminate()
+            let didExit = waitForProcessExit(pid: pid, timeout: 2.0)
+            if sentTerminate, didExit {
+                print("[WaifuXApp] Terminated stale wallpaper extension process: \(stale.path)")
+            } else if sentTerminate {
+                let forced = forceKillProcessIfNeeded(pid: pid, label: stale.path)
+                print("[WaifuXApp] Stale wallpaper extension required force kill: \(stale.path), forced=\(forced)")
+            } else {
+                let forced = forceKillProcessIfNeeded(pid: pid, label: stale.path)
+                print("[WaifuXApp] Failed to terminate stale wallpaper extension process gracefully: \(stale.path), forced=\(forced)")
+            }
+        }
+    }
+
+    nonisolated private func terminateStaleWallpaperExtensionProcessesByPID(currentAppURL: URL) {
+        let currentPrefix = currentAppURL.standardizedFileURL.path + "/"
+        let output = processOutput(
+            launchPath: "/bin/ps",
+            arguments: ["-axo", "pid=,command="]
+        )
+
+        for line in output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let firstSpace = trimmed.firstIndex(where: { $0 == " " || $0 == "\t" }) else { continue }
+
+            let pidText = trimmed[..<firstSpace].trimmingCharacters(in: .whitespaces)
+            let command = trimmed[firstSpace...].trimmingCharacters(in: .whitespaces)
+            guard let pid = Int32(pidText),
+                  command.contains("WaifuXWallpaperExtension.appex/Contents/MacOS/WaifuXWallpaperExtension"),
+                  !command.hasPrefix(currentPrefix) else {
+                continue
+            }
+
+            if kill(pid, SIGTERM) == 0 {
+                if waitForProcessExit(pid: pid, timeout: 2.0) {
+                    print("[WaifuXApp] Terminated stale wallpaper extension pid=\(pid): \(command)")
+                } else {
+                    let forced = forceKillProcessIfNeeded(pid: pid, label: command)
+                    print("[WaifuXApp] Stale wallpaper extension pid=\(pid) required force kill: forced=\(forced) command=\(command)")
+                }
+            } else {
+                print("[WaifuXApp] Failed to terminate stale wallpaper extension pid=\(pid): errno=\(errno)")
+            }
+        }
+    }
+
+    nonisolated private func waitForProcessExit(pid: pid_t, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while kill(pid, 0) == 0 && Date() < deadline {
+            usleep(100_000)
+        }
+        return kill(pid, 0) != 0
+    }
+
+    @discardableResult
+    nonisolated private func forceKillProcessIfNeeded(pid: pid_t, label: String) -> Bool {
+        guard kill(pid, 0) == 0 else { return true }
+        guard kill(pid, SIGKILL) == 0 else {
+            print("[WaifuXApp] Failed to SIGKILL stale wallpaper extension pid=\(pid): errno=\(errno) label=\(label)")
+            return false
+        }
+        let didExit = waitForProcessExit(pid: pid, timeout: 1.0)
+        if !didExit {
+            print("[WaifuXApp] SIGKILL sent but process still present pid=\(pid) label=\(label)")
+        }
+        return didExit
+    }
+
+    nonisolated private func runRegistrationTool(_ launchPath: String, arguments: [String], label: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 {
+                print("[WaifuXApp] \(label) exited with status \(process.terminationStatus): \(arguments.joined(separator: " "))")
+            }
+        } catch {
+            print("[WaifuXApp] \(label) failed: \(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private func processOutput(launchPath: String, arguments: [String]) -> String {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            print("[WaifuXApp] \(launchPath) failed: \(error.localizedDescription)")
+            return ""
+        }
+    }
+
     private func updateActivationPolicy(showDockIcon: Bool) {
         let desiredPolicy: NSApplication.ActivationPolicy = showDockIcon ? .regular : .accessory
         if NSApp.activationPolicy() != desiredPolicy {
@@ -722,6 +1126,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settingsWindow.isReleasedWhenClosed = false
         centerWindow(settingsWindow, relativeTo: window)
         settingsWindow.tabbingMode = .disallowed
+        // 设置窗口复用 AppDelegate 作为 delegate，windowShouldClose 据此区分处理
+        settingsWindow.delegate = self
 
         settingsWindow.contentView = EdgeToEdgeHostingView(
             rootView: SettingsView(viewModel: settingsViewModel!)
@@ -754,9 +1160,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 // MARK: - NSWindowDelegate
 extension AppDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        // 点击关闭按钮时隐藏窗口而不是退出
+        // 设置窗口：有待应用的模块改动时弹三选项确认（立即重启/稍后/放弃更改）
+        if sender === settingsWindowController?.window {
+            return handleSettingsWindowClose(sender)
+        }
+        // 主窗口：点击关闭按钮时锁定所有加密文件夹并隐藏窗口
+        FolderLockService.shared.lockAllFolders()
         hideMainWindow()
         return false
+    }
+
+    /// 处理设置窗口关闭：若有待应用的模块开关改动，弹三选项确认。
+    /// - 立即重启 → AppRelauncher.relaunch()
+    /// - 稍后 → 允许关闭，保留 UserDefaults 改动（下次启动生效）
+    /// - 放弃更改 → 回滚三标志到启动快照值后关闭
+    @MainActor
+    private func handleSettingsWindowClose(_ window: NSWindow) -> Bool {
+        guard let vm = settingsViewModel, vm.hasPendingModuleChanges else {
+            // 无待应用改动，正常关闭
+            settingsWindowController = nil
+            return true
+        }
+        let alert = NSAlert()
+        alert.messageText = t("settings.modules.closePending.title")
+        alert.informativeText = t("settings.modules.closePending.message")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: t("settings.modules.restartNow"))
+        alert.addButton(withTitle: t("settings.modules.closePending.later"))
+        alert.addButton(withTitle: t("settings.modules.closePending.discard"))
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            // 立即重启
+            AppRelauncher.relaunch()
+            return false // 不关闭，等 terminate
+        case .alertSecondButtonReturn:
+            // 稍后：保留改动，关闭窗口
+            settingsWindowController = nil
+            return true
+        default:
+            // 放弃更改：回滚后关闭
+            vm.discardPendingModuleChanges()
+            settingsWindowController = nil
+            return true
+        }
     }
 }
 
@@ -794,6 +1241,19 @@ struct AutoUpdateSheet: View {
     let release: GitHubRelease
     let commit: GitHubCommit?
     let onClose: () -> Void
+
+    // release.body 为空时按需加载 commit 作为更新说明 fallback
+    @State private var loadedCommit: GitHubCommit?
+    @State private var isLoadingCommit: Bool = false
+
+    private var needsCommitFallback: Bool {
+        guard let body = release.body, !body.isEmpty else { return true }
+        return false
+    }
+
+    private var displayCommit: GitHubCommit? {
+        commit ?? loadedCommit
+    }
 
     var body: some View {
         // 半透明遮罩
@@ -854,29 +1314,56 @@ struct AutoUpdateSheet: View {
                     }
 
                     // 更新内容
-                    if let commit = commit {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(t("updateContent"))
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.45))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(t("updateContent"))
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.45))
 
-                            Text(commit.shortMessage)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.88))
-                                .lineLimit(3)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                        ScrollView(.vertical, showsIndicators: true) {
+                            VStack(alignment: .leading, spacing: 0) {
+                                if let body = release.body, !body.isEmpty {
+                                    formattedReleaseNotes(body)
+                                } else if let commit = displayCommit {
+                                    Text(commit.fullMessage)
+                                        .font(.system(size: 12, weight: .regular))
+                                        .foregroundStyle(.white.opacity(0.85))
+                                        .textSelection(.enabled)
 
-                            Text(commit.shortSHA)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.white.opacity(0.35))
+                                    Text(commit.shortSHA)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(.white.opacity(0.35))
+                                        .padding(.top, 4)
+                                } else if isLoadingCommit {
+                                    HStack(spacing: 6) {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text(t("loading"))
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.white.opacity(0.5))
+                                    }
+                                } else {
+                                    Text(t("noReleaseNotes"))
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.5))
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .padding(12)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(.white.opacity(0.04))
-                        )
+                        .frame(maxHeight: 280)
+                        .task {
+                            // release.body 为空且无可用 commit 时，按需拉取（避免每次检查更新都消耗配额）
+                            guard needsCommitFallback, displayCommit == nil, !isLoadingCommit else { return }
+                            isLoadingCommit = true
+                            loadedCommit = await updateChecker.fetchCommitIfNeeded(for: release)
+                            isLoadingCommit = false
+                        }
                     }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(.white.opacity(0.04))
+                    )
 
                     // 下载进度
                     if updateManager.state.isDownloading || updateManager.state.isInstalling {
@@ -970,7 +1457,7 @@ struct AutoUpdateSheet: View {
                     }
                 }
                 .padding(24)
-                .frame(width: 360, height: 440)
+                .frame(width: 360, height: 500)
                 .background(
                     DarkLiquidGlassBackground(
                         cornerRadius: 20,
@@ -979,6 +1466,120 @@ struct AutoUpdateSheet: View {
                 )
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
             }
+    }
+
+    // MARK: - 格式化 Release Notes
+
+    @ViewBuilder
+    private func formattedReleaseNotes(_ text: String) -> some View {
+        let lines = text.components(separatedBy: .newlines)
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty {
+                    // 空行作为段落分隔
+                    Spacer().frame(height: 6)
+                } else if trimmed.hasPrefix("## ") {
+                    // 二级标题
+                    Text(String(trimmed.dropFirst(3)))
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.95))
+                        .padding(.top, 4)
+                } else if trimmed.hasPrefix("# ") {
+                    // 一级标题
+                    Text(String(trimmed.dropFirst(2)))
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.95))
+                        .padding(.top, 6)
+                } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+                    // 列表项
+                    HStack(alignment: .top, spacing: 6) {
+                        Text("•")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.white.opacity(0.5))
+                            .frame(width: 10)
+                        Text(String(trimmed.dropFirst(2)))
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .textSelection(.enabled)
+                    }
+                } else if trimmed.range(of: #"^\d+\.\s"#, options: .regularExpression) != nil {
+                    // 有序列表
+                    let parts = trimmed.split(separator: " ", maxSplits: 1)
+                    if parts.count >= 2 {
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(String(parts[0]))
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.white.opacity(0.5))
+                                .frame(width: 16, alignment: .trailing)
+                            Text(String(parts[1]))
+                                .font(.system(size: 12, weight: .regular))
+                                .foregroundStyle(.white.opacity(0.85))
+                                .textSelection(.enabled)
+                        }
+                    } else {
+                        normalText(trimmed)
+                    }
+                } else if trimmed.hasPrefix("> ") {
+                    // 引用
+                    HStack(spacing: 0) {
+                        Rectangle()
+                            .fill(Color.accentColor.opacity(0.5))
+                            .frame(width: 3)
+                            .padding(.trailing, 8)
+                        Text(String(trimmed.dropFirst(2)))
+                            .font(.system(size: 12, weight: .regular, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .italic()
+                            .textSelection(.enabled)
+                    }
+                    .padding(.vertical, 2)
+                } else if trimmed.hasPrefix("```") {
+                    // 代码块标记，跳过
+                    EmptyView()
+                } else {
+                    normalText(trimmed)
+                }
+            }
+        }
+    }
+
+    private func normalText(_ text: String) -> some View {
+        Text(parseInlineMarkdown(text))
+            .font(.system(size: 12, weight: .regular))
+            .foregroundStyle(.white.opacity(0.85))
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    // MARK: - 内联 Markdown 解析
+
+    private func parseInlineMarkdown(_ text: String) -> AttributedString {
+        var result = AttributedString(text)
+
+        // 粗体 **text** 或 __text__
+        while let boldRange = result.range(of: #"\*\*(.+?)\*\*|__(.+?)__"#, options: .regularExpression) {
+            let matched = String(result[boldRange].characters)
+            let inner = matched.replacingOccurrences(of: "**", with: "")
+                                .replacingOccurrences(of: "__", with: "")
+            var replacement = AttributedString(inner)
+            replacement.font = .system(size: 12, weight: .bold)
+            replacement.foregroundColor = .white.opacity(0.95)
+            result.replaceSubrange(boldRange, with: replacement)
+        }
+
+        // 行内代码 `code`
+        while let codeRange = result.range(of: #"`([^`]+)`"#, options: .regularExpression) {
+            let matched = String(result[codeRange].characters)
+            let inner = matched.replacingOccurrences(of: "`", with: "")
+            var replacement = AttributedString(inner)
+            replacement.font = .system(size: 11, weight: .medium, design: .monospaced)
+            replacement.foregroundColor = Color.accentColor.opacity(0.9)
+            replacement.backgroundColor = .white.opacity(0.06)
+            result.replaceSubrange(codeRange, with: replacement)
+        }
+
+        return result
     }
 
     // MARK: - 辅助属性

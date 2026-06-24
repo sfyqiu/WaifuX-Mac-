@@ -132,6 +132,9 @@ final class StatusBarController: NSObject {
     private lazy var toggleWallpaperItem = NSMenuItem(title: t("statusbar.enableWallpaper"), action: #selector(toggleDynamicWallpaper), keyEquivalent: "")
     private lazy var playPauseItem = NSMenuItem(title: t("statusbar.pauseWallpaper"), action: #selector(togglePlayback), keyEquivalent: "")
     private lazy var muteItem = NSMenuItem(title: t("statusbar.muteWallpaper"), action: #selector(toggleMute), keyEquivalent: "")
+    private lazy var desktopIconsItem = NSMenuItem(title: t("statusbar.hideDesktopIcons"), action: #selector(toggleDesktopIcons), keyEquivalent: "")
+    private lazy var designWallpaperItem = NSMenuItem(title: "设计壁纸", action: #selector(openWebWallpaperDesignPanel), keyEquivalent: "")
+    private lazy var sceneConfigItem = NSMenuItem(title: "场景高级设置", action: #selector(openSceneConfigPanel), keyEquivalent: "")
     private lazy var quitItem = NSMenuItem(title: t("statusbar.quit"), action: #selector(quitApplication), keyEquivalent: "q")
 
     private let videoWallpaperManager = VideoWallpaperManager.shared
@@ -203,12 +206,18 @@ final class StatusBarController: NSObject {
         openLibraryItem.target = self
         releaseMemoryItem.target = self
         muteItem.target = self
+        desktopIconsItem.target = self
+        designWallpaperItem.target = self
+        sceneConfigItem.target = self
         quitItem.target = self
 
         menu.addItem(openWindowItem)
         menu.addItem(openLibraryItem)
         menu.addItem(releaseMemoryItem)
         menu.addItem(.separator())
+        menu.addItem(desktopIconsItem)
+        menu.addItem(designWallpaperItem)
+        menu.addItem(sceneConfigItem)
         // toggleWallpaperItem 和 playPauseItem 在 refreshMenuState 中动态构建
         menu.addItem(muteItem)
         menu.addItem(.separator())
@@ -245,6 +254,9 @@ final class StatusBarController: NSObject {
             guard let self = self else { return }
             // 只设该屏幕的音量，不触及其他屏幕，也不动全局静音
             self.videoWallpaperManager.setVolume(volume, for: screen)
+            if self.weBridge.isControllingExternalEngine {
+                self.weBridge.setVolume(volume, for: screen)
+            }
         }
         let item = NSMenuItem()
         item.view = controlView
@@ -258,6 +270,38 @@ final class StatusBarController: NSObject {
         let hasNativeWallpaper = videoWallpaperManager.isVideoWallpaperActive
         let hasExternalWallpaper = weBridge.isControllingExternalEngine
         let hasWallpaper = hasNativeWallpaper || hasExternalWallpaper
+        let shouldShowDesignWallpaperItem: Bool
+        if let sceneWallpaperPath = currentSceneDesignWallpaperPath() {
+            shouldShowDesignWallpaperItem = true
+            designWallpaperItem.representedObject = sceneWallpaperPath
+        } else if let wallpaperPath = weBridge.currentWallpaperPathForDesign {
+            if weBridge.isCurrentWallpaperWeb {
+                shouldShowDesignWallpaperItem = WebWallpaperDesignService.shared.hasEditableProperties(for: wallpaperPath)
+                designWallpaperItem.representedObject = wallpaperPath
+            } else if weBridge.isCurrentWallpaperScene {
+                shouldShowDesignWallpaperItem = true
+                designWallpaperItem.representedObject = wallpaperPath
+            } else {
+                shouldShowDesignWallpaperItem = false
+                designWallpaperItem.representedObject = nil
+            }
+        } else {
+            shouldShowDesignWallpaperItem = false
+            designWallpaperItem.representedObject = nil
+        }
+        designWallpaperItem.isHidden = !shouldShowDesignWallpaperItem
+        designWallpaperItem.isEnabled = shouldShowDesignWallpaperItem
+
+        // 场景高级设置（仅在实时渲染场景壁纸时显示）
+        let shouldShowSceneConfig = weBridge.isCurrentWallpaperScene
+            && UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
+        sceneConfigItem.isHidden = !shouldShowSceneConfig
+        sceneConfigItem.isEnabled = shouldShowSceneConfig
+        if shouldShowSceneConfig, let path = weBridge.currentWallpaperPathForDesign {
+            sceneConfigItem.representedObject = path
+        } else {
+            sceneConfigItem.representedObject = nil
+        }
 
         // 移除旧的动态菜单项
         for item in wallpaperControlItems {
@@ -267,65 +311,170 @@ final class StatusBarController: NSObject {
         }
         wallpaperControlItems.removeAll()
 
-        // 构建各屏幕独立的暂停/关闭/音量菜单项
+        // 构建各屏幕独立的暂停/关闭/音量 + 可视区域调节，收进「显示器」父菜单。
         let activeScreens = videoWallpaperManager.activeScreens
-        let isMultiScreenNative = activeScreens.count > 1
 
-        if isMultiScreenNative {
-            // 多显示器：每屏独立控制组 → [暂停] [关闭壁纸] [音量滑块] 为一组，按显示器顺序排列
-            for screen in activeScreens {
-                let screenName = screen.localizedName
-                let isScreenPaused = videoWallpaperManager.isPaused(on: screen)
-
-                let pauseItem = NSMenuItem(
-                    title: isScreenPaused
-                        ? "\(t("statusbar.resumeWallpaper")) (\(screenName))"
-                        : "\(t("statusbar.pauseWallpaper")) (\(screenName))",
-                    action: #selector(perScreenTogglePlayback(_:)),
-                    keyEquivalent: ""
-                )
-                pauseItem.target = self
-                pauseItem.representedObject = screen
-                wallpaperControlItems.append(pauseItem)
-
-                let disableItem = NSMenuItem(
-                    title: "\(t("statusbar.disableWallpaper")) (\(screenName))",
-                    action: #selector(perScreenToggleDynamicWallpaper(_:)),
-                    keyEquivalent: ""
-                )
-                disableItem.target = self
-                disableItem.representedObject = screen
-                wallpaperControlItems.append(disableItem)
-
-                // 该显示器的音量滑块紧随其后（同一显示器内）
-                if hasNativeWallpaper {
-                    wallpaperControlItems.append(buildVolumeMenuItem(for: screen))
-                }
-            }
+        // macOS 26+：扩展控制模式下，activeScreens 为空但壁纸仍活跃
+        // 使用所有屏幕 + per-display prefs 来构建控件
+        let isExtensionMode: Bool
+        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
+            isExtensionMode = true
         } else {
-            // 单显示器：保持原有简洁菜单
-            toggleWallpaperItem.title = hasWallpaper ? t("statusbar.disableWallpaper") : t("statusbar.enableWallpaper")
-            toggleWallpaperItem.target = self
-            wallpaperControlItems.append(toggleWallpaperItem)
-
-            playPauseItem.isEnabled = hasWallpaper
-            playPauseItem.title = (hasExternalWallpaper ? weBridge.isExternalPaused : videoWallpaperManager.isPaused)
-                ? t("statusbar.resumeWallpaper")
-                : t("statusbar.pauseWallpaper")
-            playPauseItem.target = self
-            wallpaperControlItems.append(playPauseItem)
-
-            // 单屏音量滑块也跟在控制项后面，而不是放到 mute 下面
-            if hasNativeWallpaper, let screen = activeScreens.first ?? NSScreen.screens.first {
-                wallpaperControlItems.append(buildVolumeMenuItem(for: screen))
-            }
+            isExtensionMode = false
         }
 
-        // 将动态菜单项插入到 muteItem 之前（separator 之后）
-        // 注意：每个显示器的音量滑块必须紧跟在该显示器的暂停/关闭项后面
+        let screensToShow: [NSScreen]
+        if isExtensionMode {
+            screensToShow = NSScreen.screens
+        } else if hasExternalWallpaper {
+            let nativeScreenIDs = Set(activeScreens.map(\.wallpaperScreenIdentifier))
+            screensToShow = NSScreen.screens.filter { screen in
+                nativeScreenIDs.contains(screen.wallpaperScreenIdentifier) || weBridge.isManaging(screen: screen)
+            }
+        } else {
+            screensToShow = activeScreens
+        }
+
+        // 兜底：没有任何活跃屏时，至少展示主屏（保证「显示器」菜单始终可见，单屏也显示）。
+        let displayScreens = screensToShow.isEmpty
+            ? (NSScreen.screens.isEmpty ? [] : [NSScreen.screens[0]])
+            : screensToShow
+
+        // 每屏一个顶层子菜单（多屏直接平铺，无外层「显示器」包裹）
+        let hasWallpaperOnAnyScreen = hasWallpaper || hasNativeWallpaper || hasExternalWallpaper
+
+        for screen in displayScreens {
+            let screenName = screen.localizedName
+
+            // 该屏是否有壁纸（决定控件是否启用）
+            let screenHasWallpaper: Bool
+            if isExtensionMode {
+                screenHasWallpaper = hasWallpaperOnAnyScreen
+            } else if weBridge.isManaging(screen: screen) {
+                screenHasWallpaper = true
+            } else {
+                screenHasWallpaper = videoWallpaperManager.hasActiveWallpaper(on: screen)
+            }
+
+            // 该屏壁纸是否为 web（web 暂不支持可视区域调节）
+            let isWebWallpaper = weBridge.isWebWallpaperOn(screen: screen)
+
+            // 该屏壁纸是否为静态图片（静态壁纸渲染走系统 setDesktopImageURL 或
+            // StaticImageWallpaperOverlayManager，二者均未消费 DisplayCropSettings，
+            // 暂不支持可视区域调节）。扩展模式 / web 由其它分支独立处理。
+            let isStaticWallpaper: Bool = {
+                if isExtensionMode { return false }
+                if isWebWallpaper { return false }
+                if weBridge.isManaging(screen: screen) { return false }
+                return !videoWallpaperManager.hasActiveWallpaper(on: screen)
+            }()
+
+            // 暂停状态
+            let isScreenPaused: Bool
+            if isExtensionMode, #available(macOS 26.0, *),
+               let displayID = Self.cgDisplayID(for: screen) {
+                isScreenPaused = LockScreenWallpaperService.shared.isDisplayPaused(displayID)
+            } else if weBridge.isManaging(screen: screen) {
+                isScreenPaused = weBridge.isExternalPaused
+            } else {
+                isScreenPaused = videoWallpaperManager.isPaused(on: screen)
+            }
+
+            let screenMenuItem = NSMenuItem(title: screenName, action: nil, keyEquivalent: "")
+            let screenSubMenu = NSMenu(title: screenName)
+            screenMenuItem.submenu = screenSubMenu
+
+            // 暂停 / 继续
+            let pauseItem = NSMenuItem(
+                title: isScreenPaused ? t("statusbar.resumeWallpaper") : t("statusbar.pauseWallpaper"),
+                action: #selector(perScreenTogglePlayback(_:)),
+                keyEquivalent: "")
+            pauseItem.target = self
+            pauseItem.representedObject = screen
+            pauseItem.isEnabled = screenHasWallpaper
+            screenSubMenu.addItem(pauseItem)
+
+            // 关闭
+            let disableItem = NSMenuItem(
+                title: t("statusbar.disableWallpaper"),
+                action: #selector(perScreenToggleDynamicWallpaper(_:)),
+                keyEquivalent: "")
+            disableItem.target = self
+            disableItem.representedObject = screen
+            disableItem.isEnabled = screenHasWallpaper
+            screenSubMenu.addItem(disableItem)
+
+            // 音量（扩展模式跳过，与原逻辑一致）
+            if !isExtensionMode {
+                screenSubMenu.addItem(buildVolumeMenuItem(for: screen))
+            }
+
+            screenSubMenu.addItem(.separator())
+
+            // 可视区域调节…
+            let isAdjusting = CropAdjustOverlayController.shared.isActive(for: screen)
+            let cropAdjustItem = NSMenuItem(
+                title: isAdjusting ? t("statusbar.cropExit") : t("statusbar.cropAdjust"),
+                action: #selector(toggleCropAdjustment(_:)),
+                keyEquivalent: "")
+            cropAdjustItem.target = self
+            cropAdjustItem.representedObject = screen
+            if isWebWallpaper {
+                cropAdjustItem.isEnabled = false
+                cropAdjustItem.toolTip = t("statusbar.cropUnsupported")
+            } else if isStaticWallpaper {
+                cropAdjustItem.isEnabled = false
+                cropAdjustItem.toolTip = t("statusbar.cropStaticUnsupported")
+            }
+            screenSubMenu.addItem(cropAdjustItem)
+
+            // 比例子菜单
+            let aspectItem = NSMenuItem(title: t("statusbar.cropAspect"), action: nil, keyEquivalent: "")
+            let aspectMenu = NSMenu(title: t("statusbar.cropAspect"))
+            let currentSettings = DisplayCropSettingsStore.shared.settings(for: screen)
+            for preset in AspectPreset.allCases {
+                let title = preset == .autoFill ? t("statusbar.cropAspectAutoFill")
+                    : preset == .custom ? t("statusbar.cropAspectCustom")
+                    : preset.displayName()
+                let item = NSMenuItem(title: title, action: #selector(setCropAspect(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = CropAspectPayload(screen: screen, preset: preset)
+                item.state = (currentSettings.aspectPreset == preset) ? .on : .off
+                if isWebWallpaper || isStaticWallpaper { item.isEnabled = false }
+                aspectMenu.addItem(item)
+            }
+            aspectItem.submenu = aspectMenu
+            if isWebWallpaper {
+                aspectItem.isEnabled = false
+                aspectItem.toolTip = t("statusbar.cropUnsupported")
+            } else if isStaticWallpaper {
+                aspectItem.isEnabled = false
+                aspectItem.toolTip = t("statusbar.cropStaticUnsupported")
+            }
+            screenSubMenu.addItem(aspectItem)
+
+            // 重置
+            let resetItem = NSMenuItem(
+                title: t("statusbar.cropReset"),
+                action: #selector(resetCrop(_:)),
+                keyEquivalent: "")
+            resetItem.target = self
+            resetItem.representedObject = screen
+            if isWebWallpaper {
+                resetItem.isEnabled = false
+                resetItem.toolTip = t("statusbar.cropUnsupported")
+            } else if isStaticWallpaper {
+                resetItem.isEnabled = false
+                resetItem.toolTip = t("statusbar.cropStaticUnsupported")
+            }
+            screenSubMenu.addItem(resetItem)
+
+            wallpaperControlItems.append(screenMenuItem)
+        }
+
+        // 将动态菜单项（每屏一个顶层子菜单）插入到 muteItem 之前
         let separatorIndex = menu.index(of: muteItem)
         if separatorIndex != -1 {
-            // 每次插入后重新获取 muteItem 的位置，确保后续项紧跟在前一项后面
             var currentInsertIndex = separatorIndex
             for item in wallpaperControlItems {
                 menu.insertItem(item, at: currentInsertIndex)
@@ -333,8 +482,13 @@ final class StatusBarController: NSObject {
             }
         }
 
+        // 桌面图标开关
+        desktopIconsItem.title = DesktopIconManager.shared.areDesktopIconsHidden
+            ? t("statusbar.showDesktopIcons")
+            : t("statusbar.hideDesktopIcons")
+
         // 全局静音开关
-        muteItem.isEnabled = hasNativeWallpaper
+        muteItem.isEnabled = hasNativeWallpaper || hasExternalWallpaper
         muteItem.title = videoWallpaperManager.isMuted ? t("statusbar.unmuteWallpaper") : t("statusbar.muteWallpaper")
     }
 
@@ -353,6 +507,34 @@ final class StatusBarController: NSObject {
         releaseMemoryHandler?()
     }
 
+    // MARK: - 可视区域调节 (Crop)
+
+    /// 比例菜单项携带的载荷。
+    private struct CropAspectPayload {
+        let screen: NSScreen
+        let preset: AspectPreset
+    }
+
+    @objc private func toggleCropAdjustment(_ sender: NSMenuItem) {
+        guard let screen = sender.representedObject as? NSScreen else { return }
+        CropAdjustOverlayController.shared.toggle(for: screen, statusBarItemRef: statusItem)
+        refreshMenuState()
+    }
+
+    @objc private func setCropAspect(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? CropAspectPayload else { return }
+        DisplayCropSettingsStore.shared.update(for: payload.screen) { s in
+            s.aspectPreset = payload.preset
+        }
+        refreshMenuState()
+    }
+
+    @objc private func resetCrop(_ sender: NSMenuItem) {
+        guard let screen = sender.representedObject as? NSScreen else { return }
+        DisplayCropSettingsStore.shared.reset(for: screen)
+        refreshMenuState()
+    }
+
     @objc private func perScreenTogglePlayback(_ sender: NSMenuItem) {
         guard let screen = sender.representedObject as? NSScreen else {
             togglePlayback()
@@ -365,6 +547,15 @@ final class StatusBarController: NSObject {
                 weBridge.resumeWallpaper()
             } else {
                 weBridge.pauseWallpaper()
+            }
+            return
+        }
+
+        // macOS 26+：扩展控制模式下通过共享 prefs 控制 per-display 暂停
+        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
+            if let displayID = Self.cgDisplayID(for: screen) {
+                let isPaused = LockScreenWallpaperService.shared.isDisplayPaused(displayID)
+                LockScreenWallpaperService.shared.setDisplayPaused(!isPaused, forDisplayID: displayID)
             }
             return
         }
@@ -384,8 +575,16 @@ final class StatusBarController: NSObject {
         }
 
         if weBridge.isControllingExternalEngine {
-            // 关闭外部引擎壁纸（全局）
-            weBridge.stopWallpaper()
+            // 关闭外部引擎壁纸（单屏）
+            weBridge.ensureStoppedForNonCLIWallpaper(for: screen)
+            // 对称关闭该屏静态图 overlay
+            StaticImageWallpaperOverlayManager.shared.hide(for: screen)
+            return
+        }
+
+        // macOS 26+：扩展控制模式下停止单屏视频
+        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
+            videoWallpaperManager.stopWallpaper(for: screen)
             return
         }
 
@@ -403,6 +602,13 @@ final class StatusBarController: NSObject {
             } else {
                 weBridge.pauseWallpaper()
             }
+            return
+        }
+
+        // macOS 26+：扩展控制模式下全局暂停/恢复
+        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
+            LockScreenWallpaperService.shared.setPaused(!videoWallpaperManager.isPaused)
+            videoWallpaperManager.toggleExtensionGlobalPause()
             return
         }
 
@@ -436,8 +642,14 @@ final class StatusBarController: NSObject {
 
     @objc private func toggleDynamicWallpaper() {
         if weBridge.isControllingExternalEngine {
-            // 关闭外部引擎壁纸
-            weBridge.stopWallpaper()
+            // 关闭外部引擎壁纸，但保留恢复记录，便于再次点击开启
+            weBridge.disableWallpaperKeepingRestoreState()
+            return
+        }
+
+        // macOS 26+：扩展控制模式下停止所有壁纸
+        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
+            videoWallpaperManager.stopWallpaper()
             return
         }
 
@@ -445,23 +657,116 @@ final class StatusBarController: NSObject {
             // 关闭动态壁纸
             videoWallpaperManager.stopWallpaper()
         } else {
-            // 先尝试恢复上次保存的壁纸，没有则打开主窗口让用户选择
-            videoWallpaperManager.restoreIfNeeded()
-            if !videoWallpaperManager.isVideoWallpaperActive {
-                Task { await weBridge.restoreIfNeeded() }
-                if !weBridge.isControllingExternalEngine {
-                    showWindowHandler?()
+            // 优先恢复实时渲染壁纸（WE 状态存在时跳过视频恢复，避免视频壁纸遗留状态抢占 WE 恢复机会）
+            if weBridge.hasPersistedRestoreState() {
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.weBridge.restoreIfNeeded()
+                    if !self.weBridge.isControllingExternalEngine {
+                        self.showWindowHandler?()
+                    }
+                }
+            } else {
+                videoWallpaperManager.restoreIfNeeded()
+                if !videoWallpaperManager.isVideoWallpaperActive {
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.weBridge.restoreIfNeeded()
+                        if !self.weBridge.isControllingExternalEngine {
+                            self.showWindowHandler?()
+                        }
+                    }
+                }
+                // 动态壁纸均无可恢复状态时，尝试恢复静态图 overlay（sync 关闭场景）
+                if !videoWallpaperManager.isVideoWallpaperActive
+                    && !weBridge.hasPersistedRestoreState() {
+                    StaticImageWallpaperOverlayManager.shared.restoreIfNeeded()
                 }
             }
         }
     }
 
     @objc private func toggleMute() {
-        videoWallpaperManager.setMuted(!videoWallpaperManager.isMuted)
+        // macOS 26+：扩展模式下静音对所有显示器生效（扩展不播放音频，但记录状态）
+        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
+            let newMuted = !videoWallpaperManager.isMuted
+            videoWallpaperManager.setMuted(newMuted)
+            // 同步到所有活跃显示器的 prefs
+            for screen in NSScreen.screens {
+                if let displayID = Self.cgDisplayID(for: screen) {
+                    LockScreenWallpaperService.shared.setDisplayMuted(newMuted, forDisplayID: displayID)
+                }
+            }
+            return
+        }
+
+        let newMuted = !videoWallpaperManager.isMuted
+        videoWallpaperManager.setMuted(newMuted)
+        if weBridge.isControllingExternalEngine {
+            weBridge.setMuted(newMuted)
+        }
+    }
+
+    @objc private func toggleDesktopIcons() {
+        DesktopIconManager.shared.toggle()
+        refreshMenuState()
+    }
+
+    @objc private func openSceneConfigPanel() {
+        guard let wallpaperPath = sceneConfigItem.representedObject as? String ?? weBridge.currentWallpaperPathForDesign else {
+            NSSound.beep()
+            return
+        }
+        SceneConfigOverridePanelController.shared.present(for: wallpaperPath)
+    }
+
+    @objc private func openWebWallpaperDesignPanel() {
+        if let sceneWallpaperPath = currentSceneDesignWallpaperPath() {
+            SceneWallpaperDesignPanelController.shared.present(for: sceneWallpaperPath)
+            return
+        }
+
+        guard let wallpaperPath = weBridge.currentWallpaperPathForDesign else {
+            NSSound.beep()
+            return
+        }
+        if weBridge.isCurrentWallpaperWeb {
+            WebWallpaperDesignPanelController.shared.present(for: wallpaperPath)
+            return
+        }
+        if weBridge.isCurrentWallpaperScene {
+            // 实时渲染模式下，显示属性编辑面板；否则显示文本设计面板
+            if UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") {
+                SceneWallpaperPropertiesPanelController.shared.present(for: wallpaperPath)
+            } else {
+                SceneWallpaperDesignPanelController.shared.present(for: wallpaperPath)
+            }
+            return
+        }
+        NSSound.beep()
+    }
+
+    private func currentSceneDesignWallpaperPath() -> String? {
+        guard let videoURL = videoWallpaperManager.currentVideoURL,
+              let info = WallpaperDynamicTextParser.loadSidecar(for: videoURL),
+              info.hasDynamicText,
+              let wallpaperPath = info.wallpaperPath,
+              !wallpaperPath.isEmpty else {
+            return nil
+        }
+        return wallpaperPath
     }
 
     @objc private func quitApplication() {
         quitHandler?()
+    }
+
+    /// 从 NSScreen 获取 CGDirectDisplayID（用于 per-display prefs 的 key）
+    private static func cgDisplayID(for screen: NSScreen) -> UInt32? {
+        guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+        return screenNumber.uint32Value
     }
 }
 

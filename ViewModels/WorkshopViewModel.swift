@@ -6,9 +6,9 @@ import Combine
 /// 管理 Wallpaper Engine Workshop 页面的状态和逻辑
 @MainActor
 class WorkshopViewModel: ObservableObject {
-    
+
     // MARK: - Published State
-    
+
     @Published var wallpapers: [WorkshopWallpaper] = []
     @Published var isLoading = false
     @Published var isLoadingMore = false
@@ -16,16 +16,14 @@ class WorkshopViewModel: ObservableObject {
     @Published var hasMorePages = false
     @Published var searchQuery = ""
     @Published var selectedSort: WorkshopSearchParams.SortOption = .ranked
-    
+
     // MARK: - Services
-    
+
     private let workshopService = WorkshopService.shared
     private var cancellables = Set<AnyCancellable>()
-    
+
     // MARK: - Internal State
 
-    /// 内存保护：列表缓存上限，超出上限时丢弃最旧条目。
-    private static let maxCachedItems = 300
     private var currentPage = 1
     private let pageSize = 20
     private var currentSearchTask: Task<Void, Never>?
@@ -54,22 +52,22 @@ class WorkshopViewModel: ObservableObject {
             }
             .store(in: &cancellables)
     }
-    
+
     // MARK: - Public API
-    
+
     /// 搜索壁纸
     func search(query: String? = nil) async {
         currentSearchTask?.cancel()
-        
+
         let searchQuery = query ?? searchQuery
-        
+
         await MainActor.run {
             isLoading = true
             errorMessage = nil
             wallpapers = []
             currentPage = 1
         }
-        
+
         let params = WorkshopSearchParams(
             query: searchQuery,
             sortBy: selectedSort,
@@ -77,7 +75,7 @@ class WorkshopViewModel: ObservableObject {
             pageSize: pageSize,
             contentLevel: WorkshopSourceManager.WorkshopContentLevel.everyone.rawValue
         )
-        
+
         do {
             let response = try await workshopService.search(params: params)
             await MainActor.run {
@@ -92,15 +90,15 @@ class WorkshopViewModel: ObservableObject {
             }
         }
     }
-    
+
     /// 加载更多
     func loadMore() async {
         guard hasMorePages, !isLoadingMore else { return }
-        
+
         await MainActor.run {
             isLoadingMore = true
         }
-        
+
         let params = WorkshopSearchParams(
             query: searchQuery,
             sortBy: selectedSort,
@@ -108,7 +106,7 @@ class WorkshopViewModel: ObservableObject {
             pageSize: pageSize,
             contentLevel: WorkshopSourceManager.WorkshopContentLevel.everyone.rawValue
         )
-        
+
         do {
             let response = try await workshopService.search(params: params)
             await MainActor.run {
@@ -124,26 +122,26 @@ class WorkshopViewModel: ObservableObject {
             }
         }
     }
-    
+
     /// 重置并加载
     func resetAndLoad() {
         wallpapers = []
         currentPage = 1
         hasMorePages = false
         errorMessage = nil
-        
+
         Task {
             await search()
         }
     }
-    
+
     /// 刷新当前搜索
     func refresh() async {
         await search()
     }
-    
+
     // MARK: - Sorting
-    
+
     func setSortOption(_ option: WorkshopSearchParams.SortOption) {
         guard selectedSort != option else { return }
         selectedSort = option
@@ -151,31 +149,27 @@ class WorkshopViewModel: ObservableObject {
             await search()
         }
     }
-    
+
     // MARK: - 内存压力处理
 
     private func handleMemoryPressure() {
-        print("[WorkshopViewModel] 内存压力，释放缓存: wallpapers=\(wallpapers.count)")
+        print("[WorkshopViewModel] 内存压力，取消网络请求: wallpapers=\(wallpapers.count)")
         currentSearchTask?.cancel()
-        // 裁剪列表：仅保留最近 2 页（~40 条）
-        if wallpapers.count > 40 {
-            wallpapers = Array(wallpapers.suffix(40))
-        }
     }
 
     // MARK: - Download
-    
+
     /// 下载壁纸
     func downloadWallpaper(_ wallpaper: WorkshopWallpaper) async throws -> URL {
         return try await workshopService.downloadWorkshopItem(workshopID: wallpaper.id)
     }
-    
+
     // MARK: - Helpers
-    
+
     func clearError() {
         errorMessage = nil
     }
-    
+
     func cancelTasks() {
         currentSearchTask?.cancel()
     }

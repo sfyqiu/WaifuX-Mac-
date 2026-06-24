@@ -21,6 +21,7 @@ private struct VisualEffectView: NSViewRepresentable {
 // MARK: - 设置标签
 private enum SettingsTab: String, CaseIterable, Identifiable {
     case general
+    case modules
     case download
     case workshop
     case scheduler
@@ -31,6 +32,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .general: return t("general")
+        case .modules: return t("settings.modules")
         case .download: return t("download")
         case .workshop: return t("wallpaperEngine")
         case .scheduler: return t("scheduler")
@@ -41,6 +43,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .general: return "gearshape"
+        case .modules: return "square.grid.2x2"
         case .download: return "arrow.down.circle"
         case .workshop: return "gearshape.2" // Steam/Workshop 风格
         case .scheduler: return "clock.arrow.circlepath"
@@ -140,6 +143,8 @@ struct SettingsView: View {
                     switch selectedTab {
                     case .general:
                         GeneralSettingsTab(viewModel: viewModel)
+                    case .modules:
+                        ModulesSettingsTab(viewModel: viewModel)
                     case .download:
                         DownloadSettingsTab(viewModel: viewModel)
                     case .workshop:
@@ -188,11 +193,78 @@ struct SettingsView: View {
     }
 }
 
+// MARK: - 功能模块设置标签
+private struct ModulesSettingsTab: View {
+    @ObservedObject var viewModel: SettingsViewModel
+
+    var body: some View {
+        MacSettingsForm {
+            // 功能模块开关组
+            MacSettingsSection(header: t("settings.modules.title")) {
+                MacSettingsRow(
+                    title: t("settings.modules.wallpaper"),
+                    subtitle: t("settings.modules.wallpaper.subtitle"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.wallpaperModuleEnabled)
+                }
+
+                MacSettingsRow(
+                    title: t("settings.modules.media"),
+                    subtitle: t("settings.modules.media.subtitle"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.mediaModuleEnabled)
+                }
+
+                MacSettingsRow(
+                    title: t("settings.modules.anime"),
+                    subtitle: t("settings.modules.anime.subtitle"),
+                    showDivider: false
+                ) {
+                    MacToggle(isOn: $viewModel.animeModuleEnabled)
+                }
+            }
+
+            // 待应用改动区块（仅当有改动时显示）
+            if viewModel.hasPendingModuleChanges {
+                MacSettingsSection(header: t("settings.modules.apply")) {
+                    MacSettingsRow(
+                        title: t("settings.modules.pending"),
+                        subtitle: viewModel.pendingModulesDescription,
+                        showDivider: false
+                    ) {
+                        Button(t("settings.modules.restartNow")) {
+                            confirmRestart()
+                        }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color(hex: "0A84FF"))
+                    }
+                }
+            }
+        }
+    }
+
+    /// 重启确认弹窗
+    private func confirmRestart() {
+        let alert = NSAlert()
+        alert.messageText = t("settings.modules.restartConfirm.title")
+        alert.informativeText = t("settings.modules.restartConfirm.message")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: t("settings.modules.restartNow"))
+        alert.addButton(withTitle: t("cancel"))
+        if alert.runModal() == .alertFirstButtonReturn {
+            AppRelauncher.relaunch()
+        }
+    }
+}
+
 // MARK: - 通用设置标签
 private struct GeneralSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
     @State private var showClearCacheAlert = false
+    @State private var showClearLockScreenAlert = false
     @State private var importProfileURL = ""
 
     private var apiKeyBinding: Binding<String> {
@@ -291,6 +363,16 @@ private struct GeneralSettingsTab: View {
 
             // 动态壁纸设置组
             MacSettingsSection(header: t("videoWallpaper")) {
+                // 系统壁纸同步总开关（默认开启）：关闭后冻结 setDesktopImageURL 链路，
+                // 仅 App 内 mp4/场景/web 动态壁纸引擎继续工作。
+                MacSettingsRow(
+                    title: t("systemWallpaperSync"),
+                    subtitle: t("systemWallpaperSyncDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.systemWallpaperSyncEnabled)
+                }
+
                 MacSettingsRow(
                     title: t("pauseWhenOtherAppForeground"),
                     subtitle: t("pauseWhenOtherAppForegroundDesc"),
@@ -334,11 +416,72 @@ private struct GeneralSettingsTab: View {
                 }
 
                 MacSettingsRow(
+                    title: t("pauseWhenWindowCoverage"),
+                    subtitle: t("pauseWhenWindowCoverageDesc"),
+                    showDivider: !viewModel.pauseWhenWindowCoverage
+                ) {
+                    MacToggle(isOn: Binding(
+                        get: { viewModel.pauseWhenWindowCoverage },
+                        set: { newValue in
+                            viewModel.pauseWhenWindowCoverage = newValue
+                            viewModel.syncAutoPauseSettings()
+                        }
+                    ))
+                }
+
+                if viewModel.pauseWhenWindowCoverage {
+                    MacSettingsRow(
+                        title: t("windowCoverageThreshold"),
+                        showDivider: true
+                    ) {
+                        HStack(spacing: 8) {
+                            Text("\(Int(viewModel.windowCoveragePauseThreshold))%")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .frame(minWidth: 36, alignment: .trailing)
+                            Slider(
+                                value: $viewModel.windowCoveragePauseThreshold,
+                                in: 30...100,
+                                step: 5,
+                                onEditingChanged: { editing in
+                                    if !editing { viewModel.syncAutoPauseSettings() }
+                                }
+                            )
+                            .frame(width: 120)
+                            .tint(Color(hex: "30D158"))
+                        }
+                    }
+                }
+
+                MacSettingsRow(
                     title: t("hdrEnabled"),
                     subtitle: t("hdrEnabledDesc"),
-                    showDivider: false
+                    showDivider: true
                 ) {
                     MacToggle(isOn: $viewModel.hdrEnabled)
+                }
+
+                // 动态锁屏壁纸开关（仅 macOS 26+ 可用）
+                if #available(macOS 26.0, *) {
+                    MacSettingsRow(
+                        title: t("dynamicLockScreen"),
+                        subtitle: t("dynamicLockScreenDesc"),
+                        showDivider: true
+                    ) {
+                        MacToggle(isOn: $viewModel.dynamicLockScreenEnabled)
+                    }
+
+                    MacSettingsRow(
+                        title: t("clearLockScreenInstances"),
+                        subtitle: t("clearLockScreenInstancesDesc"),
+                        showDivider: false
+                    ) {
+                        Button(t("clear")) {
+                            showClearLockScreenAlert = true
+                        }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color(hex: "FF453A"))
+                    }
                 }
             }
 
@@ -424,6 +567,14 @@ private struct GeneralSettingsTab: View {
                     ))
                 }
 
+//                MacSettingsRow(
+//                    title: t("hideNotch"),
+//                    subtitle: t("hideNotchDesc"),
+//                    showDivider: true
+//                ) {
+//                    MacToggle(isOn: $viewModel.hideNotch)
+//                }
+//
                 MacSettingsRow(
                     title: t("saveToDownloadsFolder"),
                     subtitle: nil,
@@ -506,6 +657,14 @@ private struct GeneralSettingsTab: View {
             }
         } message: {
             Text(t("clearCacheConfirm"))
+        }
+        .alert(t("clearLockScreenInstances"), isPresented: $showClearLockScreenAlert) {
+            Button(t("cancel"), role: .cancel) {}
+            Button(t("clear"), role: .destructive) {
+                viewModel.clearLockScreenInstances()
+            }
+        } message: {
+            Text(t("clearLockScreenInstancesConfirm"))
         }
     }
 }
@@ -654,7 +813,7 @@ private struct SchedulerSettingsTab: View {
         MacSettingsForm {
             // 每屏配置
             MacSettingsSection(header: t("scheduleConfig")) {
-                ForEach(Array(screens.enumerated()), id: \.offset) { index, screen in
+                ForEach(Array(screens.enumerated()), id: \.element.wallpaperScreenIdentifier) { index, screen in
                     let screenID = screen.wallpaperScreenIdentifier
                     let displayConfig = viewModel.schedulerViewModel.displayConfig(for: screenID)
 
@@ -788,6 +947,8 @@ private struct SchedulerSettingsTab: View {
                             // 文件夹选择
                             FolderPickerRow(
                                 folderIDs: displayConfig.folderIDs,
+                                includeWallpapers: displayConfig.includeWallpapers && !displayConfig.isOnEndMode,
+                                includeMedia: displayConfig.includeMedia,
                                 screenID: screenID,
                                 viewModel: viewModel
                             )
@@ -807,6 +968,8 @@ private struct SchedulerSettingsTab: View {
     // MARK: - 文件夹选择组件
     private struct FolderPickerRow: View {
         let folderIDs: [String]?
+        let includeWallpapers: Bool
+        let includeMedia: Bool
         let screenID: String
         @ObservedObject var viewModel: SettingsViewModel
 
@@ -864,7 +1027,10 @@ private struct SchedulerSettingsTab: View {
         }
 
         private var allFolders: [LibraryFolder] {
-            (wallpaperFolders + mediaFolders).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            var combined: [LibraryFolder] = []
+            if includeWallpapers { combined.append(contentsOf: wallpaperFolders) }
+            if includeMedia { combined.append(contentsOf: mediaFolders) }
+            return combined.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         }
 
         private var folderIDsLabel: String {
@@ -914,18 +1080,6 @@ private struct AboutSettingsTab: View {
     @State private var showAutoUpdateSheet = false
     @State private var showResetAlert = false
 
-    private var wallpaperRuleSourceText: String {
-        if viewModel.currentRuleRepository.isEmpty {
-            return "GitHub"
-        }
-        let url = viewModel.currentRuleRepository
-        if let range = url.range(of: "github.com/") {
-            let repo = String(url[range.upperBound...])
-            return repo.replacingOccurrences(of: ".git", with: "")
-        }
-        return "GitHub"
-    }
-
     var body: some View {
         ZStack {
             MacSettingsForm {
@@ -935,7 +1089,6 @@ private struct AboutSettingsTab: View {
                 // 项目信息组
                 MacSettingsSection(header: t("projectInfo")) {
                     infoRow(title: t("developer"), value: "jipika", isLast: false)
-                    infoRow(title: t("wallpaperRuleSource"), value: wallpaperRuleSourceText, isLast: false)
                     infoRow(title: t("animeRuleSource"), value: "KazumiRules", isLast: false)
                     infoRow(title: t("techStack"), value: "SwiftUI + AppKit", isLast: true)
                 }
@@ -1143,7 +1296,7 @@ private struct AboutSettingsTab: View {
                 Text(message)
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         default:
             EmptyView()
@@ -1286,7 +1439,7 @@ struct SettingsUpdateSection: View {
                 Text(message)
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         default:
             EmptyView()
@@ -1335,6 +1488,7 @@ private struct WorkshopSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var sourceManager = WorkshopSourceManager.shared
     @ObservedObject private var workshopService = WorkshopService.shared
+    @ObservedObject private var clockSettings = LiquidGlassClockSettings.shared
     @State private var steamUsername = ""
     @State private var steamPassword = ""
     @State private var steamGuardCode = ""
@@ -1345,6 +1499,11 @@ private struct WorkshopSettingsTab: View {
     @State private var cleanupResult: (count: Int, bytesFreed: Int64)?
     @State private var isCleaningUp = false
     @State private var steamCMDStatus: SteamCMDStatus = .downloading
+
+    /// 所有已连接显示器的最高刷新率，作为 FPS 滑块的上限
+    private var maxSliderFPS: Double {
+        Double(NSScreen.screens.map(\.maxRefreshRate).max() ?? 60)
+    }
 
     var body: some View {
         ScrollView {
@@ -1366,8 +1525,120 @@ private struct WorkshopSettingsTab: View {
                 // SteamCMD 登录
                 steamCMDLoginSection
 
-                // 清理下载缓存
-                cleanupSection
+                // 桌面动态元素（时钟、音频柱状图等）
+                MacSettingsSection {
+                    MacSettingsRow(title: t("workshop.desktopDynamicElements"), subtitle: t("workshop.desktopDynamicElementsDesc"), showDivider: false) {
+                        MacToggle(isOn: Binding(
+                            get: { clockSettings.config.enabled },
+                            set: { newValue in
+                                clockSettings.update { $0.enabled = newValue }
+                                // 与场景壁纸实时渲染互斥
+                                if newValue && viewModel.sceneRealtimeRenderingEnabled {
+                                    viewModel.sceneRealtimeRenderingEnabled = false
+                                }
+                            }
+                        ))
+                    }
+                }
+
+                // 场景壁纸实时渲染模式
+                MacSettingsSection {
+                    MacSettingsRow(title: t("workshop.sceneRealtimeRendering"), subtitle: t("workshop.sceneRealtimeRenderingDesc"), showDivider: false) {
+                        MacToggle(isOn: Binding(
+                            get: { viewModel.sceneRealtimeRenderingEnabled },
+                            set: { newValue in
+                                viewModel.sceneRealtimeRenderingEnabled = newValue
+                                // 与桌面动态元素互斥
+                                if newValue && clockSettings.config.enabled {
+                                    clockSettings.update { $0.enabled = false }
+                                }
+                            }
+                        ))
+                    }
+                }
+
+                // 超分辨率模式
+                MacSettingsSection {
+                    MacSettingsRow(title: t("workshop.upscalingMode"), subtitle: t("workshop.upscalingModeDesc"), showDivider: true) {
+                        MacToggle(isOn: Binding(
+                            get: { viewModel.upscalingEnabled },
+                            set: { viewModel.upscalingEnabled = $0 }
+                        ))
+                    }
+
+                    if viewModel.upscalingEnabled {
+                        MacSettingsRow(title: t("workshop.upscalingRatio"), showDivider: true) {
+                            HStack(spacing: 8) {
+                                Text("\(Int(viewModel.upscalingPercent))%")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(minWidth: 36, alignment: .trailing)
+                                Slider(value: $viewModel.upscalingPercent, in: 30...100, step: 5)
+                                    .frame(width: 120)
+                                    .tint(Color(hex: "30D158"))
+                            }
+                        }
+
+                        MacSettingsRow(title: t("workshop.effectReduction"), subtitle: t("workshop.effectReductionDesc"), showDivider: false) {
+                            MacToggle(isOn: Binding(
+                                get: { viewModel.effectReductionEnabled },
+                                set: { viewModel.effectReductionEnabled = $0 }
+                            ))
+                        }
+                    }
+                }
+
+                // 渲染帧率上限
+                VStack(alignment: .leading, spacing: 6) {
+                    MacSettingsSection {
+                        MacSettingsRow(title: t("workshop.fps"), subtitle: t("workshop.fpsDesc"), showDivider: false) {
+                            HStack(spacing: 8) {
+                                Text("\(Int(viewModel.wallpaperEngineFPS)) FPS")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(minWidth: 52, alignment: .trailing)
+                                Slider(value: $viewModel.wallpaperEngineFPS, in: 30...maxSliderFPS, step: 1)
+                                    .frame(width: 120)
+                                    .tint(Color(hex: "30D158"))
+                            }
+                        }
+                    }
+                    Text(t("workshop.fpsHint"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary.opacity(0.75))
+                        .padding(.leading, 2)
+                }
+
+                // 烘焙帧率
+                MacSettingsSection {
+                    MacSettingsRow(title: t("workshop.bakeFps"), subtitle: t("workshop.bakeFpsDesc"), showDivider: true) {
+                        HStack(spacing: 8) {
+                            Text("\(Int(viewModel.sceneBakeFPS)) FPS")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .frame(minWidth: 52, alignment: .trailing)
+                            Slider(value: $viewModel.sceneBakeFPS, in: 15...60, step: 5)
+                                .frame(width: 120)
+                                .tint(Color(hex: "30D158"))
+                        }
+                    }
+
+                    MacSettingsRow(title: t("workshop.bakeDuration"), subtitle: t("workshop.bakeDurationDesc"), showDivider: true) {
+                        HStack(spacing: 8) {
+                            Text("\(Int(viewModel.sceneBakeDuration))s")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .frame(minWidth: 36, alignment: .trailing)
+                            Slider(value: $viewModel.sceneBakeDuration, in: 5...60, step: 5)
+                                .frame(width: 120)
+                                .tint(Color(hex: "30D158"))
+                        }
+                    }
+
+                    MacSettingsRow(title: t("workshop.autoBakeScene"), subtitle: t("workshop.autoBakeSceneDesc"), showDivider: false) {
+                        MacToggle(isOn: $viewModel.autoBakeScene)
+                    }
+                }
 
                 // 显示全部内容（仅登录 Steam 后显示）
                 if sourceManager.isSteamAuthenticated {
@@ -1380,6 +1651,9 @@ private struct WorkshopSettingsTab: View {
                         }
                     }
                 }
+
+                // 清理下载缓存
+                cleanupSection
 
                 Spacer()
             }
@@ -1566,6 +1840,8 @@ private struct WorkshopSettingsTab: View {
                 .lineLimit(3)
         }
     }
+
+
 
     // MARK: - SteamCMD 状态
     private var steamCMDStatusSection: some View {

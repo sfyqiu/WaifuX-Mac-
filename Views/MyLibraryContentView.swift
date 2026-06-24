@@ -3,13 +3,135 @@ import Kingfisher
 import AppKit
 import AVFoundation
 
+// MARK: - Scroll State
+private final class LibraryScrollRuntimeState: ObservableObject {
+    var currentOffset: CGFloat = 0
+}
+
+// MARK: - Scroll 观察与恢复辅助组件
+/// 直接观察底层 NSScrollView，避免滚动时通过 PreferenceKey 持续触发整棵 SwiftUI 内容重算。
+private struct LibraryScrollObserver: NSViewRepresentable {
+    let restoreOffset: CGFloat
+    let restoreTrigger: Int
+    let onScroll: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        scheduleInstall(from: view, context: context)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onScroll = onScroll
+        scheduleInstall(from: nsView, context: context)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onScroll: onScroll)
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.stopObserving()
+    }
+
+    private func scheduleInstall(from view: NSView, context: Context) {
+        DispatchQueue.main.async {
+            context.coordinator.install(
+                from: view,
+                restoreOffset: restoreOffset,
+                restoreTrigger: restoreTrigger
+            )
+        }
+    }
+
+    @MainActor
+    final class Coordinator {
+        var onScroll: (CGFloat) -> Void
+        private weak var observedScrollView: NSScrollView?
+        private var boundsObserver: NSObjectProtocol?
+        private var lastRestoreTrigger = -1
+
+        init(onScroll: @escaping (CGFloat) -> Void) {
+            self.onScroll = onScroll
+        }
+
+        func install(from view: NSView, restoreOffset: CGFloat, restoreTrigger: Int) {
+            guard let scrollView = findParentScrollView(from: view) else { return }
+
+            if observedScrollView !== scrollView {
+                stopObserving()
+                observedScrollView = scrollView
+                scrollView.contentView.postsBoundsChangedNotifications = true
+                boundsObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: scrollView.contentView,
+                    queue: .main
+                ) { [weak self, weak scrollView] _ in
+                    guard let scrollView else { return }
+                    MainActor.assumeIsolated { self?.handleScroll(scrollView) }
+                }
+            }
+
+            if restoreTrigger != lastRestoreTrigger {
+                lastRestoreTrigger = restoreTrigger
+                restore(scrollView: scrollView, targetOffset: restoreOffset)
+            }
+
+            handleScroll(scrollView)
+        }
+
+        func stopObserving() {
+            if let boundsObserver {
+                NotificationCenter.default.removeObserver(boundsObserver)
+            }
+            boundsObserver = nil
+            observedScrollView = nil
+        }
+
+        private func handleScroll(_ scrollView: NSScrollView) {
+            onScroll(max(0, scrollView.contentView.bounds.origin.y))
+        }
+
+        private func restore(scrollView: NSScrollView, targetOffset: CGFloat) {
+            guard targetOffset > 0 else { return }
+            let currentY = scrollView.contentView.bounds.origin.y
+            if abs(currentY - targetOffset) > 1 {
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetOffset))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
+        }
+
+        private func findParentScrollView(from view: NSView) -> NSScrollView? {
+            var current = view.superview
+            while let candidate = current {
+                if let scrollView = candidate as? NSScrollView {
+                    return scrollView
+                }
+                current = candidate.superview
+            }
+            return nil
+        }
+    }
+}
+
 struct MyLibraryContentView: View {
-    @StateObject private var viewModel = WallpaperViewModel()
-    @StateObject private var mediaViewModel = MediaExploreViewModel()
+    // 共享 AppDelegate 持有的全局 ViewModel 实例（与首页/壁纸探索/媒体探索共用）。
+    // 之前是 @StateObject 创建独立实例，导致两份 WallpaperViewModel/MediaExploreViewModel
+    // 同时订阅 LocalWallpaperScanner 通知 → 双倍内存 + 双倍响应。
+    // 改为 @ObservedObject 接收外部实例，仍能响应数据变化（body 内读 favorites/allLocalWallpapers
+    // 等需要响应式），但不再有冗余实例。
+    @ObservedObject var viewModel: WallpaperViewModel
+    @ObservedObject var mediaViewModel: MediaExploreViewModel
     @StateObject private var downloadTaskViewModel = DownloadTaskViewModel()
     @ObservedObject private var animeFavoriteStore = AnimeFavoriteStore.shared
     @ObservedObject private var folderStore = LibraryFolderStore.shared
-    @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
+    @ObservedObject private var gridOrderStore = LibraryGridOrderStore.shared
+    @ObservedObject private var folderLockService = FolderLockService.shared
+    // 注意：ArcBackgroundSettings 不在顶层观察。它有多个 @Published（dotGridOpacity /
+    // useNoiseTexture / grainIntensity 等），顶层观察会导致任意外观设置变化触发整个库视图
+    // body 重算。背景渲染已下沉到 LibraryAtmosphereBackground 子视图自行观察。
+    @ObservedObject private var workshopSourceManager = WorkshopSourceManager.shared
+    @Environment(\.mainTopBarContentPadding) private var mainTopBarContentPadding
 
     // 分类筛选
     @State private var selectedContentType: ContentType = .wallpaper
@@ -18,16 +140,28 @@ struct MyLibraryContentView: View {
     @Binding var selectedAnime: AnimeSearchResult?
     @Binding var wallpaperContext: [Wallpaper]
     @Binding var mediaContext: [MediaItem]
+    let isVisible: Bool
     @State private var animeFavorites: [AnimeSearchResult] = []
 
     // 子标签：收藏 / 已下载
     @State private var selectedSubTab: SubTab = .downloads
+    @State private var librarySearchQuery = ""
+    @State private var isLibrarySearchExpanded = false
+    @FocusState private var isLibrarySearchFocused: Bool
 
     // 编辑状态
     @State private var isEditing = false
     @State private var selectedItems = Set<String>()
 
     // 图片预加载由 onAppear 直接触发，无需追踪可见卡片 ID
+
+    // MARK: - Scroll 恢复
+    @StateObject private var libraryScrollRuntimeState = LibraryScrollRuntimeState()
+    @State private var isLibraryHeaderContentVisible = true
+    /// 详情页导航前保存的滚动位置（>=0 表示需要恢复）
+    @State private var savedLibraryScrollOffset: CGFloat = -1
+    /// 恢复成功后自增，驱动 LibraryScrollRestorer 重新触发
+    @State private var libraryScrollRestoreToken: Int = 0
 
     // 壁纸比例筛选
     @State private var wallpaperRatioFilter: WallpaperRatioFilter = .all
@@ -39,9 +173,15 @@ struct MyLibraryContentView: View {
     @State private var mediaItems: [AnyMediaItem] = []
     @State private var wallpaperFolderDisplay: [String: FolderDisplayInfo] = [:]
     @State private var mediaFolderDisplay: [String: FolderDisplayInfo] = [:]
+    // ⚡ 滚动 prefetch 用的 ID→Index 字典缓存（O(1) 查找替代 firstIndex(where:) O(N)）。
+    @State private var wallpaperIDIndexCache: [String: Int] = [:]
+    @State private var mediaIDIndexCache: [String: Int] = [:]
+    @State private var animeIDIndexCache: [String: Int] = [:]
     @State private var lastWallpaperPrefetchBucket: Int?
     @State private var lastMediaPrefetchBucket: Int?
     @State private var lastAnimePrefetchBucket: Int?
+    @State private var updateWallpaperDebounce: DispatchWorkItem?
+    @State private var updateMediaDebounce: DispatchWorkItem?
     private let wallpaperPrefetchNamespace = "library.wallpapers"
     private let mediaPrefetchNamespace = "library.media"
     private let animePrefetchNamespace = "library.anime"
@@ -55,6 +195,21 @@ struct MyLibraryContentView: View {
     // 新建文件夹
     @State private var showNewFolderSheet = false
     @State private var newFolderName = ""
+    @State private var renamingFolder: LibraryFolder?
+    @State private var renameFolderName = ""
+
+    // 拖拽排序 UI 状态
+    /// 当前 hover 中的插入位置：插入到该 entry ID 之前。nil = 未 hover 任何插入条。
+    @State private var hoveredInsertionID: String? = nil
+
+    // 同步 Steam 订阅
+    @State private var isSyncingSubscriptions = false
+    @State private var showSyncProfileSheet = false
+    @State private var showSyncSelectionSheet = false
+    @State private var syncSubscribedItems: [WorkshopWallpaper] = []
+    @State private var syncSelectedIDs = Set<String>()
+    @State private var syncIsLoadingList = false
+    @State private var syncErrorMessage: String?
 
     enum WallpaperRatioFilter: String, CaseIterable {
         case all = "all"
@@ -104,7 +259,23 @@ struct MyLibraryContentView: View {
         }
     }
 
+    private var trimmedLibrarySearchQuery: String {
+        librarySearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var hasActiveLibrarySearch: Bool {
+        !trimmedLibrarySearchQuery.isEmpty
+    }
+
+    private var libraryHeaderHeight: CGFloat {
+        118
+    }
+
     var body: some View {
+        // 性能测量：开启 PERF_TRACE 编译标记后，会在控制台打印触发本 body 的属性来源
+        #if PERF_TRACE
+        let _ = Self._printChanges()
+        #endif
         ZStack(alignment: .topLeading) {
             if isEditing {
                 Color.black.opacity(0.3)
@@ -118,60 +289,97 @@ struct MyLibraryContentView: View {
                     .allowsHitTesting(true)
             }
 
-            ArcAtmosphereBackground(
-                tint: libraryAtmosphereTint,
-                referenceImage: nil,
-                isLightMode: false,
-                dotGridOpacity: arcSettings.dotGridOpacity,
-                useNoise: arcSettings.useNoiseTexture,
-                grainIntensity: arcSettings.grainIntensity,
-                lightweight: true
-            )
+            // 背景渲染下沉到独立子视图：自行观察 ArcBackgroundSettings，
+            // 外观设置变化只重建本背景，不触发整个库视图 body 重算。
+            LibraryAtmosphereBackground(tint: libraryAtmosphereTint)
+                // 把多层渐变+点阵+噪点合并成一个 Metal 纹理，减少 WindowServer 合成层数
+                .drawingGroup(opaque: true)
+                // 滚动时暂停背景重绘（背景是静态的，不需要每帧更新）
+                .allowsHitTesting(false)
 
             GeometryReader { geometry in
                 let contentWidth = max(0, geometry.size.width - 56)
                 let gridConfig = LibraryGridConfig(contentWidth: contentWidth)
                 let animeGridConfig = AnimeGridConfig(contentWidth: contentWidth)
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 32) {
+                VStack(spacing: 0) {
+                    // 固定头部
+                    VStack(alignment: .leading, spacing: 0) {
                         mediaHero
-                        ContentTypePicker(selected: $selectedContentType)
-                        contentSections(config: gridConfig, animeConfig: animeGridConfig)
-                        Spacer(minLength: 0)
+                        libraryControlPanel
+                            .padding(.top, 20)
                     }
                     .padding(.horizontal, 28)
-                    .padding(.top, 80)
-                    .padding(.bottom, 48)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .frame(minHeight: geometry.size.height)
+                    .padding(.top, mainTopBarContentPadding)
+                    .padding(.bottom, 12)
+
+                    // 内部滚动区域
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            contentSections(config: gridConfig, animeConfig: animeGridConfig)
+                                .padding(.top, 10)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 28)
+                        .padding(.bottom, 80)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .background(
+                            LibraryScrollObserver(
+                                restoreOffset: savedLibraryScrollOffset,
+                                restoreTrigger: libraryScrollRestoreToken,
+                                onScroll: handleLibraryScroll
+                            )
+                            .frame(width: 0, height: 0)
+                        )
+                    }
                 }
-                .scrollClipDisabled()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task {
             await viewModel.initialLoad()
-            await loadAnimeFavorites()
-            Task {
-                await LocalWallpaperScanner.shared.forceRescan()
-            }
             updateWallpaperItems()
             updateMediaItems()
+            await loadAnimeFavorites()
+            Task(priority: .utility) {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                await LocalWallpaperScanner.shared.forceRescan()
+                await MainActor.run {
+                    updateWallpaperItems()
+                    updateMediaItems()
+                }
+            }
+        }
+        .onAppear {
+            // ✅ 从详情返回时触发 ScrollView 滚动位置恢复
+            if savedLibraryScrollOffset > 0 {
+                libraryScrollRestoreToken += 1
+            }
         }
         .onReceive(animeFavoriteStore.$favorites) { _ in
             Task {
                 await loadAnimeFavorites()
             }
         }
-        .onChange(of: viewModel.libraryContentRevision) { _, _ in
+        .onChange(of: librarySearchQuery) { _, _ in
             updateWallpaperItems()
+            updateMediaItems()
+            syncSelectionWithVisibleItems()
+        }
+        .onChange(of: isVisible) { _, visible in
+            if !visible {
+                isLibrarySearchExpanded = false
+            }
+        }
+        .onChange(of: viewModel.libraryContentRevision) { _, _ in
+            debouncedUpdateWallpaperItems()
         }
         .onChange(of: mediaViewModel.libraryContentRevision) { _, _ in
-            updateMediaItems()
+            debouncedUpdateMediaItems()
         }
         .onChange(of: selectedSubTab) { _, _ in
-            // 切换子标签时重置文件夹导航
+            // 切换子标签时重置文件夹导航和滚动位置
+            savedLibraryScrollOffset = -1
             currentWallpaperFolderID = nil
             currentMediaFolderID = nil
             wallpaperFolderStack.removeAll()
@@ -182,16 +390,20 @@ struct MyLibraryContentView: View {
             updateMediaItems()
         }
         .onChange(of: wallpaperRatioFilter) { _, _ in
-            updateWallpaperItems()
+            debouncedUpdateWallpaperItems()
         }
         .onChange(of: mediaRatioFilter) { _, _ in
-            updateMediaItems()
+            debouncedUpdateMediaItems()
         }
         .onReceive(folderStore.$wallpaperFolders) { _ in
-            updateWallpaperItems()
+            debouncedUpdateWallpaperItems()
         }
         .onReceive(folderStore.$mediaFolders) { _ in
-            updateMediaItems()
+            debouncedUpdateMediaItems()
+        }
+        .onReceive(gridOrderStore.$revision) { _ in
+            debouncedUpdateWallpaperItems()
+            debouncedUpdateMediaItems()
         }
         .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
             releaseForegroundMemory()
@@ -200,15 +412,16 @@ struct MyLibraryContentView: View {
             stopLibraryPrefetchers()
         }
         .onChange(of: selectedContentType) { _, _ in
-            // 切换内容类型时重置编辑状态和文件夹导航
+            // 切换内容类型时重置编辑状态、文件夹导航和滚动位置
+            savedLibraryScrollOffset = -1
             isEditing = false
             selectedItems.removeAll()
             currentWallpaperFolderID = nil
             currentMediaFolderID = nil
             wallpaperFolderStack.removeAll()
             mediaFolderStack.removeAll()
-            updateWallpaperItems()
-            updateMediaItems()
+            debouncedUpdateWallpaperItems()
+            debouncedUpdateMediaItems()
         }
         .sheet(isPresented: $showNewFolderSheet) {
             NewFolderSheet(
@@ -218,7 +431,8 @@ struct MyLibraryContentView: View {
                     guard !name.isEmpty else { return }
                     let contentType: LibraryFolder.FolderContentType = selectedContentType == .wallpaper ? .wallpaper : .media
                     let parentID = selectedContentType == .wallpaper ? currentWallpaperFolderID : currentMediaFolderID
-                    folderStore.createFolder(name: name, contentType: contentType, parentID: parentID)
+                    let collection: LibraryFolder.FolderCollection = selectedSubTab == .favorites ? .favorites : .downloads
+                    folderStore.createFolder(name: name, contentType: contentType, parentID: parentID, collection: collection)
                     newFolderName = ""
                     showNewFolderSheet = false
                     updateWallpaperItems()
@@ -229,6 +443,45 @@ struct MyLibraryContentView: View {
                     showNewFolderSheet = false
                 }
             )
+        }
+        .sheet(item: $renamingFolder) { folder in
+            NewFolderSheet(
+                title: t("folder.rename"),
+                confirmTitle: t("rename"),
+                folderName: $renameFolderName,
+                onConfirm: {
+                    let name = renameFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !name.isEmpty else { return }
+                    folderStore.renameFolder(id: folder.id, contentType: folder.contentType, newName: name)
+                    renameFolderName = ""
+                    renamingFolder = nil
+                    updateWallpaperItems()
+                    updateMediaItems()
+                },
+                onCancel: {
+                    renameFolderName = ""
+                    renamingFolder = nil
+                }
+            )
+        }
+        .sheet(isPresented: $showSyncProfileSheet) {
+            syncProfileSheet
+        }
+        .sheet(isPresented: $showSyncSelectionSheet) {
+            syncSelectionSheet
+        }
+        .sheet(isPresented: $showSteamLoginSheet) {
+            SteamLoginSheet(isPresented: $showSteamLoginSheet)
+                .environmentObject(workshopSourceManager)
+                .onDisappear {
+                    // 登录成功后立即弹出选择 Sheet（显示加载中），再开始获取数据
+                    if workshopSourceManager.hasSteamProfileID {
+                        syncIsLoadingList = true
+                        syncSelectedIDs = []
+                        showSyncSelectionSheet = true
+                        Task { await fetchSubscriptionList() }
+                    }
+                }
         }
     }
 
@@ -264,12 +517,20 @@ struct MyLibraryContentView: View {
                 originalName: nil
             )
         }
+        // ⚡ prefetch 用的 ID→Index 缓存与 animeFavorites 同步刷新
+        var idMap: [String: Int] = [:]
+        idMap.reserveCapacity(animeFavorites.count)
+        for (idx, anime) in animeFavorites.enumerated() { idMap[anime.id] = idx }
+        animeIDIndexCache = idMap
+        syncSelectionWithVisibleItems()
     }
 
     private func releaseForegroundMemory() {
         viewModel.releaseForegroundMemory()
         mediaViewModel.releaseForegroundMemory()
 
+        savedLibraryScrollOffset = -1
+        libraryScrollRestoreToken &+= 1
         selectedWallpaper = nil
         selectedMedia = nil
         selectedAnime = nil
@@ -280,6 +541,9 @@ struct MyLibraryContentView: View {
         mediaItems.removeAll()
         wallpaperFolderDisplay.removeAll()
         mediaFolderDisplay.removeAll()
+        wallpaperIDIndexCache.removeAll()
+        mediaIDIndexCache.removeAll()
+        animeIDIndexCache.removeAll()
         currentWallpaperFolderID = nil
         currentMediaFolderID = nil
         wallpaperFolderStack.removeAll()
@@ -300,7 +564,39 @@ struct MyLibraryContentView: View {
         ForegroundPrefetchManager.shared.stop(namespace: animePrefetchNamespace)
     }
 
+    private func handleLibraryScroll(_ offset: CGFloat) {
+        libraryScrollRuntimeState.currentOffset = offset
+
+        let hideThreshold = libraryHeaderHeight + 24
+        let showThreshold = libraryHeaderHeight - 24
+        let shouldBeVisible = isLibraryHeaderContentVisible
+            ? offset < hideThreshold
+            : offset < showThreshold
+        guard shouldBeVisible != isLibraryHeaderContentVisible else { return }
+
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isLibraryHeaderContentVisible = shouldBeVisible
+        }
+    }
+
     // MARK: - Hero
+    private var libraryHeaderPlaceholder: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if isLibraryHeaderContentVisible {
+                VStack(alignment: .leading, spacing: 0) {
+                    mediaHero
+                    libraryControlPanel
+                        .padding(.top, 36)
+                }
+                .frame(height: libraryHeaderHeight, alignment: .bottom)
+            }
+        }
+        .frame(height: libraryHeaderHeight, alignment: .bottom)
+        .clipped()
+    }
+
     private var mediaHero: some View {
         HStack(alignment: .bottom) {
             Text(t("my.media.library"))
@@ -337,6 +633,44 @@ struct MyLibraryContentView: View {
         }
     }
 
+    private var activeLibraryTint: Color {
+        switch selectedContentType {
+        case .wallpaper:
+            return LiquidGlassColors.primaryPink
+        case .video:
+            return LiquidGlassColors.secondaryViolet
+        case .anime:
+            return LiquidGlassColors.tertiaryBlue
+        }
+    }
+
+    private var libraryControlPanel: some View {
+        let tint = activeLibraryTint
+
+        return HStack(alignment: .center, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                ContentTypePicker(selected: $selectedContentType)
+                librarySearchControl
+
+                if selectedContentType != .anime {
+                    subTabDropdown
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            HStack(alignment: .center, spacing: 10) {
+                if selectedContentType == .wallpaper {
+                    wallpaperRatioPicker(color: tint)
+                }
+
+                libraryToolbarActions(tint: tint)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassContainer(spacing: 12)
+    }
+
     // MARK: - Content Sections
     @ViewBuilder
     private func contentSections(config: LibraryGridConfig, animeConfig: AnimeGridConfig) -> some View {
@@ -352,14 +686,7 @@ struct MyLibraryContentView: View {
 
     // MARK: - Wallpaper Section
     private func wallpaperSection(config: LibraryGridConfig) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            sectionHeader(
-                title: t("library.wallpapers"),
-                color: LiquidGlassColors.primaryPink,
-                importAction: importWallpapers,
-                folderURL: DownloadPathManager.shared.wallpapersFolderURL
-            )
-
+        VStack(alignment: .leading, spacing: 12) {
             // 文件夹导航面包屑
             folderBreadcrumb(
                 folderStack: wallpaperFolderStack,
@@ -370,44 +697,68 @@ struct MyLibraryContentView: View {
 
             if wallpaperItems.isEmpty && currentWallpaperFolders.isEmpty {
                 emptyMediaSurface(
-                    title: selectedSubTab == .favorites ? t("no.wallpaper.favorites") : t("no.wallpaper.downloads"),
-                    subtitle: selectedSubTab == .favorites ? t("no.wallpaper.favorites.hint") : t("no.wallpaper.downloads.hint"),
-                    icon: selectedSubTab == .favorites ? "heart.slash" : "arrow.down.circle",
+                    title: hasActiveLibrarySearch ? t("error.empty.title") : (selectedSubTab == .favorites ? t("no.wallpaper.favorites") : t("no.wallpaper.downloads")),
+                    subtitle: hasActiveLibrarySearch ? t("error.empty.message") : (selectedSubTab == .favorites ? t("no.wallpaper.favorites.hint") : t("no.wallpaper.downloads.hint")),
+                    icon: hasActiveLibrarySearch ? "magnifyingglass" : (selectedSubTab == .favorites ? "heart.slash" : "arrow.down.circle"),
                     accent: LiquidGlassColors.primaryPink
                 )
             } else {
                 batchDeleteToolbar(count: wallpaperItems.count + currentWallpaperFolders.count)
 
-                LazyVGrid(columns: config.gridItems, alignment: .leading, spacing: config.spacing) {
-                    // 文件夹
-                    ForEach(currentWallpaperFolders) { folder in
-                        wallpaperFolderCard(folder: folder, config: config)
-                    }
-                    // 壁纸卡片
-                    ForEach(wallpaperItems) { item in
-                        wallpaperGridItem(item: item, config: config)
-                            .onAppear {
-                                preloadNearbyWallpapers(around: item, config: config)
-                            }
-                    }
+                libraryWaterfallGrid(
+                    entries: orderedWallpaperGridItems,
+                    config: config,
+                    estimatedHeight: LibraryCardMetrics.thumbnailHeight + 60
+                ) { entry in
+                    wallpaperGridEntry(entry, config: config)
                 }
             }
         }
     }
 
+    @ViewBuilder
+    private func wallpaperGridEntry(_ entry: LibraryGridEntry<AnyWallpaperItem>, config: LibraryGridConfig) -> some View {
+        switch entry {
+        case .folder(let folder):
+            wallpaperFolderCard(folder: folder, config: config)
+                .overlay(alignment: .leading) {
+                    insertionDropZone(before: entry.id)
+                }
+        case .item(let item):
+            wallpaperGridItem(item: item, config: config)
+                .overlay(alignment: .leading) {
+                    insertionDropZone(before: entry.id)
+                }
+                .onAppear {
+                    preloadNearbyWallpapers(around: item, config: config)
+                }
+        }
+    }
+
     private func wallpaperFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = wallpaperFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
+        let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
         return LibraryFolderCard(
             folder: folder,
             previewURLs: display.previewURLs,
             itemCount: display.itemCount,
             cardWidth: config.cardWidth,
             isEditing: isEditing,
+            isUnlocked: isUnlocked,
+            dragPayload: dragPayload(for: "folder_\(folder.id)"),
             onTap: { handleFolderTap(folder) },
             onDrop: { ids in moveWallpapersToFolder(ids: ids, folderID: folder.id) },
             onDisband: {
                 folderStore.deleteFolder(id: folder.id, contentType: .wallpaper)
+                gridOrderStore.removeIDs(["folder_\(folder.id)"], from: currentGridOrderScope)
                 updateWallpaperItems()
+            },
+            onRename: { startRenamingFolder(folder) },
+            onToggleLock: {
+                folderStore.toggleFolderLock(id: folder.id, contentType: .wallpaper)
+            },
+            onRelock: {
+                folderLockService.lockFolder(folder.id)
             }
         )
     }
@@ -431,10 +782,44 @@ struct MyLibraryContentView: View {
     }
 
     private func moveWallpapersToFolder(ids: [String], folderID: String) {
+        gridOrderStore.removeIDs(Set(ids), from: currentGridOrderScope)
+        let unifiedByID: [String: UnifiedLocalWallpaper] = Dictionary(
+            uniqueKeysWithValues: viewModel.allLocalWallpapers.map { ($0.id, $0) }
+        )
         for id in ids {
-            folderStore.moveWallpaperToFolder(wallpaperID: id, folderID: folderID)
+            // 对「扫描进来但还没有 DownloadRecord」的项传 fallback，
+            // 让 Service 层自动补登记，确保 folderID 写得进去。
+            let fallback: (wallpaper: Wallpaper, fileURL: URL)?
+            if let unified = unifiedByID[id], unified.downloadRecord == nil {
+                fallback = (unified.wallpaper, unified.fileURL)
+            } else {
+                fallback = nil
+            }
+            folderStore.moveWallpaperToFolder(
+                wallpaperID: id,
+                folderID: folderID,
+                fallback: fallback
+            )
         }
         updateWallpaperItems()
+    }
+
+    private func debouncedUpdateWallpaperItems() {
+        updateWallpaperDebounce?.cancel()
+        let work = DispatchWorkItem { [self] in
+            updateWallpaperItems()
+        }
+        updateWallpaperDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+    }
+
+    private func debouncedUpdateMediaItems() {
+        updateMediaDebounce?.cancel()
+        let work = DispatchWorkItem { [self] in
+            updateMediaItems()
+        }
+        updateMediaDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
     }
 
     private func updateWallpaperItems() {
@@ -469,15 +854,39 @@ struct MyLibraryContentView: View {
         case .portrait:
             wallpaperItems = baseItems.filter { $0.wallpaper.dimensionX < $0.wallpaper.dimensionY }
         }
+        if hasActiveLibrarySearch {
+            let query = trimmedLibrarySearchQuery
+            wallpaperItems = wallpaperItems.filter { matchesLibrarySearch(for: $0, query: query) }
+        }
+        // ⚡ prefetch 用的 ID→Index 缓存与 wallpaperItems 同步刷新
+        var idMap: [String: Int] = [:]
+        idMap.reserveCapacity(wallpaperItems.count)
+        for (idx, item) in wallpaperItems.enumerated() { idMap[item.id] = idx }
+        wallpaperIDIndexCache = idMap
         refreshWallpaperFolderDisplay()
+        syncSelectionWithVisibleItems()
+    }
+
+    private var orderedWallpaperGridItems: [LibraryGridEntry<AnyWallpaperItem>] {
+        let entries = currentWallpaperFolders.map { LibraryGridEntry<AnyWallpaperItem>.folder($0) }
+            + wallpaperItems.map { LibraryGridEntry<AnyWallpaperItem>.item($0) }
+        return orderedGridEntries(entries)
     }
 
     private var currentWallpaperFolders: [LibraryFolder] {
-        folderStore.folders(for: .wallpaper, parentID: currentWallpaperFolderID)
+        let collection: LibraryFolder.FolderCollection = selectedSubTab == .favorites ? .favorites : .downloads
+        let folders = folderStore.folders(for: .wallpaper, parentID: currentWallpaperFolderID, collection: collection)
+        guard hasActiveLibrarySearch else { return folders }
+        let query = trimmedLibrarySearchQuery
+        return folders.filter { matchesLibrarySearch(for: $0, query: query) }
     }
 
     private var currentMediaFolders: [LibraryFolder] {
-        folderStore.folders(for: .media, parentID: currentMediaFolderID)
+        let collection: LibraryFolder.FolderCollection = selectedSubTab == .favorites ? .favorites : .downloads
+        let folders = folderStore.folders(for: .media, parentID: currentMediaFolderID, collection: collection)
+        guard hasActiveLibrarySearch else { return folders }
+        let query = trimmedLibrarySearchQuery
+        return folders.filter { matchesLibrarySearch(for: $0, query: query) }
     }
 
     private func updateMediaItems() {
@@ -511,7 +920,42 @@ struct MyLibraryContentView: View {
         }
         // 媒体库不再做横屏/竖屏筛选
         mediaItems = baseItems
+        if hasActiveLibrarySearch {
+            let query = trimmedLibrarySearchQuery
+            mediaItems = mediaItems.filter { matchesLibrarySearch(for: $0, query: query) }
+        }
+        // ⚡ prefetch 用的 ID→Index 缓存与 mediaItems 同步刷新
+        var idMap: [String: Int] = [:]
+        idMap.reserveCapacity(mediaItems.count)
+        for (idx, item) in mediaItems.enumerated() { idMap[item.id] = idx }
+        mediaIDIndexCache = idMap
         refreshMediaFolderDisplay()
+        syncSelectionWithVisibleItems()
+    }
+
+    private var orderedMediaGridItems: [LibraryGridEntry<AnyMediaItem>] {
+        let entries = currentMediaFolders.map { LibraryGridEntry<AnyMediaItem>.folder($0) }
+            + mediaItems.map { LibraryGridEntry<AnyMediaItem>.item($0) }
+        return orderedGridEntries(entries)
+    }
+
+    private func orderedGridEntries<Item>(_ entries: [LibraryGridEntry<Item>]) -> [LibraryGridEntry<Item>] {
+        let orderedIDs = gridOrderStore.orderedIDs(for: entries.map(\.id), scope: currentGridOrderScope)
+        let entryByID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        return orderedIDs.compactMap { entryByID[$0] }
+    }
+
+    private var currentGridOrderScope: LibraryGridOrderScope {
+        LibraryGridOrderScope(
+            content: selectedContentType == .wallpaper ? .wallpaper : .media,
+            collection: selectedSubTab == .favorites ? .favorites : .downloads,
+            parentFolderID: selectedContentType == .wallpaper ? currentWallpaperFolderID : currentMediaFolderID
+        )
+    }
+
+    private func startRenamingFolder(_ folder: LibraryFolder) {
+        renameFolderName = folder.name
+        renamingFolder = folder
     }
 
     @ViewBuilder
@@ -527,9 +971,11 @@ struct MyLibraryContentView: View {
         ) {
             handleWallpaperTap(item.wallpaper)
         }
+        .equatable()
         .contextMenu {
             if currentWallpaperFolderID != nil {
                 Button {
+                    gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)
                     folderStore.moveWallpaperToFolder(wallpaperID: item.id, folderID: nil)
                     updateWallpaperItems()
                 } label: {
@@ -542,15 +988,7 @@ struct MyLibraryContentView: View {
 
     // MARK: - Media Section
     private func mediaSection(config: LibraryGridConfig) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            sectionHeader(
-                title: t("library.videos"),
-                color: LiquidGlassColors.secondaryViolet,
-                importAction: { Task { await importMedia() } },
-                workshopImportAction: importWorkshop,
-                folderURL: DownloadPathManager.shared.mediaFolderURL
-            )
-
+        VStack(alignment: .leading, spacing: 12) {
             // 文件夹导航面包屑
             folderBreadcrumb(
                 folderStack: mediaFolderStack,
@@ -561,44 +999,68 @@ struct MyLibraryContentView: View {
 
             if mediaItems.isEmpty && currentMediaFolders.isEmpty {
                 emptyMediaSurface(
-                    title: selectedSubTab == .favorites ? t("no.media.favorites") : t("no.media.downloads"),
-                    subtitle: selectedSubTab == .favorites ? t("no.media.favorites.hint") : t("no.media.downloads.hint"),
-                    icon: selectedSubTab == .favorites ? "heart.slash" : "arrow.down.circle",
+                    title: hasActiveLibrarySearch ? t("error.empty.title") : (selectedSubTab == .favorites ? t("no.media.favorites") : t("no.media.downloads")),
+                    subtitle: hasActiveLibrarySearch ? t("error.empty.message") : (selectedSubTab == .favorites ? t("no.media.favorites.hint") : t("no.media.downloads.hint")),
+                    icon: hasActiveLibrarySearch ? "magnifyingglass" : (selectedSubTab == .favorites ? "heart.slash" : "arrow.down.circle"),
                     accent: LiquidGlassColors.secondaryViolet
                 )
             } else {
                 batchDeleteToolbar(count: mediaItems.count + currentMediaFolders.count)
 
-                LazyVGrid(columns: config.gridItems, alignment: .leading, spacing: config.spacing) {
-                    // 文件夹
-                    ForEach(currentMediaFolders) { folder in
-                        mediaFolderCard(folder: folder, config: config)
-                    }
-                    // 媒体卡片
-                    ForEach(mediaItems) { item in
-                        mediaGridItem(item: item, config: config)
-                            .onAppear {
-                                preloadNearbyMedia(around: item, config: config)
-                            }
-                    }
+                libraryWaterfallGrid(
+                    entries: orderedMediaGridItems,
+                    config: config,
+                    estimatedHeight: LibraryCardMetrics.thumbnailHeight + 56
+                ) { entry in
+                    mediaGridEntry(entry, config: config)
                 }
             }
         }
     }
 
+    @ViewBuilder
+    private func mediaGridEntry(_ entry: LibraryGridEntry<AnyMediaItem>, config: LibraryGridConfig) -> some View {
+        switch entry {
+        case .folder(let folder):
+            mediaFolderCard(folder: folder, config: config)
+                .overlay(alignment: .leading) {
+                    insertionDropZone(before: entry.id)
+                }
+        case .item(let item):
+            mediaGridItem(item: item, config: config)
+                .overlay(alignment: .leading) {
+                    insertionDropZone(before: entry.id)
+                }
+                .onAppear {
+                    preloadNearbyMedia(around: item, config: config)
+                }
+        }
+    }
+
     private func mediaFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = mediaFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
+        let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
         return LibraryFolderCard(
             folder: folder,
             previewURLs: display.previewURLs,
             itemCount: display.itemCount,
             cardWidth: config.cardWidth,
             isEditing: isEditing,
+            isUnlocked: isUnlocked,
+            dragPayload: dragPayload(for: "folder_\(folder.id)"),
             onTap: { handleFolderTap(folder) },
             onDrop: { ids in moveMediasToFolder(ids: ids, folderID: folder.id) },
             onDisband: {
                 folderStore.deleteFolder(id: folder.id, contentType: .media)
+                gridOrderStore.removeIDs(["folder_\(folder.id)"], from: currentGridOrderScope)
                 updateMediaItems()
+            },
+            onRename: { startRenamingFolder(folder) },
+            onToggleLock: {
+                folderStore.toggleFolderLock(id: folder.id, contentType: .media)
+            },
+            onRelock: {
+                folderLockService.lockFolder(folder.id)
             }
         )
     }
@@ -622,8 +1084,22 @@ struct MyLibraryContentView: View {
     }
 
     private func moveMediasToFolder(ids: [String], folderID: String) {
+        gridOrderStore.removeIDs(Set(ids), from: currentGridOrderScope)
+        let unifiedByID: [String: UnifiedLocalMedia] = Dictionary(
+            uniqueKeysWithValues: mediaViewModel.allLocalMedia.map { ($0.id, $0) }
+        )
         for id in ids {
-            folderStore.moveMediaToFolder(mediaID: id, folderID: folderID)
+            let fallback: (item: MediaItem, fileURL: URL)?
+            if let unified = unifiedByID[id], unified.downloadRecord == nil {
+                fallback = (unified.mediaItem, unified.fileURL)
+            } else {
+                fallback = nil
+            }
+            folderStore.moveMediaToFolder(
+                mediaID: id,
+                folderID: folderID,
+                fallback: fallback
+            )
         }
         updateMediaItems()
     }
@@ -648,13 +1124,16 @@ struct MyLibraryContentView: View {
             cardWidth: config.cardWidth,
             thumbnailURL: item.thumbnailURL,
             shouldProbeAnimatedThumbnail: item.shouldProbeAnimatedThumbnail,
-            resolvedVideoFileURL: item.resolvedVideoFileURL
+            resolvedVideoFileURL: item.resolvedVideoFileURL,
+            isVisible: isVisible
         ) {
             handleMediaTap(item.mediaItem)
         }
+        .equatable()
         .contextMenu {
             if currentMediaFolderID != nil {
                 Button {
+                    gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)
                     folderStore.moveMediaToFolder(mediaID: item.id, folderID: nil)
                     updateMediaItems()
                 } label: {
@@ -667,7 +1146,6 @@ struct MyLibraryContentView: View {
 
     private func dragPayload(for itemID: String) -> String {
         let selectedMovableIDs = selectedItems
-            .filter { !$0.hasPrefix("folder_") }
             .filter { currentItemIDs.contains($0) }
 
         guard selectedItems.contains(itemID), !selectedMovableIDs.isEmpty else {
@@ -677,9 +1155,87 @@ struct MyLibraryContentView: View {
         return "waifux:items:\(selectedMovableIDs.sorted().joined(separator: "\n"))"
     }
 
+    // MARK: - 拖拽反馈辅助
+
+    /// 单条插入条 drop zone：贴在卡片左侧内缘，命中时显示一根蓝色指示条。
+    /// 占用卡片左侧约 14pt 命中宽。不挡卡片其他区域的点击/hover。
+    @ViewBuilder
+    private func insertionDropZone(before entryID: String) -> some View {
+        let isActive = hoveredInsertionID == entryID
+        ZStack(alignment: .leading) {
+            if isActive {
+                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                    .fill(Color.accentColor)
+                    .frame(width: 3)
+                    .padding(.vertical, 6)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+            Color.clear
+                .frame(width: 14)
+                .contentShape(Rectangle())
+                .dropDestination(for: String.self) { payloads, _ in
+                    handleGridReorderDrop(payloads, before: entryID)
+                } isTargeted: { hovering in
+                    if hovering {
+                        hoveredInsertionID = entryID
+                    } else if hoveredInsertionID == entryID {
+                        hoveredInsertionID = nil
+                    }
+                }
+        }
+        .frame(maxHeight: .infinity)
+        .animation(.easeOut(duration: 0.12), value: isActive)
+    }
+
+    /// 处理排序 drop。
+    /// - Parameter targetID: 插入到该 entry 之前；传 nil 表示插入到末尾。
+    @discardableResult
+    private func handleGridReorderDrop(_ payloads: [String], before targetID: String?) -> Bool {
+        let movingIDs = uniqueIDs(payloads.flatMap(parseDropPayload))
+            .filter { currentItemIDs.contains($0) }
+        guard !movingIDs.isEmpty else { return false }
+
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.85)) {
+            gridOrderStore.reorder(
+                moving: movingIDs,
+                before: targetID,
+                availableIDs: currentItemIDs,
+                scope: currentGridOrderScope
+            )
+            updateWallpaperItems()
+            updateMediaItems()
+            hoveredInsertionID = nil
+        }
+        return true
+    }
+
+    private func parseDropPayload(_ payload: String) -> [String] {
+        if payload.hasPrefix("waifux:items:") {
+            return String(payload.dropFirst(13))
+                .split(separator: "\n")
+                .map(String.init)
+                .filter { !$0.isEmpty }
+        }
+        if payload.hasPrefix("waifux:item:") {
+            return [String(payload.dropFirst(12))]
+        }
+        return []
+    }
+
+    private func uniqueIDs(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ids.filter { seen.insert($0).inserted }
+    }
+
     // MARK: - Image Preloading
+    //
+    // ⚡ 滚动时每个 grid item 的 .onAppear 都会调 preloadNearbyXxx；旧实现内部走
+    // `firstIndex(where:)` 是 O(N)，大库（数千项）时每次滚动 mount 几十张就会做几十次
+    // 全表扫描。改用 ID→Index 字典做 O(1) 查找。
+
     private func preloadNearbyWallpapers(around item: AnyWallpaperItem, config: LibraryGridConfig) {
-        guard let index = wallpaperItems.firstIndex(where: { $0.id == item.id }) else { return }
+        guard let index = wallpaperIDIndexCache[item.id] else { return }
         let bucket = prefetchBucket(for: index)
         guard lastWallpaperPrefetchBucket != bucket else { return }
         lastWallpaperPrefetchBucket = bucket
@@ -699,7 +1255,7 @@ struct MyLibraryContentView: View {
     }
 
     private func preloadNearbyMedia(around item: AnyMediaItem, config: LibraryGridConfig) {
-        guard let index = currentMediaItems.firstIndex(where: { $0.id == item.id }) else { return }
+        guard let index = mediaIDIndexCache[item.id] else { return }
         let bucket = prefetchBucket(for: index)
         guard lastMediaPrefetchBucket != bucket else { return }
         lastMediaPrefetchBucket = bucket
@@ -720,7 +1276,7 @@ struct MyLibraryContentView: View {
     }
 
     private func preloadNearbyAnime(around anime: AnimeSearchResult, config: AnimeGridConfig) {
-        guard let index = currentAnimeItems.firstIndex(where: { $0.id == anime.id }) else { return }
+        guard let index = animeIDIndexCache[anime.id] else { return }
         let bucket = prefetchBucket(for: index)
         guard lastAnimePrefetchBucket != bucket else { return }
         lastAnimePrefetchBucket = bucket
@@ -855,24 +1411,20 @@ struct MyLibraryContentView: View {
 
     // MARK: - Anime Section
     private func animeSection(config: AnimeGridConfig) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            sectionHeader(
-                title: t("library.anime"),
-                color: LiquidGlassColors.tertiaryBlue,
-                importAction: nil,
-                folderURL: nil
-            )
-
+        VStack(alignment: .leading, spacing: 12) {
             if currentAnimeItems.isEmpty {
                 emptyMediaSurface(
-                    title: t("no.anime.favorites"),
-                    subtitle: t("no.anime.favorites.hint"),
-                    icon: "heart.slash",
+                    title: hasActiveLibrarySearch ? t("error.empty.title") : t("no.anime.favorites"),
+                    subtitle: hasActiveLibrarySearch ? t("error.empty.message") : t("no.anime.favorites.hint"),
+                    icon: hasActiveLibrarySearch ? "magnifyingglass" : "heart.slash",
                     accent: LiquidGlassColors.tertiaryBlue
                 )
             } else {
                 batchDeleteToolbar(count: currentAnimeItems.count)
 
+                let animeCardHeight = config.cardWidth * 1.4 + 52
+
+                // ⚡ 改用 LazyVGrid：动漫卡片高度统一，不需要瀑布流多列对齐。
                 LazyVGrid(columns: config.gridItems, alignment: .leading, spacing: config.spacing) {
                     ForEach(currentAnimeItems) { anime in
                         AnimeLibraryCard(
@@ -886,6 +1438,7 @@ struct MyLibraryContentView: View {
                         .onAppear {
                             preloadNearbyAnime(around: anime, config: config)
                         }
+                        .frame(height: animeCardHeight)
                     }
                 }
             }
@@ -894,219 +1447,581 @@ struct MyLibraryContentView: View {
 
     private var currentAnimeItems: [AnimeSearchResult] {
         // 动漫目前只有收藏
-        animeFavorites
+        guard hasActiveLibrarySearch else { return animeFavorites }
+        let query = trimmedLibrarySearchQuery
+        return animeFavorites.filter { matchesLibrarySearch(for: $0, query: query) }
     }
 
     // MARK: - Section Header
-    private func sectionHeader(
-        title: String,
-        color: Color,
-        importAction: (() -> Void)?,
-        workshopImportAction: (() -> Void)? = nil,
-        folderURL: URL?
-    ) -> some View {
-        HStack(spacing: 16) {
-            // 左侧：收藏 / 已下载 下拉选择器 + 壁纸比例筛选
-            HStack(spacing: 10) {
-                if selectedContentType != .anime {
-                    Menu {
-                        ForEach(SubTab.allCases, id: \.self) { tab in
-                            Button(tab.title) {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    selectedSubTab = tab
-                                    isEditing = false
-                                    selectedItems.removeAll()
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Text(selectedSubTab.title)
-                                .font(.system(size: 14, weight: .semibold))
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 10, weight: .semibold))
-                        }
-                        .foregroundStyle(.white.opacity(0.95))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.white.opacity(0.1))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                        )
-                    }
-                    .menuStyle(.borderlessButton)
-                    .pointingHandCursor()
-                } else {
-                    Text(title)
-                        .font(.system(size: 20, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.95))
+    // MARK: - 同步订阅 - Profile ID 输入 Sheet
+
+    @State private var syncProfileInput: String = ""
+
+    private var syncProfileSheet: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 32))
+                .foregroundStyle(Color.accentColor)
+
+            Text("同步 Steam 订阅")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(.white)
+
+            Text("请输入你的 Steam 社区档案 ID（64位数字ID 或 自定义URL）\n例如：76561198113134000 或 customurl")
+                .font(.system(size: 13))
+                .foregroundStyle(.white.opacity(0.7))
+                .multilineTextAlignment(.center)
+                .lineSpacing(4)
+
+            TextField("Steam Profile ID", text: $syncProfileInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 14))
+                .padding(.horizontal, 20)
+                .onAppear {
+                    syncProfileInput = workshopSourceManager.steamProfileID
                 }
 
-                // 壁纸比例筛选（媒体库不显示）
-                if selectedContentType == .wallpaper {
-                    HStack(spacing: 0) {
-                        ForEach(WallpaperRatioFilter.allCases, id: \.self) { filter in
-                            Button {
-                                if selectedContentType == .wallpaper {
-                                    wallpaperRatioFilter = filter
-                                } else {
-                                    mediaRatioFilter = filter
-                                }
-                                isEditing = false
-                                selectedItems.removeAll()
-                            } label: {
-                                Text(filter.title)
-                                    .font(.system(size: 12, weight: activeRatioFilter == filter ? .semibold : .medium))
-                                    .foregroundStyle(activeRatioFilter == filter ? .white : .white.opacity(0.7))
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                            .fill(activeRatioFilter == filter ? color.opacity(0.35) : Color.clear)
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            .pointingHandCursor()
+            HStack(spacing: 12) {
+                Button("取消") {
+                    showSyncProfileSheet = false
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.7))
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+
+                Button("保存并继续") {
+                    let trimmed = syncProfileInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return }
+                    workshopSourceManager.steamProfileID = trimmed
+                    showSyncProfileSheet = false
+                    Task { await fetchSubscriptionList() }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.5))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.accentColor.opacity(0.3), lineWidth: 1)
+                )
+                .disabled(syncProfileInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(30)
+        .frame(width: 400)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(hex: "1C1C1E"))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                )
+        )
+    }
+
+    // MARK: - 同步订阅 - 选择列表 Sheet
+
+    private var syncSelectionSheet: some View {
+        VStack(spacing: 0) {
+            // 标题区
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("选择要同步的订阅")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("已过滤掉已下载的项目，共 \(syncSubscribedItems.count) 个待同步")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                Spacer()
+                Button("全选") {
+                    let allIDs = Set(syncSubscribedItems.map(\.id))
+                    if syncSelectedIDs == allIDs {
+                        syncSelectedIDs = []
+                    } else {
+                        syncSelectedIDs = allIDs
+                    }
+                }
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 24)
+            .padding(.bottom, 12)
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            if syncIsLoadingList {
+                Spacer()
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在获取订阅列表...")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                Spacer()
+            } else if syncSubscribedItems.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.green.opacity(0.7))
+                    Text("所有订阅已同步完成")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(syncSubscribedItems) { item in
+                            syncSelectionRow(item: item)
+                            Divider()
+                                .background(Color.white.opacity(0.05))
+                                .padding(.leading, 60)
                         }
                     }
-                    .padding(.horizontal, 2)
-                    .padding(.vertical, 2)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color.white.opacity(0.06))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                    )
+                    .padding(.vertical, 4)
                 }
             }
 
-            Spacer()
+            Divider()
+                .background(Color.white.opacity(0.1))
 
-            // 右侧：按钮组
-            HStack(spacing: 8) {
-                // 新建文件夹
-                if selectedContentType != .anime {
-                    Button {
-                        showNewFolderSheet = true
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "folder.badge.plus")
-                                .font(.system(size: 12))
-                            Text(t("new.folder"))
-                                .font(.system(size: 13, weight: .semibold))
+            // 底部确认区
+            HStack {
+                Text("已选择 \(syncSelectedIDs.count) 项")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.5))
+
+                Spacer()
+
+                Button("取消") {
+                    showSyncSelectionSheet = false
+                    syncSubscribedItems = []
+                    syncSelectedIDs = []
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.7))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+
+                Button {
+                    let selectedItems = syncSubscribedItems.filter { syncSelectedIDs.contains($0.id) }
+                    showSyncSelectionSheet = false
+                    syncSubscribedItems = []
+                    syncSelectedIDs = []
+                    Task { await downloadSelectedSubscriptions(selectedItems) }
+                } label: {
+                    HStack(spacing: 6) {
+                        if isSyncingSubscriptions {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.7)
                         }
-                        .foregroundStyle(.white.opacity(0.9))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.white.opacity(0.08))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                        )
+                        Text("确认下载 (\(syncSelectedIDs.count))")
+                            .font(.system(size: 13, weight: .semibold))
                     }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(syncSelectedIDs.isEmpty
+                                  ? Color.white.opacity(0.05)
+                                  : Color.accentColor.opacity(0.5))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(syncSelectedIDs.isEmpty
+                                    ? Color.white.opacity(0.05)
+                                    : Color.accentColor.opacity(0.3), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .disabled(syncSelectedIDs.isEmpty || isSyncingSubscriptions)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+        }
+        .frame(width: 520, height: 480)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(hex: "1C1C1E"))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                )
+        )
+    }
+
+    private func syncSelectionRow(item: WorkshopWallpaper) -> some View {
+        Button {
+            if syncSelectedIDs.contains(item.id) {
+                syncSelectedIDs.remove(item.id)
+            } else {
+                syncSelectedIDs.insert(item.id)
+            }
+        } label: {
+            HStack(spacing: 12) {
+                // 复选框
+                Image(systemName: syncSelectedIDs.contains(item.id) ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 18))
+                    .foregroundStyle(syncSelectedIDs.contains(item.id)
+                                     ? Color.accentColor
+                                     : .white.opacity(0.3))
+
+                // 预览图（使用 Kingfisher 缓存，避免滚动时重复加载）
+                KFImage(item.previewURL)
+                    .fade(duration: 0.2)
+                    .placeholder { _ in
+                        Color.gray.opacity(0.2)
+                    }
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 48, height: 36)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                    )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(item.type.rawValue.capitalized)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Color.accentColor.opacity(0.7))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.15))
+                            .cornerRadius(3)
+                        if let subs = item.subscriptions {
+                            Text("\(formatStat(subs)) 订阅")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.4))
+                        }
+                    }
                 }
 
-                // 编辑 / 完成
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .background(
+            Color.white.opacity(syncSelectedIDs.contains(item.id) ? 0.04 : 0)
+        )
+    }
+
+    private func formatStat(_ count: Int) -> String {
+        if count >= 10000 {
+            return String(format: "%.1fw", Double(count) / 10000)
+        } else if count >= 1000 {
+            return String(format: "%.1fk", Double(count) / 1000)
+        }
+        return "\(count)"
+    }
+
+    private var librarySearchControl: some View {
+        HStack(spacing: 0) {
+            if isLibrarySearchExpanded {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+
+                    TextField(t("search.placeholder"), text: $librarySearchQuery)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .focused($isLibrarySearchFocused)
+                        .onSubmit {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                isLibrarySearchExpanded = false
+                            }
+                        }
+                        .onExitCommand {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                isLibrarySearchExpanded = false
+                            }
+                        }
+
+                    if !librarySearchQuery.isEmpty {
+                        Button {
+                            librarySearchQuery = ""
+                            // 清空后自动收起
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                isLibrarySearchExpanded = false
+                            }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .frame(maxWidth: 240)
+                .frame(height: 42)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            } else {
                 Button {
-                    withAnimation {
-                        isEditing.toggle()
-                        selectedItems.removeAll()
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        isLibrarySearchExpanded = true
+                        isLibrarySearchFocused = true
                     }
                 } label: {
-                    Text(isEditing ? t("done") : t("edit"))
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(isEditing ? .white : .white.opacity(0.9))
-                        .padding(.horizontal, 12)
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.88))
+                        .frame(width: 42, height: 42)
+                }
+                .buttonStyle(.plain)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .liquidGlassSurface(.regular, in: Capsule(style: .continuous), lightweight: true)
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
+        .clipped()
+        .animation(.easeInOut(duration: 0.25), value: isLibrarySearchExpanded)
+        .onChange(of: isLibrarySearchFocused) { _, focused in
+            if !focused {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    isLibrarySearchExpanded = false
+                }
+            }
+        }
+    }
+
+    private func libraryToolbarActions(tint: Color) -> some View {
+        HStack(spacing: 8) {
+            toolbarCapsuleButton(
+                title: isEditing ? t("done") : t("edit"),
+                systemImage: isEditing ? "checkmark.circle.fill" : "checkmark.circle",
+                tint: tint,
+                prominence: isEditing ? .primary : .secondary
+            ) {
+                withAnimation {
+                    isEditing.toggle()
+                    selectedItems.removeAll()
+                }
+            }
+
+            if selectedContentType != .anime {
+                toolbarCapsuleButton(
+                    title: t("new.folder"),
+                    systemImage: "folder.badge.plus",
+                    tint: tint,
+                    prominence: .secondary
+                ) {
+                    showNewFolderSheet = true
+                }
+
+                // 统一导入按钮（仅下载标签下显示）
+                if selectedSubTab == .downloads {
+                    toolbarCapsuleButton(
+                        title: t("import"),
+                        systemImage: "square.and.arrow.down",
+                        tint: tint,
+                        prominence: .primary
+                    ) {
+                        startImport()
+                    }
+                }
+            }
+
+            libraryUtilityMenu(tint: tint)
+        }
+    }
+
+    private var subTabDropdown: some View {
+        Menu {
+            ForEach(SubTab.allCases, id: \.self) { tab in
+                Button(tab.title) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        selectedSubTab = tab
+                        isEditing = false
+                        selectedItems.removeAll()
+                    }
+                }
+            }
+        } label: {
+            Text(selectedSubTab.title)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.95))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .liquidGlassSurface(.regular, in: RoundedRectangle(cornerRadius: 8, style: .continuous), lightweight: true)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+                )
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: true, vertical: false)
+        .pointingHandCursor()
+    }
+
+    private func wallpaperRatioPicker(color: Color) -> some View {
+        HStack(spacing: 0) {
+            ForEach(WallpaperRatioFilter.allCases, id: \.self) { filter in
+                Button {
+                    wallpaperRatioFilter = filter
+                    isEditing = false
+                    selectedItems.removeAll()
+                } label: {
+                    Text(filter.title)
+                        .font(.system(size: 12, weight: activeRatioFilter == filter ? .semibold : .medium))
+                        .foregroundStyle(activeRatioFilter == filter ? .white : .white.opacity(0.7))
+                        .padding(.horizontal, 10)
                         .padding(.vertical, 6)
                         .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(isEditing ? color.opacity(0.35) : Color.white.opacity(0.08))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(activeRatioFilter == filter ? color.opacity(0.35) : Color.clear)
                         )
                 }
                 .buttonStyle(.plain)
                 .pointingHandCursor()
-
-                // 导入
-                if let importAction {
-                    Button(action: importAction) {
-                        Text(t("import"))
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color.white.opacity(0.08))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
-                }
-
-                // Workshop 导入
-                if let workshopImportAction {
-                    Button(action: workshopImportAction) {
-                        Text(t("import.workshop"))
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color.white.opacity(0.08))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
-                }
-
-                // 打开文件夹
-                if let folderURL {
-                    Button {
-                        openFolderInFinder(folderURL)
-                    } label: {
-                        Text(t("open.in.finder"))
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color.white.opacity(0.08))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
-                }
             }
         }
+        .padding(.horizontal, 2)
+        .padding(.vertical, 2)
+        .liquidGlassSurface(.regular, in: RoundedRectangle(cornerRadius: 8, style: .continuous), lightweight: true)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
+        )
+    }
+
+    @ViewBuilder
+    private func libraryUtilityMenu(tint: Color) -> some View {
+        let hasMenuItems = selectedSubTab == .downloads
+        && (selectedContentType == .wallpaper || selectedContentType == .video)
+
+        if hasMenuItems {
+            Menu {
+                if selectedSubTab == .downloads {
+                    switch selectedContentType {
+                    case .wallpaper:
+                        Button {
+                            openFolderInFinder(DownloadPathManager.shared.wallpapersFolderURL)
+                        } label: {
+                            Label(t("open.in.finder"), systemImage: "folder")
+                        }
+                    case .video:
+                        Button(action: { syncSubscriptions() }) {
+                            Label(isSyncingSubscriptions ? t("syncing") : t("sync.subscriptions"), systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(isSyncingSubscriptions)
+
+                        Button {
+                            openFolderInFinder(DownloadPathManager.shared.mediaFolderURL)
+                        } label: {
+                            Label(t("open.in.finder"), systemImage: "folder")
+                        }
+                    case .anime:
+                        EmptyView()
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.84))
+                    .frame(width: 36, height: 36)
+                    .liquidGlassSurface(.regular, in: Circle(), lightweight: true)
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
+                    )
+            }
+            .menuStyle(.borderlessButton)
+            .pointingHandCursor()
+        }
+    }
+
+    private enum ToolbarButtonProminence {
+        case primary
+        case secondary
+    }
+
+    private func toolbarCapsuleButton(
+        title: String,
+        systemImage: String,
+        tint: Color,
+        prominence: ToolbarButtonProminence,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .semibold))
+
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundStyle(.white.opacity(0.92))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background {
+                Group {
+                    if prominence == .primary {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(tint.opacity(0.3))
+                    } else {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(.regularMaterial)
+                            .opacity(0.5)
+                    }
+                }
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(prominence == .primary ? tint.opacity(0.24) : Color.white.opacity(0.15), lineWidth: 1)
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
     }
 
     // MARK: - 文件夹面包屑
@@ -1153,7 +2068,8 @@ struct MyLibraryContentView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.white.opacity(0.06))
+                            .fill(.regularMaterial)
+                            .opacity(0.4)
                     )
                 }
                 .buttonStyle(.plain)
@@ -1240,6 +2156,7 @@ struct MyLibraryContentView: View {
         if isEditing {
             toggleSelection(wallpaper.id)
         } else {
+            savedLibraryScrollOffset = libraryScrollRuntimeState.currentOffset
             wallpaperContext = wallpaperItems.map(\.wallpaper)
             selectedWallpaper = wallpaper
         }
@@ -1248,13 +2165,33 @@ struct MyLibraryContentView: View {
     private func handleFolderTap(_ folder: LibraryFolder) {
         if isEditing {
             toggleSelection("folder_\(folder.id)")
-        } else {
-            switch folder.contentType {
-            case .wallpaper:
-                navigateToWallpaperFolder(folder.id)
-            case .media:
-                navigateToMediaFolder(folder.id)
+            return
+        }
+
+        // 加密文件夹需要认证
+        if folder.isLocked {
+            let lockService = FolderLockService.shared
+            if !lockService.isFolderUnlocked(folder.id) {
+                Task { @MainActor in
+                    let reason = "解锁「\(folder.name)」文件夹"
+                    let success = await lockService.unlockFolder(folderID: folder.id, reason: reason)
+                    if success {
+                        navigateToFolder(folder)
+                    }
+                }
+                return
             }
+        }
+
+        navigateToFolder(folder)
+    }
+
+    private func navigateToFolder(_ folder: LibraryFolder) {
+        switch folder.contentType {
+        case .wallpaper:
+            navigateToWallpaperFolder(folder.id)
+        case .media:
+            navigateToMediaFolder(folder.id)
         }
     }
 
@@ -1262,6 +2199,7 @@ struct MyLibraryContentView: View {
         if isEditing {
             toggleSelection(item.id)
         } else {
+            savedLibraryScrollOffset = libraryScrollRuntimeState.currentOffset
             mediaContext = mediaItems.map(\.mediaItem)
             selectedMedia = item
         }
@@ -1271,6 +2209,7 @@ struct MyLibraryContentView: View {
         if isEditing {
             toggleSelection(anime.id)
         } else {
+            savedLibraryScrollOffset = libraryScrollRuntimeState.currentOffset
             selectedAnime = anime
         }
     }
@@ -1288,22 +2227,23 @@ struct MyLibraryContentView: View {
         selectedItems = selectedItems.count == allIDs.count ? [] : allIDs
     }
 
+    private func syncSelectionWithVisibleItems() {
+        selectedItems = selectedItems.intersection(Set(currentItemIDs))
+    }
+
     private var currentItemIDs: [String] {
         switch selectedContentType {
         case .wallpaper:
-            let folderIDs = currentWallpaperFolders.map { "folder_\($0.id)" }
-            let itemIDs = wallpaperItems.map(\.id)
-            return folderIDs + itemIDs
+            return orderedWallpaperGridItems.map(\.id)
         case .video:
-            let folderIDs = currentMediaFolders.map { "folder_\($0.id)" }
-            let itemIDs = currentMediaItems.map(\.id)
-            return folderIDs + itemIDs
+            return orderedMediaGridItems.map(\.id)
         case .anime:
             return currentAnimeItems.map(\.id)
         }
     }
 
     private func deleteSelectedItems() {
+        let removedOrderIDs = selectedItems
         // 分离文件夹 ID 和普通项目 ID
         let folderIDs = selectedItems.filter { $0.hasPrefix("folder_") }
         let itemIDs = selectedItems.filter { !$0.hasPrefix("folder_") }
@@ -1361,10 +2301,76 @@ struct MyLibraryContentView: View {
                 await loadAnimeFavorites()
             }
         }
+        if selectedContentType != .anime {
+            gridOrderStore.removeIDs(removedOrderIDs, from: currentGridOrderScope)
+        }
         selectedItems.removeAll()
         isEditing = false
         updateWallpaperItems()
         updateMediaItems()
+    }
+
+    private func matchesLibrarySearch(for folder: LibraryFolder, query: String) -> Bool {
+        folder.name.localizedCaseInsensitiveContains(query)
+    }
+
+    private func matchesLibrarySearch(for item: AnyWallpaperItem, query: String) -> Bool {
+        let wallpaper = item.wallpaper
+        let directMatches = [
+            item.localFileURL?.deletingPathExtension().lastPathComponent,
+            wallpaper.id,
+            wallpaper.category,
+            wallpaper.categoryDisplayName,
+            wallpaper.purity,
+            wallpaper.purityDisplayName,
+            wallpaper.effectiveResolutionLabel,
+            wallpaper.ratio,
+            wallpaper.source,
+            wallpaper.uploader?.username,
+            wallpaper.primaryTagName
+        ]
+        if directMatches.contains(where: { $0?.localizedCaseInsensitiveContains(query) == true }) {
+            return true
+        }
+        return wallpaper.tags?.contains(where: {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || ($0.alias?.localizedCaseInsensitiveContains(query) ?? false)
+        }) ?? false
+    }
+
+    private func matchesLibrarySearch(for item: AnyMediaItem, query: String) -> Bool {
+        let media = item.mediaItem
+        let directMatches = [
+            item.localFileURL?.deletingPathExtension().lastPathComponent,
+            media.id,
+            media.title,
+            media.collectionTitle,
+            media.summary,
+            media.sourceName,
+            media.authorName,
+            media.resolutionLabel,
+            media.exactResolution,
+            media.primaryTagText
+        ]
+        if directMatches.contains(where: { $0?.localizedCaseInsensitiveContains(query) == true }) {
+            return true
+        }
+        return media.tags.contains { $0.localizedCaseInsensitiveContains(query) }
+    }
+
+    private func matchesLibrarySearch(for anime: AnimeSearchResult, query: String) -> Bool {
+        let directMatches = [
+            anime.title,
+            anime.originalName,
+            anime.sourceName,
+            anime.latestEpisode,
+            anime.summary,
+            anime.rating
+        ]
+        if directMatches.contains(where: { $0?.localizedCaseInsensitiveContains(query) == true }) {
+            return true
+        }
+        return anime.tags?.contains(where: { $0.name.localizedCaseInsensitiveContains(query) }) ?? false
     }
 
     /// 删除本地壁纸（含物理文件删除）
@@ -1431,7 +2437,24 @@ struct MyLibraryContentView: View {
             self.spacing = 16
             let totalSpacing = spacing * CGFloat(columnCount - 1)
             self.cardWidth = floor((contentWidth - totalSpacing) / CGFloat(columnCount))
-            self.gridItems = Array(repeating: GridItem(.flexible(), spacing: spacing), count: columnCount)
+            self.gridItems = Array(repeating: GridItem(.fixed(cardWidth), spacing: spacing), count: columnCount)
+        }
+    }
+
+    @ViewBuilder
+    private func libraryWaterfallGrid<Item: Identifiable, Content: View>(
+        entries: [Item],
+        config: LibraryGridConfig,
+        estimatedHeight: CGFloat,
+        @ViewBuilder content: @escaping (Item) -> Content
+    ) -> some View {
+        // ⚡ 库卡片高度是统一的（LibraryCardMetrics.thumbnailHeight = 180 + 元数据栏），
+        // 不需要瀑布流。改用 LazyVGrid 替代 `HStack { LazyVStack × N }` 的多列模式
+        // ——后者在 macOS 上会让所有列在每帧滚动期间反复同步对齐，是已知 hitch 来源。
+        LazyVGrid(columns: config.gridItems, alignment: .leading, spacing: config.spacing) {
+            ForEach(entries) { item in
+                content(item)
+            }
         }
     }
 
@@ -1447,7 +2470,7 @@ struct MyLibraryContentView: View {
             self.columnCount = contentWidth > 1200 ? 5 : (contentWidth > 800 ? 4 : 3)
             let totalSpacing = spacing * CGFloat(columnCount - 1)
             self.cardWidth = floor((contentWidth - totalSpacing) / CGFloat(columnCount))
-            self.gridItems = Array(repeating: GridItem(.flexible(), spacing: spacing), count: columnCount)
+            self.gridItems = Array(repeating: GridItem(.fixed(cardWidth), spacing: spacing), count: columnCount)
         }
     }
 
@@ -1457,91 +2480,10 @@ struct MyLibraryContentView: View {
         NSWorkspace.shared.open(url)
     }
 
-    private func importWallpapers() {
+    /// 统一导入入口：打开文件选择面板，支持图片/视频/文件夹/workshop 混合选择
+    private func startImport() {
         guard DownloadPathManager.shared.createDirectoryStructure() else {
             print("[MyLibrary] Failed to create download directory structure, import aborted")
-            return
-        }
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowedContentTypes = [.image]
-        panel.prompt = t("import")
-
-        guard panel.runModal() == .OK else { return }
-
-        let destinationFolder = DownloadPathManager.shared.wallpapersFolderURL
-        print("[MyLibrary] Importing wallpapers to: \(destinationFolder.path)")
-        let fileManager = FileManager.default
-        var importedCount = 0
-
-        for url in panel.urls {
-            let destURL = destinationFolder.appendingPathComponent(url.lastPathComponent)
-            do {
-                if url.standardizedFileURL != destURL.standardizedFileURL {
-                    if fileManager.fileExists(atPath: destURL.path) {
-                        try fileManager.removeItem(at: destURL)
-                    }
-                    try fileManager.copyItem(at: url, to: destURL)
-                }
-                let wallpaper = makeImportedWallpaper(from: destURL)
-                WallpaperLibraryService.shared.recordDownload(wallpaper, fileURL: destURL)
-                importedCount += 1
-            } catch {
-                print("[MyLibrary] Failed to import wallpaper \(url.lastPathComponent): \(error)")
-            }
-        }
-
-        if importedCount > 0 {
-            viewModel.objectWillChange.send()
-        }
-    }
-
-    private func importMedia() async {
-        guard DownloadPathManager.shared.createDirectoryStructure() else {
-            print("[MyLibrary] Failed to create download directory structure, import aborted")
-            return
-        }
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowedContentTypes = [.movie]
-        panel.prompt = t("import")
-
-        guard panel.runModal() == .OK else { return }
-
-        let destinationFolder = DownloadPathManager.shared.mediaFolderURL
-        print("[MyLibrary] Importing media to: \(destinationFolder.path)")
-        let fileManager = FileManager.default
-        var importedCount = 0
-
-        for url in panel.urls {
-            let destURL = destinationFolder.appendingPathComponent(url.lastPathComponent)
-            do {
-                if url.standardizedFileURL != destURL.standardizedFileURL {
-                    if fileManager.fileExists(atPath: destURL.path) {
-                        try fileManager.removeItem(at: destURL)
-                    }
-                    try fileManager.copyItem(at: url, to: destURL)
-                }
-                let item = await makeImportedMediaItem(from: destURL)
-                MediaLibraryService.shared.recordDownload(item: item, localFileURL: destURL)
-                importedCount += 1
-            } catch {
-                print("[MyLibrary] Failed to import media \(url.lastPathComponent): \(error)")
-            }
-        }
-
-        if importedCount > 0 {
-            mediaViewModel.objectWillChange.send()
-        }
-    }
-
-    private func importWorkshop() {
-        guard DownloadPathManager.shared.createDirectoryStructure() else {
-            print("[MyLibrary] Failed to create download directory structure, workshop import aborted")
             return
         }
         let panel = NSOpenPanel()
@@ -1549,287 +2491,157 @@ struct MyLibraryContentView: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.prompt = t("import")
+        panel.message = t("import.panel.message")
 
         guard panel.runModal() == .OK else { return }
 
-        let destinationRoot = DownloadPathManager.shared.mediaFolderURL
-        let fileManager = FileManager.default
-        var importedCount = 0
-        var skippedCount = 0
+        // 确定当前文件夹上下文：如果在某个文件夹内，导入的文件自动归入该文件夹
+        let currentFolderID: String?
+        switch selectedContentType {
+        case .wallpaper:
+            currentFolderID = currentWallpaperFolderID
+        case .video:
+            currentFolderID = currentMediaFolderID
+        default:
+            currentFolderID = nil
+        }
 
-        // 递归查找目录树中的第一个 project.json（含 preview 同目录）
-        func findProjectJSON(in dir: URL) -> (projectURL: URL, parentDir: URL)? {
-            guard let enumerator = fileManager.enumerator(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
-            for case let fileURL as URL in enumerator {
-                if fileURL.lastPathComponent == "project.json" {
-                    return (fileURL, fileURL.deletingLastPathComponent())
+        let urls = panel.urls
+        Task {
+            await ImportService.shared.importURLs(urls, folderID: currentFolderID)
+
+            // 完成后用原生 NSAlert 展示结果
+            let progress = ImportService.shared.progress
+            let message: String
+            if progress.failedImports > 0 {
+                message = String(format: t("import.result.partial"), progress.successfulImports, progress.failedImports)
+            } else if progress.successfulImports > 0 {
+                message = String(format: t("import.result.success"), progress.successfulImports)
+            } else {
+                message = t("import.result.none")
+            }
+
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = t("import.completed")
+                alert.informativeText = message
+                alert.alertStyle = progress.failedImports > 0 ? .warning : .informational
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
+
+    // MARK: - 同步 Steam 订阅
+
+    /// 获取用户订阅列表（已过滤已下载），展示选择 Sheet
+    private func fetchSubscriptionList() async {
+        defer { syncIsLoadingList = false }
+
+        let steamID = workshopSourceManager.steamProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !steamID.isEmpty else {
+            showSyncSelectionSheet = false
+            showSyncProfileSheet = true
+            return
+        }
+
+        do {
+            let allItems = try await mediaViewModel.fetchSubscribedItems(steamID: steamID)
+            syncSubscribedItems = allItems
+            // 默认全选
+            syncSelectedIDs = Set(allItems.map(\.id))
+            // showSyncSelectionSheet 已在 onDisappear 中设为 true，无需重复设置
+        } catch {
+            syncErrorMessage = error.localizedDescription
+            // 关闭加载中的选择 Sheet，然后显示错误弹窗
+            showSyncSelectionSheet = false
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "获取订阅列表失败"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
+
+    /// 下载用户勾选的订阅项
+    private func downloadSelectedSubscriptions(_ items: [WorkshopWallpaper]) async {
+        guard !items.isEmpty else { return }
+        isSyncingSubscriptions = true
+
+        let mediaItems = mediaViewModel.workshopService.convertToMediaItems(items)
+        
+        // 并发提交所有下载任务，SteamCMD 下载限制器会自动控制并发（最多 2 个同时下载）
+        let results = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
+            for item in mediaItems {
+                group.addTask {
+                    guard !Task.isCancelled else { return false }
+                    do {
+                        try await self.mediaViewModel.downloadWorkshopWallpaper(item)
+                        return true
+                    } catch {
+                        AppLogger.error(.media, "sync download failed", metadata: ["id": item.id, "error": "\(error)"])
+                        return false
+                    }
                 }
             }
-            return nil
+            
+            var results: [Bool] = []
+            for await success in group {
+                results.append(success)
+            }
+            return results
         }
+        
+        let successCount = results.filter { $0 }.count
+        let failCount = results.filter { !$0 }.count
 
-        // 在指定目录下递归查找预览图
-        func findPreview(in dir: URL) -> URL? {
-            guard let enumerator = fileManager.enumerator(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
-            for case let fileURL as URL in enumerator {
-                let name = fileURL.lastPathComponent.lowercased()
-                if name == "preview.jpg" || name == "preview.jpeg" || name == "preview.png" || name == "preview.webp" || name == "preview.gif" {
-                    return fileURL
-                }
-            }
-            return nil
-        }
+        isSyncingSubscriptions = false
+        mediaViewModel.objectWillChange.send()
 
-        // 收集所有待导入的源目录（用户选文件夹→递归扫描子目录；选 .pkg→取上级目录）
-        var sourceDirPaths: [String] = []
-        for url in panel.urls {
-            let path = url.path
-            var isDir: ObjCBool = false
-            guard fileManager.fileExists(atPath: path, isDirectory: &isDir) else { continue }
-            if isDir.boolValue {
-                // 批量模式：列出其下所有子目录，每个都尝试递归查找 project.json
-                let subItems = (try? fileManager.contentsOfDirectory(atPath: path)) ?? []
-                for name in subItems {
-                    guard !name.hasPrefix(".") else { continue }
-                    let subPath = (path as NSString).appendingPathComponent(name)
-                    var subIsDir: ObjCBool = false
-                    guard fileManager.fileExists(atPath: subPath, isDirectory: &subIsDir), subIsDir.boolValue else { continue }
-                    sourceDirPaths.append(subPath)
-                }
-            } else if url.pathExtension.lowercased() == "pkg" {
-                // 单文件模式：取 .pkg 所在目录
-                sourceDirPaths.append(url.deletingLastPathComponent().path)
-            }
-        }
-
-        // 去重
-        sourceDirPaths = Array(Set(sourceDirPaths))
-
-        for sourcePath in sourceDirPaths {
-            let sourceURL = URL(fileURLWithPath: sourcePath)
-            let sourceName = (sourcePath as NSString).lastPathComponent
-
-            // 递归查找 project.json
-            guard let found = findProjectJSON(in: sourceURL) else {
-                print("[MyLibrary] No project.json found under \(sourceName)")
-                skippedCount += 1
-                continue
-            }
-
-            let projectJSONURL = found.projectURL
-
-            guard let data = try? Data(contentsOf: projectJSONURL),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                print("[MyLibrary] Failed to parse project.json in \(sourceName)")
-                skippedCount += 1
-                continue
-            }
-
-            let title = (json["title"] as? String) ?? sourceName
-            var workshopID = (json["publishedfileid"] as? String) ?? (json["id"] as? String)
-
-            if workshopID == nil {
-                let numeric = sourceName.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-                if !numeric.isEmpty { workshopID = numeric }
-            }
-
-            guard let id = workshopID, !id.isEmpty else {
-                print("[MyLibrary] Could not infer workshop ID for \(sourceName)")
-                skippedCount += 1
-                continue
-            }
-
-            let destDir = destinationRoot.appendingPathComponent("workshop_\(id)")
-            do {
-                if fileManager.fileExists(atPath: destDir.path) {
-                    try fileManager.removeItem(at: destDir)
-                }
-                // 复制整个 workshop 目录（保留 steamapps/... 深层结构）
-                try fileManager.copyItem(at: sourceURL, to: destDir)
-
-                // 在复制的目录中递归查找预览图
-                let previewURL = findPreview(in: destDir)
-
-                let item = makeImportedWorkshopItem(
-                    workshopID: id,
-                    title: title,
-                    projectJSON: json,
-                    destDir: destDir,
-                    previewURL: previewURL
-                )
-                MediaLibraryService.shared.recordDownload(item: item, localFileURL: destDir)
-                importedCount += 1
-            } catch {
-                print("[MyLibrary] Failed to import \(sourceName): \(error)")
-                skippedCount += 1
-            }
-        }
-
-        if importedCount > 0 {
-            mediaViewModel.objectWillChange.send()
-        }
-
-        // 反馈
-        let message: String
-        if importedCount > 0 {
-            message = String(format: t("import.workshop.result"), importedCount, skippedCount)
-        } else {
-            message = t("import.workshop.none")
-        }
         DispatchQueue.main.async {
             let alert = NSAlert()
-            alert.messageText = t("import")
-            alert.informativeText = message
-            alert.alertStyle = .informational
+            alert.messageText = "同步订阅"
+            if failCount > 0 {
+                alert.informativeText = "下载完成！\n成功：\(successCount) 个\n失败：\(failCount) 个"
+                alert.alertStyle = .warning
+            } else {
+                alert.informativeText = "所有勾选的订阅已开始下载！\n共 \(successCount) 个"
+                alert.alertStyle = .informational
+            }
             alert.addButton(withTitle: "OK")
             alert.runModal()
         }
     }
 
-    private func makeImportedWallpaper(from fileURL: URL) -> Wallpaper {
-        let fileName = fileURL.lastPathComponent
-        let id: String
-        if fileName.hasPrefix("wallhaven-"), let dotIndex = fileName.firstIndex(of: ".") {
-            let start = fileName.index(fileName.startIndex, offsetBy: 10)
-            let extracted = String(fileName[start..<dotIndex])
-            id = extracted.isEmpty ? "local_import_\(UUID().uuidString.prefix(8))" : extracted
-        } else {
-            id = "local_import_\(fileURL.deletingPathExtension().lastPathComponent)"
-        }
+    /// 同步按钮入口：始终弹出 Steam Web 登录页面以建立有效会话
+    /// 登录成功后自动关闭 Web 页面 → onDisappear 触发 fetchSubscriptionList() → 弹出选择弹窗
+    @State private var showSteamLoginSheet = false
 
-        let localPath = fileURL.absoluteString
-        var dimensionX = 1920
-        var dimensionY = 1080
-        if let imageSource = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
-           let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [String: Any],
-           let width = properties[kCGImagePropertyPixelWidth as String] as? Int,
-           let height = properties[kCGImagePropertyPixelHeight as String] as? Int {
-            // 检查方向，可能需要交换宽高
-            if let orientation = properties[kCGImagePropertyOrientation as String] as? UInt32,
-               (5...8).contains(orientation) {
-                dimensionX = height
-                dimensionY = width
-            } else {
-                dimensionX = width
-                dimensionY = height
-            }
-        }
-        let resolution = "\(dimensionX)x\(dimensionY)"
-        let ratio = dimensionY > 0 ? Double(dimensionX) / Double(dimensionY) : 1.77
-
-        return Wallpaper(
-            id: id,
-            url: localPath,
-            shortUrl: nil,
-            views: 0,
-            favorites: 0,
-            downloads: nil,
-            source: nil,
-            purity: "sfw",
-            category: "general",
-            dimensionX: dimensionX,
-            dimensionY: dimensionY,
-            resolution: resolution,
-            ratio: String(format: "%.2f", ratio),
-            fileSize: nil,
-            fileType: nil,
-            createdAt: nil,
-            colors: [],
-            path: localPath,
-            thumbs: Wallpaper.Thumbs(large: localPath, original: localPath, small: localPath),
-            tags: nil,
-            uploader: nil
-        )
+    private func syncSubscriptions() {
+        showSteamLoginSheet = true
     }
 
-    private func makeImportedMediaItem(from fileURL: URL) async -> MediaItem {
-        let fileName = fileURL.lastPathComponent
-        let slug: String
-        if fileName.hasPrefix("motionbgs-") {
-            let parts = fileName.split(separator: "-")
-            if parts.count >= 2 {
-                slug = String(parts[1])
-            } else {
-                slug = "local_import_\(fileURL.deletingPathExtension().lastPathComponent)"
-            }
-        } else {
-            slug = "local_import_\(fileURL.deletingPathExtension().lastPathComponent)"
-        }
+}
 
-        let title = fileURL.deletingPathExtension().lastPathComponent
-        var resolutionLabel = "Unknown"
-        var durationSeconds: Double?
-        let asset = AVAsset(url: fileURL)
-        do {
-            let tracks = try await asset.loadTracks(withMediaType: .video)
-            if let track = tracks.first {
-                let naturalSize = try await track.load(.naturalSize)
-                let preferredTransform = try await track.load(.preferredTransform)
-                let size = naturalSize.applying(preferredTransform)
-                let w = Int(abs(size.width))
-                let h = Int(abs(size.height))
-                resolutionLabel = "\(w)x\(h)"
-            }
-            let duration = try await asset.load(.duration)
-            if duration.isValid && duration != CMTime.indefinite {
-                durationSeconds = CMTimeGetSeconds(duration)
-            }
-        } catch {
-            print("[MyLibrary] Failed to load video metadata: \(error)")
-        }
+// MARK: - 库视图氛围背景（独立观察 ArcBackgroundSettings）
+/// 从 MyLibraryContentView 下沉而来：自行观察 ArcBackgroundSettings，
+/// 外观设置（点阵/噪点/颗粒度）变化时只重建本背景，不触发整个库视图 body 重算。
+private struct LibraryAtmosphereBackground: View {
+    let tint: ExploreAtmosphereTint
+    @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
 
-        // 为导入的视频生成并缓存第一帧缩略图到缓存目录
-        _ = await VideoThumbnailCache.shared.thumbnailImage(for: fileURL)
-        let thumbnailURL = VideoThumbnailCache.shared.thumbnailURL(for: fileURL)
-
-        return MediaItem(
-            slug: slug,
-            title: title,
-            pageURL: fileURL,
-            thumbnailURL: thumbnailURL,
-            resolutionLabel: resolutionLabel,
-            collectionTitle: "Imported",
-            summary: nil,
-            previewVideoURL: fileURL,
-            posterURL: thumbnailURL,
-            tags: [],
-            exactResolution: resolutionLabel,
-            durationSeconds: durationSeconds,
-            downloadOptions: [],
-            sourceName: "Import",
-            isAnimatedImage: nil
-        )
-    }
-
-
-
-    private func makeImportedWorkshopItem(
-        workshopID: String,
-        title: String,
-        projectJSON: [String: Any],
-        destDir: URL,
-        previewURL: URL?
-    ) -> MediaItem {
-        let typeString = (projectJSON["type"] as? String) ?? "pkg"
-        let resolutionLabel = typeString.capitalized
-        let thumbnailURL = previewURL ?? URL(string: "https://steamcommunity.com/favicon.ico")!
-
-        return MediaItem(
-            slug: "workshop_\(workshopID)",
-            title: title,
-            pageURL: URL(string: "https://steamcommunity.com/sharedfiles/filedetails/?id=\(workshopID)")!,
-            thumbnailURL: thumbnailURL,
-            resolutionLabel: resolutionLabel,
-            collectionTitle: "Workshop",
-            summary: (projectJSON["description"] as? String),
-            previewVideoURL: nil,
-            posterURL: previewURL,
-            tags: [],
-            exactResolution: nil,
-            durationSeconds: nil,
-            downloadOptions: [],
-            sourceName: t("wallpaperEngine"),
-            isAnimatedImage: nil
+    var body: some View {
+        ArcAtmosphereBackground(
+            tint: tint,
+            referenceImage: nil,
+            isLightMode: false,
+            dotGridOpacity: arcSettings.dotGridOpacity,
+            useNoise: arcSettings.useNoiseTexture,
+            grainIntensity: arcSettings.grainIntensity,
+            lightweight: true
         )
     }
 }
@@ -1838,51 +2650,80 @@ struct MyLibraryContentView: View {
 struct ContentTypePicker: View {
     @Binding var selected: ContentType
 
+    @Namespace private var selectionNamespace
+    @State private var hoveredType: ContentType?
+
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 6) {
             ForEach(ContentType.allCases, id: \.self) { type in
-                ContentTypeButton(
-                    type: type,
-                    isSelected: selected == type
-                ) {
+                Button {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         selected = type
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: type.icon)
+                            .font(.system(size: 13, weight: .semibold))
+
+                        Text(type.displayName)
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .foregroundStyle(labelColor(for: type))
+                    .frame(minWidth: 86, minHeight: 32)
+                    .padding(.horizontal, 10)
+                    .background {
+                        if selected == type {
+                            selectedTypeGlass
+                        } else if hoveredType == type {
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.1))
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .contentShape(Capsule(style: .continuous))
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        hoveredType = hovering ? type : (hoveredType == type ? nil : hoveredType)
                     }
                 }
             }
         }
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .liquidGlassSurface(.regular, in: Capsule(style: .continuous))
     }
-}
 
-struct ContentTypeButton: View {
-    let type: ContentType
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: type.icon)
-                    .font(.system(size: 14, weight: .semibold))
-
-                Text(type.displayName)
-                    .font(.system(size: 14, weight: isSelected ? .semibold : .medium))
-            }
-            .foregroundStyle(isSelected ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.3) : Color.white.opacity(0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(isSelected ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.1), lineWidth: 1)
-            )
+    private func labelColor(for type: ContentType) -> Color {
+        if selected == type {
+            return .white.opacity(0.96)
         }
-        .buttonStyle(.plain)
-        .pointingHandCursor()
+        if hoveredType == type {
+            return .white.opacity(0.86)
+        }
+        return .white.opacity(0.72)
+    }
+
+    @ViewBuilder
+    private var selectedTypeGlass: some View {
+        Capsule(style: .continuous)
+            .fill(Color.white.opacity(0.12))
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.34),
+                                Color.white.opacity(0.08)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.8
+                    )
+            )
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 4)
+            .matchedGeometryEffect(id: "libraryContentTypeGlass", in: selectionNamespace)
     }
 }
 
@@ -2209,6 +3050,20 @@ private struct AnyMediaItem: Identifiable {
         }
 
         return true
+    }
+}
+
+private enum LibraryGridEntry<Item: Identifiable>: Identifiable where Item.ID == String {
+    case folder(LibraryFolder)
+    case item(Item)
+
+    var id: String {
+        switch self {
+        case .folder(let folder):
+            return "folder_\(folder.id)"
+        case .item(let item):
+            return item.id
+        }
     }
 }
 

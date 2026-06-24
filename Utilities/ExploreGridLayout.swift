@@ -1,5 +1,14 @@
 import SwiftUI
 
+/// 用于 `onScrollGeometryChange` 的 Equatable 状态，只在跨过"近底"阈值时翻转。
+/// 避免因 contentSize 增长导致 distance 数值波动触发不必要的 action 回调。
+public struct ScrollNearBottomState: Equatable {
+    public var isNearBottom: Bool
+    public init(isNearBottom: Bool) {
+        self.isNearBottom = isNearBottom
+    }
+}
+
 /// 探索页网格：列数 2…4（中间宽度默认约 3 列）、间距 16pt。
 enum ExploreGridLayout {
     static let spacing: CGFloat = 16
@@ -30,75 +39,45 @@ enum ExploreGridLayout {
             count: n
         )
     }
-}
 
-private struct ExploreColumnDistributionKey: Equatable {
-    let itemCount: Int
-    let version: Int
-    let columnCount: Int
-    let cardWidthUnits: Int
-    let spacingUnits: Int
-}
+    static func stableColumns<Item>(items: [Item], columnCount: Int) -> [[Item]] {
+        let safeColumnCount = max(1, columnCount)
+        var columns = Array(repeating: [Item](), count: safeColumnCount)
 
-@MainActor
-final class ExploreColumnDistributionCache<Item>: ObservableObject {
-    private var cachedKey: ExploreColumnDistributionKey?
-    private var cachedColumnIndices: [[Int]] = []
+        for (index, item) in items.enumerated() {
+            columns[index % safeColumnCount].append(item)
+        }
 
-    func columns(
-        for items: [Item],
-        version: Int,
+        return columns
+    }
+
+    /// 高度平衡的瀑布流列分配，根据每项计算高度将新项放入当前最矮的列。
+    /// 适用于图片尺寸不一致的场景（如壁纸/媒体），避免部分列堆积过多导致视觉不平衡。
+    /// - Parameters:
+    ///   - items: 所有数据项
+    ///   - columnCount: 列数
+    ///   - cardWidth: 卡片宽度（用于计算高度）
+    ///   - spacing: 列内 item 间距
+    ///   - heightProvider: 返回每项在给定卡片宽度下的高度
+    /// - Returns: 每列的数据数组
+    static func waterfallColumns<Item>(
+        items: [Item],
         columnCount: Int,
         cardWidth: CGFloat,
         spacing: CGFloat,
-        height: (Item) -> CGFloat
+        heightProvider: (Item) -> CGFloat
     ) -> [[Item]] {
-        let key = ExploreColumnDistributionKey(
-            itemCount: items.count,
-            version: version,
-            columnCount: columnCount,
-            cardWidthUnits: Int((cardWidth * 100).rounded()),
-            spacingUnits: Int((spacing * 100).rounded())
-        )
-
-        if cachedKey != key {
-            cachedKey = key
-            cachedColumnIndices = distributeIndices(
-                for: items,
-                columnCount: columnCount,
-                spacing: spacing,
-                height: height
-            )
-        }
-
-        return cachedColumnIndices.map { indices in
-            indices.compactMap { index in
-                guard items.indices.contains(index) else { return nil }
-                return items[index]
-            }
-        }
-    }
-
-    func invalidate() {
-        cachedKey = nil
-        cachedColumnIndices = []
-    }
-
-    private func distributeIndices(
-        for items: [Item],
-        columnCount: Int,
-        spacing: CGFloat,
-        height: (Item) -> CGFloat
-    ) -> [[Int]] {
         let safeColumnCount = max(1, columnCount)
-        var columns: [[Int]] = Array(repeating: [], count: safeColumnCount)
-        var columnHeights: [CGFloat] = Array(repeating: 0, count: safeColumnCount)
+        var columns = Array(repeating: [Item](), count: safeColumnCount)
+        var columnHeights = Array(repeating: CGFloat(0), count: safeColumnCount)
 
-        for (index, item) in items.enumerated() {
-            let itemHeight = max(1, height(item))
+        for item in items {
+            // 找到当前总高度最小的列
             let minHeight = columnHeights.min() ?? 0
             let column = columnHeights.firstIndex(of: minHeight) ?? 0
-            columns[column].append(index)
+
+            columns[column].append(item)
+            let itemHeight = heightProvider(item)
             columnHeights[column] += itemHeight + spacing
         }
 

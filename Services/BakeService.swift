@@ -124,6 +124,7 @@ final class BakeService: ObservableObject {
         isBaking = true
         isCancelled = false
         self.progress = 0
+        progress?(0)
         statusText = "准备中..."
 
         // 1. 解析 assets 路径
@@ -131,7 +132,7 @@ final class BakeService: ObservableObject {
         if let ap = assetsPath, !ap.isEmpty {
             resolvedAssets = ap
             print("[BakeService] 使用外部 assets: \(resolvedAssets)")
-        } else if let embedded = WallpaperEngineEmbeddedAssets.materializedAssetsRootIfPresent() {
+        } else if let embedded = await WallpaperEngineEmbeddedAssets.awaitAssetsReady() {
             resolvedAssets = embedded
             print("[BakeService] 使用内嵌 assets: \(resolvedAssets)")
         } else {
@@ -150,6 +151,9 @@ final class BakeService: ObservableObject {
             }
         }
         print("[BakeService] ✅ 屏幕录制权限已授予")
+        self.progress = 0.02
+        statusText = "正在启动渲染器..."
+        progress?(0.02)
 
         // 3. 启动 wallpaper-wgpu（--wallpaper --background 铺到桌面层，无需 AX/CGS 调整窗口）
         guard let cliURL = WallpaperEngineXBridge.resolvedCLIExecutableURL() else {
@@ -173,6 +177,8 @@ final class BakeService: ObservableObject {
             launchedPID = try await launchRendererWrapper(wrapper, arguments: args)
             renderPID = launchedPID
             statusText = "等待渲染窗口..."
+            self.progress = 0.05
+            progress?(0.05)
             print("[BakeService] ✅ wallpaper-wgpu wrapper 已启动 (pid=\(launchedPID))")
         } catch {
             print("[BakeService] ❌ 启动 wallpaper-wgpu 失败: \(error.localizedDescription)")
@@ -185,6 +191,9 @@ final class BakeService: ObservableObject {
         let windowID = windowInfo.windowID
 
         print("[BakeService] 找到桌面层渲染窗口 ID=\(windowID) bounds=\(windowInfo.width)x\(windowInfo.height)")
+        self.progress = 0.10
+        statusText = "等待画面稳定..."
+        progress?(0.10)
 
         // 5. 使用主显示器分辨率作为烘焙尺寸。桌面层窗口已覆盖整个显示器，无标题栏。
         guard let mainScreen = NSScreen.main ?? NSScreen.screens.first else {
@@ -206,7 +215,9 @@ final class BakeService: ObservableObject {
             captureHeight: preparedHeight
         )
 
+        self.progress = 0.15
         statusText = "正在烘焙..."
+        progress?(0.15)
 
         // 6. 开始捕获和编码
         let result = try await captureAndEncode(
@@ -781,11 +792,12 @@ final class BakeService: ObservableObject {
         // 完成写入
         videoInput.markAsFinished()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            writer.finishWriting {
-                if writer.status == .completed {
+            nonisolated(unsafe) let w = writer
+            w.finishWriting {
+                if w.status == .completed {
                     continuation.resume()
                 } else {
-                    continuation.resume(throwing: BakeError.writerFailed(writer.error?.localizedDescription ?? "finishWriting 失败"))
+                    continuation.resume(throwing: BakeError.writerFailed(w.error?.localizedDescription ?? "finishWriting 失败"))
                 }
             }
         }
@@ -1335,6 +1347,19 @@ final class BakeService: ObservableObject {
         }
         UserDefaults.standard.set(fileURL.path, forKey: cacheKey)
 
+        // ⚠️ 动态锁屏启用时跳过设置静态桌面壁纸，
+        // 避免覆盖用户在系统设置中手动选择的 WaifuX 锁屏实例。
+        let shouldSkipForLockScreen: Bool = {
+            if #available(macOS 26.0, *) {
+                return VideoWallpaperManager.shared.isLockScreenEnabled
+            }
+            return false
+        }()
+        guard !shouldSkipForLockScreen else {
+            print("[BakeService] 🔒 动态锁屏已启用，跳过设置静态 fallback 壁纸以保护用户锁屏选择")
+            return
+        }
+
         // 设为静态桌面壁纸（所有显示器）
         let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
             .imageScaling: NSImageScaling.scaleAxesIndependently.rawValue,
@@ -1371,7 +1396,7 @@ final class BakeService: ObservableObject {
         let resolvedAssets: String
         if let ap = assetsPath, !ap.isEmpty {
             resolvedAssets = ap
-        } else if let embedded = WallpaperEngineEmbeddedAssets.materializedAssetsRootIfPresent() {
+        } else if let embedded = await WallpaperEngineEmbeddedAssets.awaitAssetsReady() {
             resolvedAssets = embedded
         } else {
             resolvedAssets = ""
@@ -1646,10 +1671,10 @@ final class BakeService: ObservableObject {
         }
         context.draw(sourceImage, in: drawRect)
 
-        // 等待输入就绪
+        // 等待输入就绪（5ms 步进，最多 6 秒；替代原来 usleep(1ms) 的忙等，降低 CPU 占用）
         var waitCount = 0
-        while !input.isReadyForMoreMediaData, waitCount < 6000 {
-            usleep(1000)
+        while !input.isReadyForMoreMediaData, waitCount < 1200 {
+            Thread.sleep(forTimeInterval: 0.005)
             waitCount += 1
         }
         guard input.isReadyForMoreMediaData else {
@@ -1770,7 +1795,7 @@ private func CGSResizeWindow(_ cgsWindow: UInt32, _ size: CGSize) {
     var region: OpaquePointer?
     guard newRegion(&rect, &region) == .success, let region else { return }
     _ = setShape(CGSDefaultConnectionFn?() ?? 0, cgsWindow, region)
-    releaseRegion(region)
+    _ = releaseRegion(region)
 }
 
 /// 检查是否有屏幕录制权限
@@ -1803,7 +1828,7 @@ private let CGSSetWindowLevelFunc: (@convention(c) (UInt32, Int32) -> Int32)? = 
 }()
 
 private func CGSWindowSetLevel(_ cgsWindow: UInt32, _ level: Int32) {
-    CGSSetWindowLevelFunc?(cgsWindow, level)
+    _ = CGSSetWindowLevelFunc?(cgsWindow, level)
 }
 
 // MARK: - 错误类型

@@ -14,6 +14,31 @@ private struct MediaLoadMoreSentinelMinYPreferenceKey: PreferenceKey {
     }
 }
 
+private struct MediaExploreHeaderHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let next = nextValue()
+        if next > 0 {
+            value = next
+        }
+    }
+}
+
+private final class MediaExploreScrollCoordinator: ObservableObject {
+    var sentinelDebounceTask: DispatchWorkItem?
+    var pendingLoadMoreTask: DispatchWorkItem?
+    var wasNearBottom = false
+
+    func cancelPendingWork() {
+        sentinelDebounceTask?.cancel()
+        pendingLoadMoreTask?.cancel()
+        sentinelDebounceTask = nil
+        pendingLoadMoreTask = nil
+        wasNearBottom = false
+    }
+}
+
 // MARK: - MediaExploreContentView - 媒体探索页
 
 struct MediaExploreContentView: View {
@@ -26,9 +51,13 @@ struct MediaExploreContentView: View {
     @StateObject private var exploreAtmosphere = ExploreAtmosphereController(wallpaperMode: false)
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
     @ObservedObject private var workshopSourceManager = WorkshopSourceManager.shared
-    @ObservedObject private var videoWallpaperManager = VideoWallpaperManager.shared
-    @ObservedObject private var wallpaperEngineBridge = WallpaperEngineXBridge.shared
+    // 注意：VideoWallpaperManager / WallpaperEngineXBridge 不在顶层观察。
+    // 它们各有多个 @Published（isPaused/isMuted/volume 等），若顶层观察会导致
+    // 视频壁纸暂停/恢复时整个媒体探索页 body 重算。
+    // 仅 shouldUseLightweightEffects 依赖它们的播放状态，已下沉到
+    // MediaExploreAtmosphereBackground 子视图内自行观察，只重建背景。
     @StateObject private var translationBridge = SearchTranslationBridge()
+    @Environment(\.mainTopBarContentPadding) private var mainTopBarContentPadding
 
     @State private var selectedCategory: MediaCategory = .all
     @State private var selectedHotTag: MediaHotTag?
@@ -43,14 +72,18 @@ struct MediaExploreContentView: View {
 
     @State private var searchTask: Task<Void, Never>?
     @State private var loadMoreTask: Task<Void, Never>?
+    /// loadMore 世代计数器，防止过期 task 覆盖较新 task 的引用或 UI 状态
+    @State private var loadMoreGeneration: UInt = 0
     @State private var pendingSearchText: String?
     /// 翻译后的实际搜索词（英文），与 searchText（原始中文）分离
     @State private var mediaSearchQuery: String = ""
-    @State private var sentinelDebounceTask: DispatchWorkItem?
-    private var shouldUseLightweightEffects: Bool {
-        (videoWallpaperManager.isVideoWallpaperActive && !videoWallpaperManager.isPaused) ||
-        (wallpaperEngineBridge.isControllingExternalEngine && !wallpaperEngineBridge.isExternalPaused)
-    }
+    /// loadMore 冷却期，防止 contentSize 增长 → isNearBottom 翻转 → 立即重试的无限级联。
+    @State private var loadMoreCooldownUntil: Date? = nil
+    @State private var measuredHeaderHeight: CGFloat = 0
+    @State private var isHeaderContentMounted = true
+    @StateObject private var scrollCoordinator = MediaExploreScrollCoordinator()
+    // shouldUseLightweightEffects 已下沉到 MediaExploreAtmosphereBackground 子视图，
+    // 该子视图自行观察 VideoWallpaperManager / WallpaperEngineXBridge 的播放状态。
 
     // Grid 控制
     @State private var showScrollToTop: Bool = false
@@ -61,12 +94,14 @@ struct MediaExploreContentView: View {
     @State private var selectedWorkshopType: WorkshopSourceManager.WorkshopTypeFilter = .all
     @State private var selectedWorkshopContentLevel: WorkshopSourceManager.WorkshopContentLevel? = .everyone
     @State private var selectedWorkshopResolution: WorkshopSourceManager.WorkshopResolution? = nil
-    @State private var workshopSearchQuery: String = ""
     @State private var selectedWorkshopSort: WorkshopSortOption = .trendWeek
     @State private var showWorkshopURLSheet = false
     @State private var workshopURLInput = ""
     @State private var isResolvingWorkshopURL = false
     @State private var workshopURLError: String?
+
+    // Wallsflow 筛选
+    @State private var selectedWallsflowCategorySlug: String = "live-wallpapers"
 
     // Dynamic Wallpaper (DongTai) 筛选
     @State private var selectedDongTaiCategories: Set<DynamicWallpaperCategory> = []
@@ -79,6 +114,10 @@ struct MediaExploreContentView: View {
     }
 
     var body: some View {
+        // 性能测量：开启 PERF_TRACE 编译标记后，会在控制台打印触发本 body 的属性来源
+        #if PERF_TRACE
+        let _ = Self._printChanges()
+        #endif
         GeometryReader { geometry in
             let gridContentWidth = max(0, geometry.size.width - 56)
 
@@ -87,14 +126,15 @@ struct MediaExploreContentView: View {
                     arcSettings.compactBackground
                         .ignoresSafeArea()
                 } else {
-                    ArcAtmosphereBackground(
+                    // 背景渲染下沉到独立子视图：它自行观察 VideoWallpaperManager /
+                    // WallpaperEngineXBridge 的播放状态以决定 lightweight，
+                    // 视频壁纸暂停/恢复只重建此背景，不触发整个媒体探索页 body 重算。
+                    MediaExploreAtmosphereBackground(
                         tint: exploreAtmosphere.tint,
-                        referenceImage: shouldUseLightweightEffects ? nil : exploreAtmosphere.referenceImage,
+                        referenceImage: exploreAtmosphere.referenceImage,
                         isLightMode: arcSettings.isLightMode,
                         dotGridOpacity: arcSettings.dotGridOpacity,
-                        useNoise: true,
-                        grainIntensity: arcSettings.exploreGrainMedia,
-                        lightweight: shouldUseLightweightEffects
+                        grainIntensity: arcSettings.exploreGrainMedia
                     )
                     .ignoresSafeArea()
                 }
@@ -102,9 +142,9 @@ struct MediaExploreContentView: View {
                 ZStack {
                     contentArea(
                         gridContentWidth: gridContentWidth,
+                        fullWidth: geometry.size.width,
                         viewportHeight: geometry.size.height
                     )
-                        .padding(.horizontal, 28)
                         .frame(width: geometry.size.width, alignment: .leading)
                         .frame(maxHeight: .infinity, alignment: .top)
                         .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
@@ -140,6 +180,7 @@ struct MediaExploreContentView: View {
             } else {
                 // 恢复可见时复位 isLoadingMore，防止之前 task 被取消后状态卡死
                 isLoadingMore = false
+                _ = viewModel.restoreExploreFeedIfNeededAfterDetailReturn()
                 syncAtmosphereIfNeeded()
             }
         }
@@ -161,17 +202,26 @@ struct MediaExploreContentView: View {
                 syncAtmosphereIfNeeded()
             }
         }
-        .onChange(of: viewModel.libraryContentRevision) { _, _ in }
+        // ❌ 已移除 libraryContentRevision 的空 onChange，收藏状态改为视图直接读取
+        // viewModel.favoriteIDSet，无需 @State 中间赋值引发 body 重算。
         .onChange(of: viewModel.items.count) { _, newCount in
+            if newCount != 0 {
+                // 数据从 0→N（切换源后新数据到达）时同步大气层背景
+                syncAtmosphereIfNeeded()
+            }
             if newCount > 60 { showScrollToTop = true }
         }
         .onReceive(NotificationCenter.default.publisher(for: .workshopSourceChanged)) { _ in
             handleSourceChange()
+            invalidateHeaderMeasurement()
+        }
+        .onChange(of: headerLayoutSignature) { _, _ in
+            invalidateHeaderMeasurement()
         }
     }
 
     @ViewBuilder
-    private func contentArea(gridContentWidth: CGFloat, viewportHeight: CGFloat) -> some View {
+    private func contentArea(gridContentWidth: CGFloat, fullWidth: CGFloat, viewportHeight: CGFloat) -> some View {
         if viewModel.items.isEmpty {
             legacyScrollContent(gridContentWidth: gridContentWidth) {
                 Group {
@@ -185,9 +235,9 @@ struct MediaExploreContentView: View {
             }
         } else {
             if #available(macOS 15.0, *) {
-                scrollViewModern(gridContentWidth: gridContentWidth)
+                scrollViewModern(gridContentWidth: gridContentWidth, fullWidth: fullWidth)
             } else {
-                scrollViewLegacy(gridContentWidth: gridContentWidth, viewportHeight: viewportHeight)
+                scrollViewLegacy(gridContentWidth: gridContentWidth, fullWidth: fullWidth, viewportHeight: viewportHeight)
             }
         }
     }
@@ -195,7 +245,7 @@ struct MediaExploreContentView: View {
     // MARK: - macOS 15+：使用 onScrollGeometryChange
 
     @available(macOS 15.0, *)
-    private func scrollViewModern(gridContentWidth: CGFloat) -> some View {
+    private func scrollViewModern(gridContentWidth: CGFloat, fullWidth: CGFloat) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
@@ -205,16 +255,40 @@ struct MediaExploreContentView: View {
                     headerStack
                     mediaGrid(contentWidth: gridContentWidth)
                 }
+                .padding(.horizontal, 28)
+                .frame(width: fullWidth, alignment: .leading)
                 .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+                // ⚡ macOS 15+ 路径不再使用 ScrollToTopHelper（NSScrollView KVO）。
+                // header mount state / 滚动到顶都通过下方 onScrollGeometryChange + ScrollViewReader 实现，
+                // 避免每帧 KVO 与 onScrollGeometryChange 重复触发同一个 handleScrollOffset 回调。
             }
-            .onScrollGeometryChange(for: CGFloat.self, of: { geometry in
+            .onScrollGeometryChange(for: ScrollNearBottomState.self, of: { geometry in
                 let bottomOffset = geometry.contentOffset.y + geometry.containerSize.height
-                return geometry.contentSize.height - bottomOffset
-            }, action: { _, distanceFromBottom in
-                guard isVisible, distanceFromBottom.isFinite else { return }
-                if distanceFromBottom <= Self.loadMoreTriggerThreshold {
-                    triggerLoadMore()
+                let distanceFromBottom = geometry.contentSize.height - bottomOffset
+                guard distanceFromBottom.isFinite else {
+                    return ScrollNearBottomState(isNearBottom: false)
                 }
+                return ScrollNearBottomState(
+                    isNearBottom: distanceFromBottom <= Self.loadMoreTriggerThreshold
+                )
+            }, action: { oldValue, newValue in
+                if newValue.isNearBottom && !oldValue.isNearBottom {
+                    // ⛔ 冷却期内不触发 loadMore
+                    if let cooldown = loadMoreCooldownUntil, Date() < cooldown { return }
+                    guard !scrollCoordinator.wasNearBottom else { return }
+                    scrollCoordinator.wasNearBottom = true
+                    scheduleLoadMoreFromScroll()
+                } else if !newValue.isNearBottom && oldValue.isNearBottom {
+                    // ⚡ 延迟重置 wasNearBottom，给 contentSize 足够时间稳定
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+                        scrollCoordinator.wasNearBottom = false
+                    }
+                }
+            })
+            .onScrollGeometryChange(for: CGFloat.self, of: { geometry in
+                geometry.contentOffset.y
+            }, action: { _, newOffset in
+                handleScrollOffset(max(0, newOffset))
             })
             .scrollDisabled(!isVisible)
             .onChange(of: outerScrollToTopToken) { _, _ in
@@ -227,7 +301,7 @@ struct MediaExploreContentView: View {
 
     // MARK: - macOS 14：使用 PreferenceKey
 
-    private func scrollViewLegacy(gridContentWidth: CGFloat, viewportHeight: CGFloat) -> some View {
+    private func scrollViewLegacy(gridContentWidth: CGFloat, fullWidth: CGFloat, viewportHeight: CGFloat) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
@@ -238,14 +312,20 @@ struct MediaExploreContentView: View {
                     mediaGrid(contentWidth: gridContentWidth)
                     loadMoreSentinel
                 }
+                .padding(.horizontal, 28)
+                .frame(width: fullWidth, alignment: .leading)
                 .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+                .background(
+                    ScrollToTopHelper(trigger: 0, onOffsetChange: handleScrollOffset)
+                        .frame(width: 0, height: 0)
+                )
             }
             .onPreferenceChange(MediaLoadMoreSentinelMinYPreferenceKey.self) { sentinelMinY in
-                sentinelDebounceTask?.cancel()
+                scrollCoordinator.sentinelDebounceTask?.cancel()
                 let task = DispatchWorkItem {
                     handleLoadMoreSentinelPosition(sentinelMinY, viewportHeight: viewportHeight)
                 }
-                sentinelDebounceTask = task
+                scrollCoordinator.sentinelDebounceTask = task
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: task)
             }
             .scrollDisabled(!isVisible)
@@ -264,6 +344,7 @@ struct MediaExploreContentView: View {
                 headerStack
                 body()
             }
+            .padding(.horizontal, 28)
             .padding(.bottom, 48)
         }
         .scrollDisabled(!isVisible)
@@ -294,31 +375,44 @@ struct MediaExploreContentView: View {
             HStack {
                 Spacer()
                 if showScrollToTop {
-                    Button {
+                    ScrollToTopButton {
                         outerScrollToTopToken &+= 1
-                    } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .frame(width: 44, height: 44)
-                            .liquidGlassSurface(.regular, in: Circle())
                     }
-                    .buttonStyle(.plain)
                     .padding(.trailing, 28)
                     .padding(.bottom, 120)
-                    .contentShape(Rectangle())
-                    .zIndex(100)
                     .transition(.scale.combined(with: .opacity))
                 }
             }
         }
-        .zIndex(100)
         .animation(.easeInOut(duration: 0.3), value: showScrollToTop)
     }
 
     // MARK: - Header
 
     private var headerStack: some View {
+        Group {
+            if isHeaderContentMounted {
+                headerContent
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: MediaExploreHeaderHeightPreferenceKey.self,
+                                value: proxy.size.height
+                            )
+                        }
+                    )
+            } else {
+                Color.clear
+                    .frame(height: max(measuredHeaderHeight, 1))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onPreferenceChange(MediaExploreHeaderHeightPreferenceKey.self) { height in
+            updateMeasuredHeaderHeight(height)
+        }
+    }
+
+    private var headerContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             heroSection
             categorySection
@@ -335,12 +429,68 @@ struct MediaExploreContentView: View {
             }
             contentHeader.padding(.top, 12)
         }
-        .padding(.top, 80)
+        .padding(.top, mainTopBarContentPadding)
         .padding(.bottom, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         .environment(\.explorePageAtmosphereTint, exploreAtmosphere.tint)
         .environment(\.arcIsLightMode, arcSettings.isLightMode)
+    }
+
+    private var headerLayoutSignature: String {
+        [
+            workshopSourceManager.activeSource.rawValue,
+            selectedCategory.rawValue,
+            selectedHotTag?.id ?? "none",
+            selectedWorkshopType.id,
+            selectedWorkshopContentLevel?.id ?? "none",
+            selectedWorkshopResolution?.id ?? "none",
+            selectedWorkshopTags.map(\.id).sorted().joined(separator: ","),
+            selectedWallsflowCategorySlug,
+            selectedDongTaiCategories.map(\.rawValue).sorted().joined(separator: ","),
+            dongtaiFilterAudio.map(String.init) ?? "nil",
+            dongtaiFilterFourK.map(String.init) ?? "nil"
+        ].joined(separator: "|")
+    }
+
+    private func handleScrollOffset(_ offset: CGFloat) {
+        updateHeaderMountState(scrollOffset: offset)
+    }
+
+    private func updateHeaderMountState(scrollOffset: CGFloat) {
+        let headerHeight = measuredHeaderHeight > 1 ? measuredHeaderHeight : 260
+        let hideThreshold = headerHeight + 80
+        let showThreshold = max(0, headerHeight - 48)
+        let shouldMount = isHeaderContentMounted
+            ? scrollOffset < hideThreshold
+            : scrollOffset < showThreshold
+
+        guard shouldMount != isHeaderContentMounted else { return }
+
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isHeaderContentMounted = shouldMount
+        }
+    }
+
+    private func updateMeasuredHeaderHeight(_ height: CGFloat) {
+        guard height > 1, abs(height - measuredHeaderHeight) > 1 else { return }
+
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            measuredHeaderHeight = height
+        }
+    }
+
+    private func invalidateHeaderMeasurement() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isHeaderContentMounted = true
+            measuredHeaderHeight = 0
+        }
     }
 
     // MARK: - Sections
@@ -469,7 +619,7 @@ struct MediaExploreContentView: View {
         viewModel.clearItems()
 
         let tags = selectedWorkshopTags.map { $0.name }
-        let searchQuery = query ?? workshopSearchQuery
+        let searchQuery = query ?? viewModel.workshopSearchQuery
         await viewModel.loadWorkshopWithFilters(
             query: searchQuery,
             tags: tags,
@@ -486,6 +636,8 @@ struct MediaExploreContentView: View {
             workshopTypeSection
         case .dongtai:
             dongtaiCategorySection
+        case .wallsflow:
+            wallsflowCategorySection
         default:
             FlowLayout(spacing: 12) {
                 ForEach(MediaCategory.allCases) { category in
@@ -730,6 +882,98 @@ struct MediaExploreContentView: View {
             selectedWorkshopResolution = nil
         }
         Task { await applyWorkshopFilters() }
+    }
+
+    // MARK: - Wallsflow 分类
+
+    private var wallsflowCategorySection: some View {
+        FlowLayout(spacing: 12) {
+            // "全部"选项
+            CategoryChip(
+                icon: "square.grid.2x2",
+                title: t("filter.all"),
+                accentColors: ["9B5DE5", "F15BB5"],
+                isSelected: selectedWallsflowCategorySlug == "live-wallpapers"
+            ) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    selectedWallsflowCategorySlug = "live-wallpapers"
+                    Task { await applyWallsflowCategory(slug: "live-wallpapers") }
+                }
+            }
+            // Wallsflow 分类（排除 "live-wallpapers" 顶层分类，只显示子分类）
+            ForEach(WallsflowCategory.allCategories.filter { $0.slug != "live-wallpapers" }, id: \.slug) { category in
+                CategoryChip(
+                    icon: wallsflowCategoryIcon(for: category.slug),
+                    title: wallsflowCategoryDisplayName(for: category.slug),
+                    accentColors: wallsflowCategoryColors(for: category.slug),
+                    isSelected: selectedWallsflowCategorySlug == category.slug
+                ) {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        selectedWallsflowCategorySlug = category.slug
+                        Task { await applyWallsflowCategory(slug: category.slug) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func wallsflowCategoryDisplayName(for slug: String) -> String {
+        let key = "wallsflow.category.\(slug)"
+        let localized = t(key)
+        // 如果本地化键不存在，t() 返回 key 本身，此时回退到英文名
+        if localized == key {
+            // fallback: 从 WallsflowCategory 取英文名并去掉 " Live Wallpapers" 后缀
+            if let category = WallsflowCategory.allCategories.first(where: { $0.slug == slug }) {
+                return category.name.replacingOccurrences(of: " Live Wallpapers", with: "")
+            }
+            return slug
+        }
+        return localized
+    }
+
+    private func wallsflowCategoryIcon(for slug: String) -> String {
+        switch slug {
+        case "anime": return "sparkles"
+        case "games": return "gamecontroller.fill"
+        case "cars": return "car.fill"
+        case "nature": return "leaf.fill"
+        case "space": return "moon.fill"
+        case "animals": return "pawprint.fill"
+        case "winter": return "snowflake"
+        case "minimalist": return "circle.fill"
+        case "pixel-art": return "square.grid.2x2"
+        case "movies": return "film.fill"
+        case "people": return "person.fill"
+        case "graphics": return "paintpalette.fill"
+        default: return "photo.fill"
+        }
+    }
+
+    private func wallsflowCategoryColors(for slug: String) -> [String] {
+        switch slug {
+        case "anime": return ["FF5E98", "FF9A5B"]
+        case "games": return ["FFBE0B", "FB5607"]
+        case "cars": return ["E71D36", "FF9F1C"]
+        case "nature": return ["00F5D4", "01BE96"]
+        case "space": return ["3A86FF", "00BBF9"]
+        case "animals": return ["A8E6CF", "1A936F"]
+        case "winter": return ["A8DADC", "457B9D"]
+        case "minimalist": return ["D4A373", "BC6C25"]
+        case "pixel-art": return ["FF006E", "8338EC"]
+        case "movies": return ["E71D36", "FF9F1C"]
+        case "people": return ["FF5E98", "FF9A5B"]
+        case "graphics": return ["9B5DE5", "F15BB5"]
+        default: return ["9B5DE5", "F15BB5"]
+        }
+    }
+
+    /// 应用 Wallsflow 分类筛选
+    private func applyWallsflowCategory(slug: String) async {
+        prepareForFeedReplacement()
+        viewModel.isLoading = false
+        viewModel.clearItems()
+        await viewModel.loadWallsflowCategory(slug: slug)
+        syncAtmosphereIfNeeded()
     }
 
     // MARK: - DongTai 分类
@@ -987,87 +1231,52 @@ struct MediaExploreContentView: View {
         let columnCount = ExploreGridLayout.columnCount(for: contentWidth)
         let totalSpacing = spacing * CGFloat(columnCount - 1)
         let cardWidth = max(1, floor((contentWidth - totalSpacing) / CGFloat(columnCount)))
-        let items = viewModel.items
-        let columnItems = distributeMediaToColumns(
-            items: items,
-            cardWidth: cardWidth,
-            columnCount: columnCount,
-            spacing: spacing
+        let cardHeight = Self.uniformMediaCardHeight(cardWidth: cardWidth)
+        let columns = Array(
+            repeating: GridItem(.fixed(cardWidth), spacing: spacing, alignment: .topLeading),
+            count: max(1, columnCount)
         )
 
-        return HStack(alignment: .top, spacing: spacing) {
-            ForEach(0..<columnCount, id: \.self) { columnIndex in
-                let items = columnItems[safe: columnIndex] ?? []
-                LazyVStack(spacing: spacing) {
-                    ForEach(items) { media in
-                        MediaCardView(
-                            media: media,
-                            isFavorite: viewModel.isFavorite(media),
-                            cardWidth: cardWidth
-                        ) {
-                            selectedMedia = media
-                        }
-                    }
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: spacing) {
+            ForEach(viewModel.items) { media in
+                MediaCardView(
+                    media: media,
+                    // ✅ 直接读取 viewModel.favoriteIDSet，O(1) 判断
+                    isFavorite: viewModel.favoriteIDSet.contains(media.id),
+                    cardWidth: cardWidth,
+                    forcedHeight: cardHeight
+                ) {
+                    viewModel.preserveExploreFeedForDetailNavigation()
+                    selectedMedia = media
                 }
-                .frame(width: cardWidth)
+                .equatable()
+                .frame(width: cardWidth, height: cardHeight)
             }
         }
     }
 
-    /// 瀑布流：将所有媒体项按最短列连续分配到各列。
-    /// 与分页块解耦，新追加的项始终流入当前最短列底部，不会出现在视口上方。
-    private func distributeMediaToColumns(items: [MediaItem], cardWidth: CGFloat, columnCount: Int, spacing: CGFloat) -> [[MediaItem]] {
-        let safeColumnCount = max(1, columnCount)
-        var columns: [[MediaItem]] = Array(repeating: [], count: safeColumnCount)
-        var columnHeights: [CGFloat] = Array(repeating: 0, count: safeColumnCount)
-
-        for item in items {
-            let aspect = parsedMediaAspectRatio(item)
-            let maxImageHeight = cardWidth * 1.8
-            let itemHeight = min(cardWidth / aspect, maxImageHeight) + 44
-            let minHeight = columnHeights.min() ?? 0
-            let column = columnHeights.firstIndex(of: minHeight) ?? 0
-            columns[column].append(item)
-            columnHeights[column] += itemHeight + spacing
-        }
-
-        return columns
+    /// 媒体网格的统一卡片高度（LazyVGrid 模式：所有卡片同样高度，避免瀑布流的高度抖动与
+    /// 多列 LazyVStack 在 macOS 上的协调开销）。
+    private static func uniformMediaCardHeight(cardWidth: CGFloat) -> CGFloat {
+        let bottomBarHeight: CGFloat = 44
+        // 16:10 是动态壁纸/桌面壁纸常见的视觉比例，在大多数媒体源里都是合适的中位数。
+        let imageHeight = cardWidth / (16.0 / 10.0)
+        return imageHeight + bottomBarHeight
     }
 
-    private func parsedMediaAspectRatio(_ item: MediaItem) -> CGFloat {
-        let raw = (item.exactResolution ?? item.resolutionLabel)
-            .replacingOccurrences(of: " ", with: "")
-            .replacingOccurrences(of: "X", with: "x")
-        let parts = raw.split(separator: "x")
-        guard parts.count == 2,
-              let w = Double(parts[0]), w > 0,
-              let h = Double(parts[1]), h > 0 else { return 1.6 }
-        return min(max(CGFloat(w / h), 0.35), 3.6)
+    /// 旧 API：保留以兼容外部潜在调用，内部已不再使用。
+    private static func mediaCardHeight(cardWidth: CGFloat, media: MediaItem) -> CGFloat {
+        return uniformMediaCardHeight(cardWidth: cardWidth)
     }
 
     // MARK: - UI Components
 
     private func smartRetry() async {
         let query = viewModel.currentQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch workshopSourceManager.activeSource {
-        case .wallpaperEngine:
-            if !query.isEmpty {
-                await viewModel.searchWorkshop(query: query)
-            } else {
-                await viewModel.loadWorkshopFeed()
-            }
-        case .dongtai:
-            if !query.isEmpty {
-                await viewModel.searchDongTai(query: query)
-            } else {
-                await viewModel.loadDongTaiFeed()
-            }
-        default:
-            if !query.isEmpty {
-                await viewModel.search(query: query)
-            } else {
-                await viewModel.loadHomeFeed()
-            }
+        if !query.isEmpty {
+            await viewModel.searchFeed(query: query)
+        } else {
+            await viewModel.initialLoadIfNeeded()
         }
     }
 
@@ -1124,10 +1333,13 @@ struct MediaExploreContentView: View {
 
     private func handleInitialLoad() async {
 
+        let restoredFeed = viewModel.restoreExploreFeedIfNeededAfterDetailReturn()
         if viewModel.items.isEmpty {
             isInitialLoading = true
         }
-        await viewModel.initialLoadIfNeeded()
+        if !restoredFeed {
+            await viewModel.initialLoadIfNeeded()
+        }
         if searchText.isEmpty {
             searchText = viewModel.currentQuery
         }
@@ -1158,14 +1370,7 @@ struct MediaExploreContentView: View {
         loadMoreFailed = false
         viewModel.errorMessage = nil
 
-        switch workshopSourceManager.activeSource {
-        case .wallpaperEngine:
-            await viewModel.loadWorkshopFeed()
-        case .dongtai:
-            await viewModel.loadDongTaiFeed()
-        default:
-            await viewModel.loadHomeFeed()
-        }
+        await viewModel.initialLoadIfNeeded()
 
         syncAtmosphereIfNeeded()
         isInitialLoading = false
@@ -1196,6 +1401,8 @@ struct MediaExploreContentView: View {
                 await viewModel.loadWorkshopFeed()
             case .dongtai:
                 await viewModel.loadDongTaiFeed()
+            case .wallsflow:
+                await viewModel.loadWallsflowFeed()
             default:
                 if category == .all {
                     await viewModel.loadHomeFeed()
@@ -1210,7 +1417,7 @@ struct MediaExploreContentView: View {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // BG 源：中文翻译处理（仅在无外部 query 时触发）
-        let isMotionBG = workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai
+        let isMotionBG = workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai && workshopSourceManager.activeSource != .wallsflow
         if query == nil && isMotionBG && !trimmed.isEmpty {
             let chineseDetected = translationBridge.isChinese(trimmed)
             let needsTranslation = chineseDetected
@@ -1256,6 +1463,8 @@ struct MediaExploreContentView: View {
                 await applyWorkshopFilters(query: query)
             case .dongtai:
                 await viewModel.searchDongTai(query: query)
+            case .wallsflow:
+                await viewModel.searchWallsflow(query: query)
             default:
                 await viewModel.search(query: query)
             }
@@ -1264,7 +1473,8 @@ struct MediaExploreContentView: View {
 
     private func handleTranslationCompleted() {
         guard workshopSourceManager.activeSource != .wallpaperEngine,
-              workshopSourceManager.activeSource != .dongtai else { return }
+              workshopSourceManager.activeSource != .dongtai,
+              workshopSourceManager.activeSource != .wallsflow else { return }
         guard let pending = pendingSearchText else { return }
         pendingSearchText = nil
         let query = translationBridge.effectiveQuery(for: pending)
@@ -1275,8 +1485,8 @@ struct MediaExploreContentView: View {
     private func handleFilterChange() {
         guard !isApplyingProgrammaticReset else { return }
 
-        // Workshop/DongTai 模式下不支持标签过滤
-        if workshopSourceManager.activeSource == .wallpaperEngine || workshopSourceManager.activeSource == .dongtai {
+        // Workshop/DongTai/Wallsflow 模式下不支持标签过滤
+        if workshopSourceManager.activeSource == .wallpaperEngine || workshopSourceManager.activeSource == .dongtai || workshopSourceManager.activeSource == .wallsflow {
             syncAtmosphereIfNeeded()
             return
         }
@@ -1341,8 +1551,8 @@ struct MediaExploreContentView: View {
     }
 
     private func handleSourceChange() {
-        // 数据源切换时重置并重新加载
-        resetAllFilters(reloadData: true)
+        // 仅重置 UI 筛选状态，不触发数据加载——加载由 ViewModel.$activeSource sink 统一负责
+        resetAllFilters(reloadData: false)
     }
 
     private func handleWorkshopURLSubmit() {
@@ -1369,6 +1579,7 @@ struct MediaExploreContentView: View {
                     isResolvingWorkshopURL = false
                     showWorkshopURLSheet = false
                     workshopURLInput = ""
+                    viewModel.preserveExploreFeedForDetailNavigation()
                     selectedMedia = item
                 }
             } catch {
@@ -1386,34 +1597,55 @@ struct MediaExploreContentView: View {
               !isLoadingMore,
               !viewModel.isLoadingMore else { return }
 
+        // ⛔ 冷却期内不触发 loadMore（防止 contentSize 增长后的无限级联）
+        if let cooldown = loadMoreCooldownUntil, Date() < cooldown { return }
+
         isLoadingMore = true
         loadMoreFailed = false
         loadMoreTask?.cancel()
-        loadMoreTask = Task {
-            switch workshopSourceManager.activeSource {
-            case .wallpaperEngine:
-                await viewModel.loadMoreWorkshop()
-            case .dongtai:
-                await viewModel.loadMoreDongTai()
-            default:
-                await viewModel.loadMore()
-            }
+        let generation = loadMoreGeneration
+        loadMoreGeneration &+= 1
+        loadMoreTask = Task { [generation] in
+            await viewModel.loadMoreFeed()
             await MainActor.run {
+                // 只有最新的 task 才能更新 UI：generation 被捕获后 loadMoreGeneration 已 +1，
+                // 若期间有新 task 创建则 loadMoreGeneration 会继续 +1，此时 guard 不成立跳过
+                guard loadMoreGeneration == generation + 1 else { return }
                 if viewModel.hasMorePages && viewModel.errorMessage != nil {
                     loadMoreFailed = true
                 }
+                // ⚡ 设置 1.5s 冷却期 + 0.5s 延迟释放 isLoadingMore，双重防护
+                loadMoreCooldownUntil = Date().addingTimeInterval(1.5)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     isLoadingMore = false
                 }
             }
-            loadMoreTask = nil
         }
+    }
+
+    private func scheduleLoadMoreFromScroll() {
+        scrollCoordinator.pendingLoadMoreTask?.cancel()
+        let task = DispatchWorkItem { [self] in
+            triggerLoadMore()
+        }
+        scrollCoordinator.pendingLoadMoreTask = task
+        DispatchQueue.main.async(execute: task)
     }
 
     private func handleLoadMoreSentinelPosition(_ sentinelMinY: CGFloat, viewportHeight: CGFloat) {
         guard isVisible, viewportHeight > 0, sentinelMinY.isFinite else { return }
-        if sentinelMinY <= viewportHeight + Self.loadMoreTriggerThreshold {
-            triggerLoadMore()
+        let isNearBottom = sentinelMinY <= viewportHeight + Self.loadMoreTriggerThreshold
+        if isNearBottom {
+            // ⛔ 冷却期内不触发 loadMore
+            if let cooldown = loadMoreCooldownUntil, Date() < cooldown { return }
+            guard !scrollCoordinator.wasNearBottom else { return }
+            scrollCoordinator.wasNearBottom = true
+            scheduleLoadMoreFromScroll()
+        } else {
+            // ⚡ 延迟重置 wasNearBottom，给 contentSize 足够时间稳定
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+                scrollCoordinator.wasNearBottom = false
+            }
         }
     }
 
@@ -1433,6 +1665,7 @@ struct MediaExploreContentView: View {
         selectedDongTaiSort = .popular
         dongtaiFilterAudio = nil
         dongtaiFilterFourK = nil
+        selectedWallsflowCategorySlug = "live-wallpapers"
         selectedCategory = .all
         selectedSort = .newest
         lastSyncedFirstItemID = nil
@@ -1465,14 +1698,7 @@ struct MediaExploreContentView: View {
                 searchTask = nil
             }
 
-            switch workshopSourceManager.activeSource {
-            case .wallpaperEngine:
-                await viewModel.resetAndLoadDefaultWorkshopFeed()
-            case .dongtai:
-                await viewModel.resetAndLoadDefaultDongTaiFeed()
-            default:
-                await viewModel.resetAndLoadDefaultHomeFeed()
-            }
+            await viewModel.resetAndLoadDefaultFeed()
 
             syncAtmosphereIfNeeded()
 
@@ -1481,7 +1707,7 @@ struct MediaExploreContentView: View {
 
     private func prepareForFeedReplacement() {
         loadMoreTask?.cancel()
-        sentinelDebounceTask?.cancel()
+        scrollCoordinator.cancelPendingWork()
         isLoadingMore = false
         loadMoreFailed = false
         showScrollToTop = false
@@ -1491,11 +1717,10 @@ struct MediaExploreContentView: View {
     private func cancelTasks() {
         searchTask?.cancel()
         loadMoreTask?.cancel()
-        sentinelDebounceTask?.cancel()
+        scrollCoordinator.cancelPendingWork()
 
         searchTask = nil
         loadMoreTask = nil
-        sentinelDebounceTask = nil
         isLoadingMore = false
     }
 
@@ -1666,6 +1891,40 @@ private enum MediaCategory: String, CaseIterable, Identifiable {
         case .japan: return ["FFB7C5", "E85D75"]
         case .helloKitty: return ["FF69B4", "FF1493"]
         }
+    }
+}
+
+// MARK: - 媒体探索页氛围背景（独立观察视频壁纸播放状态）
+/// 从 MediaExploreContentView 下沉而来：自行观察 VideoWallpaperManager / WallpaperEngineXBridge，
+/// 仅当播放状态变化时重建本背景视图，避免整个媒体探索页 body 重算。
+private struct MediaExploreAtmosphereBackground: View {
+    let tint: ExploreAtmosphereTint
+    let referenceImage: NSImage?
+    let isLightMode: Bool
+    let dotGridOpacity: Double
+    let grainIntensity: Double
+
+    @ObservedObject private var videoWallpaperManager = VideoWallpaperManager.shared
+    @ObservedObject private var wallpaperEngineBridge = WallpaperEngineXBridge.shared
+
+    /// 动态壁纸正在播放时启用轻量特效，降低 GPU/WindowServer 压力
+    private var shouldUseLightweightEffects: Bool {
+        (videoWallpaperManager.isVideoWallpaperActive && !videoWallpaperManager.isPaused) ||
+        (wallpaperEngineBridge.isControllingExternalEngine && !wallpaperEngineBridge.isExternalPaused)
+    }
+
+    var body: some View {
+        ArcAtmosphereBackground(
+            tint: tint,
+            referenceImage: shouldUseLightweightEffects ? nil : referenceImage,
+            isLightMode: isLightMode,
+            dotGridOpacity: dotGridOpacity,
+            useNoise: true,
+            grainIntensity: grainIntensity,
+            lightweight: shouldUseLightweightEffects
+        )
+        // 把多层渐变+点阵+噪点合并成一个 Metal 纹理，减少 WindowServer 合成层数
+        .drawingGroup(opaque: true)
     }
 }
 

@@ -16,7 +16,7 @@ class WallpaperSchedulerService: ObservableObject {
     /// Tracks already-used item IDs per screen in the current random round to avoid duplicates within a full cycle.
     private var usedItemIDs: [String: Set<String>] = [:]
 
-    private var timer: Timer?
+    private var dispatchTimer: DispatchSourceTimer?
     private var pendingCleanupWorkItem: DispatchWorkItem?
     private let userDefaultsKey = "wallpaper_scheduler_config"
     private let usedItemIDsKey = "wallpaper_scheduler_used_item_ids_v1"
@@ -127,8 +127,8 @@ class WallpaperSchedulerService: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.isScreenLocked = true
-            self.timer?.invalidate()
-            self.timer = nil
+            self.dispatchTimer?.cancel()
+            self.dispatchTimer = nil
             print("\(self.logTag) Screen locked, pausing scheduler")
         }
     }
@@ -351,8 +351,8 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        dispatchTimer?.cancel()
+        dispatchTimer = nil
         isRunning = false
         saveConfig()
         // 停止时保留持久化状态，以便重新启用时继续上轮随机进度
@@ -380,7 +380,18 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateConfig(_ newConfig: SchedulerConfig) {
-        config = newConfig
+        // 根据各屏启用的内容类型校验 folderIDs：移除属于已关闭类型（或 on-end 模式下的壁纸类型）
+        // 的文件夹 ID。若全部失效则回退为 nil（全部），避免文件夹过滤把候选清空导致自动更换失效。
+        var validated = newConfig
+        for screenID in validated.displayConfigs.keys {
+            guard var dc = validated.displayConfigs[screenID] else { continue }
+            let pruned = validatedFolderIDs(dc.folderIDs, displayConfig: dc)
+            if pruned != dc.folderIDs {
+                dc.folderIDs = pruned
+                validated.displayConfigs[screenID] = dc
+            }
+        }
+        config = validated
         saveConfig()
         if isRunning {
             stop()
@@ -388,6 +399,25 @@ class WallpaperSchedulerService: ObservableObject {
         if hasAnyEnabledDisplay {
             start()
         }
+    }
+
+    /// 校验 folderIDs 是否仍属于当前启用的内容类型。
+    /// - on-end 模式仅消费媒体，壁纸文件夹视为失效。
+    /// - 已删除（在两类文件夹存储中均查不到）的 ID 一并剔除。
+    /// - 全部失效时返回 nil（等价于"全部"），避免空过滤把候选清空。
+    private func validatedFolderIDs(_ folderIDs: [String]?, displayConfig: DisplaySchedulerConfig) -> [String]? {
+        guard let folderIDs, !folderIDs.isEmpty else { return folderIDs }
+        let includeWallpapers = displayConfig.includeWallpapers && !displayConfig.isOnEndMode
+        let includeMedia = displayConfig.includeMedia
+        let store = LibraryFolderStore.shared
+        let filtered = folderIDs.filter { id in
+            let isWallpaperFolder = store.folder(withID: id, contentType: .wallpaper) != nil
+            let isMediaFolder = store.folder(withID: id, contentType: .media) != nil
+            if isWallpaperFolder { return includeWallpapers }
+            if isMediaFolder { return includeMedia }
+            return false // 未知/已删除 ID
+        }
+        return filtered.isEmpty ? nil : filtered
     }
 
     /// 是否有至少一个显示器开启了自动更换
@@ -464,7 +494,7 @@ class WallpaperSchedulerService: ObservableObject {
                     // 无本机视频壁纸（静态图片 / Web CLI 壁纸等）：自动选取一个视频开始播放
                     if isWebWallpaper {
                         print("\(logTag) On-end mode: stopping CLI Web wallpaper to switch to video")
-                        WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
+                        WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: screen)
                     }
                     print("\(logTag) On-end mode: no active video, auto-selecting first video wallpaper for screen \(screenID)")
                     self.triggerNextWallpaper(for: screenID)
@@ -540,7 +570,8 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     private func scheduleNextChange() {
-        timer?.invalidate()
+        dispatchTimer?.cancel()
+        dispatchTimer = nil
 
         let interval = effectiveCheckInterval()
         // interval 为 0 表示所有启用的显示器都使用"播完即换"模式，不需要定时器
@@ -549,11 +580,13 @@ class WallpaperSchedulerService: ObservableObject {
             return
         }
 
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.changeWallpaperIfNeeded()
-            }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.changeWallpaperIfNeeded()
         }
+        timer.activate()
+        dispatchTimer = timer
     }
 
     private func changeWallpaperIfNeeded() {
@@ -633,8 +666,13 @@ class WallpaperSchedulerService: ObservableObject {
             .attributesOfItem(atPath: fileURL.path)[.type] as? FileAttributeType) == .typeDirectory
 
         do {
-            // 优先使用烘焙 MP4 产物（WE Scene 离线烘焙）
+            // 优先使用烘焙 MP4 产物（WE Scene 离线烘焙）。
+            // 实时渲染模式下需跳过：scene 壁纸的烘焙 MP4 仅供锁屏/桌面 poster，不得反向替换
+            // 桌面实时渲染（否则会变成播放固定时长 MP4 循环而非 wallpaper-wgpu 实时渲染）。
+            // on-end 模式必须播放视频以接收播放完成通知，保留烘焙产物。
+            let preferRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") && !isOnEndMode
             if let bakedPath = item.bakedVideoPath,
+               !preferRealtime,
                SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: bakedPath)) {
                 print("\(logTag) Using baked video: \(bakedPath)")
                 let bakedURL = URL(fileURLWithPath: bakedPath)
@@ -744,10 +782,23 @@ class WallpaperSchedulerService: ObservableObject {
                             return false
                         }
                         print("\(logTag) Using CLI renderer for WE \(type): \(resolvedRoot.path)")
+                        let isRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
+                        let userProps = isRealtime
+                            ? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: resolvedRoot.path)
+                            : nil
                         try await WallpaperEngineXBridge.shared.setWallpaper(
                             path: resolvedRoot.path,
-                            targetScreens: [screen]
+                            targetScreens: [screen],
+                            userProperties: userProps
                         )
+                        // 实时渲染模式下，后台生成离线 MP4；完成后若动态锁屏开启，则推送到当前屏幕实例。
+                        if isRealtime {
+                            SceneOfflineBakeService.scheduleRealtimeCompanionBake(
+                                path: resolvedRoot.path,
+                                targetScreens: [screen],
+                                reason: "scheduler"
+                            )
+                        }
                         // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
                     }
                 } else {
@@ -1020,10 +1071,16 @@ class WallpaperSchedulerService: ObservableObject {
                 if isWorkshop && displayConfig.includeWallpapers && existingIDs.contains(itemID) {
                     continue
                 }
-                // Workshop 项优先使用烘焙产物
+                // Workshop 项优先使用烘焙产物。
+                // 但实时渲染模式下，scene 壁纸的烘焙 MP4 仅供锁屏/桌面 poster（见
+                // SceneOfflineBakeService.scheduleRealtimeCompanionBake 注释），
+                // 不得反向替换桌面实时渲染——否则轮播第二次起会变成播放固定时长的
+                // 烘焙视频而非 wallpaper-wgpu 实时渲染。on-end 模式仍需可播放视频，保留烘焙产物。
+                let isRealtimeRenderingEnabled = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
+                let preferRealtimeForScene = isRealtimeRenderingEnabled && !onEndMode
                 var bakedVideoPath: String? = nil
                 var sceneBakeItemID: String? = nil
-                if isWorkshop, let art = record.sceneBakeArtifact {
+                if isWorkshop, !preferRealtimeForScene, let art = record.sceneBakeArtifact {
                     if SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
                         bakedVideoPath = art.videoPath
                         sceneBakeItemID = record.item.id

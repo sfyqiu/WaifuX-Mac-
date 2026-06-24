@@ -27,21 +27,113 @@ mkdir -p "$DEST_DIR" "$DEST_LIB_DIR"
 
 echo "🔧 wallpaper-wgpu 部署开始..."
 
+fix_ffmpeg_install_names() {
+  local ffmpeg_bin="$1"
+  local lib_dir="$2"
+
+  if [[ ! -f "$ffmpeg_bin" || ! -d "$lib_dir" ]] || ! command -v otool >/dev/null 2>&1 || ! command -v install_name_tool >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local changed=false
+  while IFS= read -r dep_path; do
+    [[ -n "$dep_path" ]] || continue
+    case "$dep_path" in
+      /opt/homebrew/*)
+        local dep_base
+        dep_base="$(basename "$dep_path")"
+        if [[ -e "$lib_dir/$dep_base" ]]; then
+          install_name_tool -change "$dep_path" "@loader_path/lib/$dep_base" "$ffmpeg_bin" 2>/dev/null || true
+          changed=true
+        else
+          echo "  ⚠️  ffmpeg 依赖未捆绑: $dep_base"
+        fi
+        ;;
+    esac
+  done < <(otool -L "$ffmpeg_bin" 2>/dev/null | awk 'NR > 1 { print $1 }')
+
+  if [[ "$changed" == true ]]; then
+    codesign --force --sign - "$ffmpeg_bin" 2>/dev/null || true
+    echo "  ✅ ffmpeg dylib 路径已改为 @loader_path/lib"
+  fi
+}
+
 # ── 1. 复制 wallpaper-wgpu ──────────────────────────────────────
-WGUI_SRC="${WAIFUX_WGPU_SRC:-/Users/lixiongwei/Downloads/wallpaper-wgpu}"
-if [[ -f "$WGUI_SRC" ]]; then
+WGUI_SRC="${WAIFUX_WGPU_SRC:-}"
+if [[ -z "$WGUI_SRC" ]]; then
+  # 手动部署时优先使用 wallpaper-wgpu 项目的最新 release 产物。
+  for candidate in \
+    "/Volumes/mac/CodeLibrary/Claude/wallpaper-wgpu/target/release/wallpaper-wgpu" \
+    "$HOME/Downloads/wallpaper-wgpu" \
+    "$ROOT/wallpaper-wgpu"; do
+    if [[ -f "$candidate" ]]; then
+      WGUI_SRC="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -n "$WGUI_SRC" && -f "$WGUI_SRC" ]]; then
   cp "$WGUI_SRC" "$DEST_DIR/wallpaper-wgpu"
   chmod +x "$DEST_DIR/wallpaper-wgpu"
   echo "  ✅ wallpaper-wgpu → $DEST_DIR/wallpaper-wgpu"
+elif [[ -f "$DEST_DIR/wallpaper-wgpu" ]]; then
+  echo "  ⚠️  wallpaper-wgpu 源未找到，保留已有 $DEST_DIR/wallpaper-wgpu"
 else
-  echo "  ⚠️  $WGUI_SRC 不存在，跳过 wallpaper-wgpu 复制"
+  echo "  ⚠️  wallpaper-wgpu 未找到，跳过复制"
+fi
+
+# ── 1.5 复制 ffmpeg（bake 命令需要） ────────────────────────────
+FFMPEG_SRC="${WAIFUX_FFMPEG_SRC:-/opt/homebrew/bin/ffmpeg}"
+# 如果是符号链接，解析真实路径（macOS readlink 不支持 -f）
+if [[ -L "$FFMPEG_SRC" ]]; then
+  FFMPEG_SRC="$(cd "$(dirname "$FFMPEG_SRC")" && pwd)/$(basename "$FFMPEG_SRC")"
+  # 如果还是链接，用 stat 获取真实路径
+  if [[ -L "$FFMPEG_SRC" ]]; then
+    FFMPEG_SRC="$(stat -f%R "$FFMPEG_SRC" 2>/dev/null || echo "$FFMPEG_SRC")"
+  fi
+fi
+if [[ -f "$FFMPEG_SRC" ]]; then
+  cp "$FFMPEG_SRC" "$DEST_DIR/ffmpeg"
+  chmod +x "$DEST_DIR/ffmpeg"
+  fix_ffmpeg_install_names "$DEST_DIR/ffmpeg" "$DEST_LIB_DIR"
+  echo "  ✅ ffmpeg → $DEST_DIR/ffmpeg"
+else
+  echo "  ⚠️  ffmpeg 未找到($FFMPEG_SRC), bake 功能将不可用"
 fi
 
 # ── 2. 复制 DXC ─────────────────────────────────────────────────
-DXC_SRC="${WAIFUX_DXC_SRC:-/Users/lixiongwei/Desktop/dxc}"
-DXC_DYLIB_SRC="${WAIFUX_DXC_DYLIB_SRC:-/Users/lixiongwei/Desktop/libdxcompiler.dylib}"
+DXC_SRC="${WAIFUX_DXC_SRC:-}"
+DXC_DYLIB_SRC="${WAIFUX_DXC_DYLIB_SRC:-}"
 
-if [[ -f "$DXC_SRC" ]]; then
+# 如果未指定源路径，尝试多个位置
+if [[ -z "$DXC_SRC" ]]; then
+  for candidate in \
+    "$HOME/Desktop/dxc" \
+    "$ROOT/Resources/dxc" \
+    "/opt/homebrew/bin/dxc"; do
+    if [[ -f "$candidate" ]]; then
+      DXC_SRC="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$DXC_DYLIB_SRC" ]]; then
+  for candidate in \
+    "$HOME/Desktop/libdxcompiler.dylib" \
+    "$ROOT/Resources/lib/libdxcompiler.dylib" \
+    "/opt/homebrew/lib/libdxcompiler.dylib"; do
+    if [[ -f "$candidate" ]]; then
+      DXC_DYLIB_SRC="$candidate"
+      break
+    fi
+  done
+fi
+
+# 如果 Resources 下已存在且未指定源，跳过复制
+if [[ -f "$DEST_DIR/dxc" && -z "${WAIFUX_DXC_SRC:-}" ]]; then
+  echo "  ✅ dxc 已存在，跳过复制"
+elif [[ -n "$DXC_SRC" && -f "$DXC_SRC" ]]; then
   cp "$DXC_SRC" "$DEST_DIR/dxc"
   chmod +x "$DEST_DIR/dxc"
   # dxc 已有 @executable_path/../lib rpath，但由于 Xcode 的 folder reference
@@ -54,15 +146,17 @@ if [[ -f "$DXC_SRC" ]]; then
   codesign --force --sign - "$DEST_DIR/dxc" 2>/dev/null || true
   echo "  ✅ dxc → $DEST_DIR/dxc"
 else
-  echo "  ⚠️  $DXC_SRC 不存在，跳过 dxc 复制"
+  echo "  ⚠️  dxc 未找到，跳过复制"
 fi
 
-if [[ -f "$DXC_DYLIB_SRC" ]]; then
+if [[ -f "$DEST_LIB_DIR/libdxcompiler.dylib" && -z "${WAIFUX_DXC_DYLIB_SRC:-}" ]]; then
+  echo "  ✅ libdxcompiler.dylib 已存在，跳过复制"
+elif [[ -n "$DXC_DYLIB_SRC" && -f "$DXC_DYLIB_SRC" ]]; then
   cp "$DXC_DYLIB_SRC" "$DEST_LIB_DIR/libdxcompiler.dylib"
   chmod +x "$DEST_LIB_DIR/libdxcompiler.dylib"
   echo "  ✅ libdxcompiler.dylib → $DEST_LIB_DIR/libdxcompiler.dylib"
 else
-  echo "  ⚠️  $DXC_DYLIB_SRC 不存在，跳过 libdxcompiler.dylib 复制"
+  echo "  ⚠️  libdxcompiler.dylib 未找到，跳过复制"
 fi
 
 # ── 3. 生成内嵌 assets (.incbin) ─────────────────────────────────
@@ -140,8 +234,8 @@ EOF
   for arch in "${REQUIRED_EMBED_ARCHS[@]}"; do
     data_object="$DEST_DIR/zip_data.${arch}.o"
     accessor_object="$DEST_DIR/zip_accessor.${arch}.o"
-    as -arch "$arch" -mmacosx-version-min=14.0 "$ZIP_DATA_S" -o "$data_object"
-    clang -arch "$arch" -c -mmacosx-version-min=14.0 "$ZIP_ACCESSOR_C" -o "$accessor_object"
+    as -arch "$arch" -mmacosx-version-min=14.4 "$ZIP_DATA_S" -o "$data_object"
+    clang -arch "$arch" -c -mmacosx-version-min=14.4 "$ZIP_ACCESSOR_C" -o "$accessor_object"
     data_objects+=("$data_object")
     accessor_objects+=("$accessor_object")
   done
@@ -168,6 +262,9 @@ if command -v codesign >/dev/null 2>&1; then
   fi
   if [[ -f "$DEST_LIB_DIR/libdxcompiler.dylib" ]]; then
     codesign --force -s - "$DEST_LIB_DIR/libdxcompiler.dylib" 2>/dev/null || true
+  fi
+  if [[ -f "$DEST_DIR/ffmpeg" ]]; then
+    codesign --force -s - "$DEST_DIR/ffmpeg" 2>/dev/null || true
   fi
   echo "  ✅ 签名完成"
 fi

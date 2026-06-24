@@ -25,14 +25,54 @@ func configureAnimatedGIFViewForAspectFill(_ view: AnimatedImageView, autoPlay: 
 actor AnimatedImageProbeCache {
     static let shared = AnimatedImageProbeCache()
 
-    private let maxEntries = 512
-    private var cache: [String: Bool] = [:]
-    private var accessOrder: [String] = []
+    /// 内存缓存：使用 NSCache（线程安全）以便提供 nonisolated 同步读取接口。
+    /// 这样 SwiftUI body 在同步求值期间就能命中缓存，避免每次卡片 mount 都启动一次
+    /// async probe + setState 抖动（结果即使一致也会触发一次 body 重算）。
+    /// `nonisolated(unsafe)`：NSCache 文档承诺所有访问皆线程安全，无需额外加锁。
+    private nonisolated(unsafe) static let memoryCache: NSCache<NSString, NSNumber> = {
+        let cache = NSCache<NSString, NSNumber>()
+        cache.countLimit = 512
+        return cache
+    }()
+
+    /// 最大并发探测数（避免快速滚动时大量并发 HTTP Range 请求）
+    private let maxConcurrentProbes = 6
+    private var activeProbes = 0
+    private var waitingProbes: [CheckedContinuation<Void, Never>] = []
 
     private static let gifSignature = Data("GIF".utf8)
     private static let headerByteCount = 64 * 1024
     private static let defaultMaxPixelCount = 8_000_000
     private static let defaultMaxFrameCount = 180
+
+    private nonisolated static func cacheKey(
+        url: URL,
+        maxByteCount: Int64,
+        maxPixelCount: Int,
+        maxFrameCount: Int
+    ) -> NSString {
+        "\(url.absoluteString)|b:\(maxByteCount)|p:\(maxPixelCount)|f:\(maxFrameCount)" as NSString
+    }
+
+    /// **同步**查询缓存（不发起任何探测）。SwiftUI body 可直接调用以避免异步抖动。
+    /// 返回值：
+    /// - `true`  → 已缓存为 GIF；
+    /// - `false` → 已缓存为非 GIF；
+    /// - `nil`   → 未探测过，调用方需要走 `isAnimatedGIF(...)` 异步流程。
+    nonisolated func cachedIsAnimatedGIF(
+        _ url: URL,
+        maxByteCount: Int64,
+        maxPixelCount: Int = defaultMaxPixelCount,
+        maxFrameCount: Int = defaultMaxFrameCount
+    ) -> Bool? {
+        let key = Self.cacheKey(
+            url: url,
+            maxByteCount: maxByteCount,
+            maxPixelCount: maxPixelCount,
+            maxFrameCount: maxFrameCount
+        )
+        return Self.memoryCache.object(forKey: key)?.boolValue
+    }
 
     /// 不看文件名/后缀，只读取实际图片响应/文件数据判断是否为可安全播放的 GIF。
     func isAnimatedGIF(
@@ -41,11 +81,18 @@ actor AnimatedImageProbeCache {
         maxPixelCount: Int = defaultMaxPixelCount,
         maxFrameCount: Int = defaultMaxFrameCount
     ) async -> Bool {
-        let key = "\(url.absoluteString)|b:\(maxByteCount)|p:\(maxPixelCount)|f:\(maxFrameCount)"
-        if let cached = cache[key] {
-            markRecentlyUsed(key)
+        let key = Self.cacheKey(
+            url: url,
+            maxByteCount: maxByteCount,
+            maxPixelCount: maxPixelCount,
+            maxFrameCount: maxFrameCount
+        )
+        if let cached = Self.memoryCache.object(forKey: key)?.boolValue {
             return cached
         }
+
+        // 并发限制：等待槽位
+        await acquireProbeSlot()
 
         let result: Bool
         if url.isFileURL {
@@ -64,7 +111,32 @@ actor AnimatedImageProbeCache {
             )
         }
 
-        return store(result, for: key)
+        // 释放槽位
+        releaseProbeSlot()
+
+        Self.memoryCache.setObject(NSNumber(value: result), forKey: key)
+        return result
+    }
+
+    /// 等待一个并发槽位
+    private func acquireProbeSlot() async {
+        if activeProbes < maxConcurrentProbes {
+            activeProbes += 1
+        } else {
+            await withCheckedContinuation { continuation in
+                waitingProbes.append(continuation)
+            }
+        }
+    }
+
+    /// 释放并发槽位，唤醒等待者
+    private func releaseProbeSlot() {
+        if let next = waitingProbes.first {
+            waitingProbes.removeFirst()
+            next.resume()
+        } else {
+            activeProbes -= 1
+        }
     }
 
     private static func probeLocalGIF(
@@ -102,7 +174,8 @@ actor AnimatedImageProbeCache {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             forHTTPHeaderField: "User-Agent"
         )
-        request.setValue("image/gif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        // 只接受 GIF，阻止 CDN 转换为 WebP 等格式
+        request.setValue("image/gif,*/*;q=0.1", forHTTPHeaderField: "Accept")
         if let host = url.host?.lowercased() {
             if host.contains("steam") || host.contains("akamaihd") {
                 request.setValue("https://steamcommunity.com/", forHTTPHeaderField: "Referer")
@@ -124,16 +197,16 @@ actor AnimatedImageProbeCache {
             return false
         }
 
-        let looksLikeGIF = response.mimeType?.lowercased().contains("gif") == true
-            || dataLooksLikeGIF(data)
+        let mimeType = response.mimeType?.lowercased() ?? ""
+        let looksLikeGIF = mimeType.contains("gif") || dataLooksLikeGIF(data)
         guard looksLikeGIF else { return false }
 
         return imagePropertiesWithinBudget(
             data,
             maxPixelCount: maxPixelCount,
             maxFrameCount: maxFrameCount,
-            requireAnimatedFrameCount: false
-        ) || gifHeaderDimensionsWithinBudget(data, maxPixelCount: maxPixelCount)
+            requireAnimatedFrameCount: true
+        )
     }
 
     private static func dataLooksLikeGIF(_ data: Data) -> Bool {
@@ -201,26 +274,9 @@ actor AnimatedImageProbeCache {
     }
 
     private func store(_ result: Bool, for key: String) -> Bool {
-        if cache[key] == nil {
-            accessOrder.append(key)
-        } else {
-            markRecentlyUsed(key)
-        }
-
-        cache[key] = result
-
-        while accessOrder.count > maxEntries, let oldest = accessOrder.first {
-            accessOrder.removeFirst()
-            cache.removeValue(forKey: oldest)
-        }
-
+        // 已迁移到 NSCache 直接写入。保留这个方法签名以防其他调用方，但内部直接缓存。
+        Self.memoryCache.setObject(NSNumber(value: result), forKey: key as NSString)
         return result
-    }
-
-    private func markRecentlyUsed(_ key: String) {
-        guard let index = accessOrder.firstIndex(of: key) else { return }
-        accessOrder.remove(at: index)
-        accessOrder.append(key)
     }
 }
 
@@ -1032,6 +1088,11 @@ final class PreviewWindowManager: ObservableObject {
     func closePreview() {
         guard isPresented else { return }
         removeCloseObserver()
+        if let window = windowController?.window {
+            // 主动断开 hosting view，确保 SwiftUI 视图树立即销毁
+            // (PreviewPlayer @StateObject 走 deinit → AVPlayer 停播)
+            window.contentView = nil
+        }
         windowController?.close()
         windowController = nil
         isPresented = false
@@ -1044,7 +1105,7 @@ final class PreviewWindowManager: ObservableObject {
         }
     }
 
-    func openPreview(url: URL, isMuted: Bool, aspectRatio: Double? = nil, isWeb: Bool = false, posterURL: URL? = nil) {
+    func openPreview(url: URL, aspectRatio: Double? = nil, isWeb: Bool = false, posterURL: URL? = nil) {
         removeCloseObserver()
         windowController?.close()
         windowController = nil
@@ -1088,7 +1149,7 @@ final class PreviewWindowManager: ObservableObject {
         window.minSize = NSSize(width: 400, height: 400)
 
         let hostingView = NSHostingView(
-            rootView: WallpaperPreviewSheet(url: url, isMuted: .constant(isMuted), isWeb: isWeb, posterURL: posterURL)
+            rootView: WallpaperPreviewSheet(url: url, isWeb: isWeb, posterURL: posterURL)
         )
         window.contentView = hostingView
 
@@ -1104,8 +1165,15 @@ final class PreviewWindowManager: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.isPresented = false
-                self?.closeObserver = nil
+                guard let self else { return }
+                self.removeCloseObserver()
+                // 主动断开 hosting view，触发 SwiftUI .onDisappear /
+                // PreviewPlayer.deinit，避免 AVPlayer 在窗口隐藏后继续播放音频
+                if let win = self.windowController?.window {
+                    win.contentView = nil
+                }
+                self.windowController = nil
+                self.isPresented = false
             }
         }
     }

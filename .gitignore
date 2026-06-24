@@ -22,7 +22,7 @@ Packages/
 
 # CocoaPods
 Pods/
-
+Docs/superpowers
 # App
 *.app
 *.dSYM
@@ -47,6 +47,7 @@ COPILOT.md
 .1code/
 .claude/
 .vscode/
+.mimocode/
 .workbuddy/
 *.swp
 *~

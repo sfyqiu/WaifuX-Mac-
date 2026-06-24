@@ -1,6 +1,21 @@
 import SwiftUI
 import AppKit
 
+enum MainTopBarLayout {
+    static let legacyContentTopPadding: CGFloat = 80
+}
+
+private struct MainTopBarContentPaddingKey: EnvironmentKey {
+    static let defaultValue: CGFloat = MainTopBarLayout.legacyContentTopPadding
+}
+
+extension EnvironmentValues {
+    var mainTopBarContentPadding: CGFloat {
+        get { self[MainTopBarContentPaddingKey.self] }
+        set { self[MainTopBarContentPaddingKey.self] = newValue }
+    }
+}
+
 // MARK: - 主标签类型
 public enum MainTab: String, CaseIterable {
     case home, wallpaperExplore, mediaExplore, animeExplore, myMedia
@@ -30,11 +45,12 @@ public enum MainTab: String, CaseIterable {
 struct TopNavigationBar: View {
     @Binding var selectedTab: MainTab
     let onOpenSettings: () -> Void
+    let onGuessYouLike: () -> Void
     let onClose: () -> Void
     let onMinimize: () -> Void
     let onMaximize: () -> Void
     let onZoom: () -> Void
-    
+
     private let controlHeight: CGFloat = 34
 
     var body: some View {
@@ -58,11 +74,18 @@ struct TopNavigationBar: View {
 
             Spacer()
 
-            // 右侧设置按钮 - 固定宽高，内容居中
-            TopBarCircleButton(icon: "gearshape", size: controlHeight) {
-                onOpenSettings()
+            // 右侧按钮组
+            HStack(spacing: 4) {
+                // 猜你喜欢按钮
+                GuessYouLikeNavButton(action: onGuessYouLike)
+                    .frame(height: controlHeight, alignment: .center)
+
+                // 设置按钮
+                TopBarCircleButton(icon: "gearshape", size: controlHeight) {
+                    onOpenSettings()
+                }
+                .frame(width: 48, height: controlHeight, alignment: .center)
             }
-            .frame(width: 48, height: controlHeight, alignment: .center)
         }
         .padding(.leading, 12)
         .padding(.trailing, 12)
@@ -74,6 +97,7 @@ struct TopNavigationBar: View {
     }
 }
 
+// MARK: - 红绿灯按钮组
 struct CustomWindowControls: View {
     let onClose: () -> Void
     let onMinimize: () -> Void
@@ -166,6 +190,35 @@ private struct TopBarCircleButton: View {
     }
 }
 
+// MARK: - 猜你喜欢导航按钮（与设置按钮相同液态玻璃风格）
+
+struct GuessYouLikeNavButton: View {
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: "sparkle")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(t("common.youMayLike"))
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(.white.opacity(isHovered ? 0.96 : 0.82))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .detailGlassCapsuleChrome()
+        }
+        .buttonStyle(.plain)
+        .preferredColorScheme(.dark)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.16)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
 private struct TopBarSegmentedControl: View {
     @Binding var selectedTab: MainTab
     let controlHeight: CGFloat
@@ -175,7 +228,8 @@ private struct TopBarSegmentedControl: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            ForEach(MainTab.allCases, id: \.self) { tab in
+            // 仅显示启动快照启用的 tab（home/myMedia 永远显示；三个 Explore 受功能模块开关门控）
+            ForEach(MainTab.allCases.filter { ModuleAvailability.shared.isTabEnabled($0) }, id: \.self) { tab in
                 Button {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
                         selectedTab = tab
@@ -205,7 +259,7 @@ private struct TopBarSegmentedControl: View {
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
-        .liquidGlassSurface(.prominent, tint: Color.black.opacity(0.25), in: Capsule(style: .continuous))
+        .liquidGlassSurface(.prominent, tint: Color.black.opacity(0.18), in: Capsule(style: .continuous))
         .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
     }
 
@@ -228,7 +282,7 @@ private struct TopBarSegmentedControl: View {
         if #available(macOS 26.0, *) {
             // macOS 26: 使用原生玻璃效果
             Capsule(style: .continuous)
-                .liquidGlassSurface(.max, tint: Color.black.opacity(0.3), in: Capsule(style: .continuous))
+                .liquidGlassSurface(.max, tint: Color.black.opacity(0.18), in: Capsule(style: .continuous))
                 .overlay(
                     Capsule(style: .continuous)
                         .stroke(

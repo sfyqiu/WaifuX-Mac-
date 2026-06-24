@@ -10,7 +10,7 @@ struct DisplaySelectorSheet: View {
     let onCancel: () -> Void
 
     @State private var isVisible = false
-    @State private var selectedScreenID: String? = NSScreen.main?.screenIdentifier
+    @State private var selectedScreenID: String? = nil
 
     private var screens: [NSScreen] {
         NSScreen.screens
@@ -73,7 +73,7 @@ struct DisplaySelectorSheet: View {
                     )
 
                     // 单个显示器选项
-                    ForEach(Array(screens.enumerated()), id: \.offset) { index, screen in
+                    ForEach(Array(screens.enumerated()), id: \.element.screenIdentifier) { index, screen in
                         DisplayOptionButton(
                             icon: "display",
                             title: "\(t("display")) \(index + 1)",
@@ -88,7 +88,7 @@ struct DisplaySelectorSheet: View {
                     }
                 }
                 .frame(maxWidth: 320)
-                
+
                 // 操作按钮
                 HStack(spacing: 12) {
                     Button {
@@ -103,7 +103,7 @@ struct DisplaySelectorSheet: View {
                             .liquidGlassSurface(.regular, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    
+
                     Button {
                         confirmSelection()
                     } label: {
@@ -132,16 +132,13 @@ struct DisplaySelectorSheet: View {
             .scaleEffect(isVisible ? 1.0 : 0.88)
             .opacity(isVisible ? 1.0 : 0.0)
             .onAppear {
-                if selectedScreenID == nil, let firstScreen = screens.first {
-                    selectedScreenID = firstScreen.screenIdentifier
-                }
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                     isVisible = true
                 }
             }
         }
     }
-    
+
     private func dismiss() {
         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
             isVisible = false
@@ -150,7 +147,7 @@ struct DisplaySelectorSheet: View {
             onCancel()
         }
     }
-    
+
     private func confirmSelection() {
         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
             isVisible = false
@@ -168,9 +165,9 @@ private struct DisplayOptionButton: View {
     let subtitle: String
     let isSelected: Bool
     let action: () -> Void
-    
+
     @State private var isHovered = false
-    
+
     var body: some View {
         Button(action: action) {
             HStack(spacing: 12) {
@@ -184,20 +181,20 @@ private struct DisplayOptionButton: View {
                         tint: isSelected ? Color.accentColor.opacity(0.15) : nil,
                         in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                     )
-                
+
                 // 文字
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.system(size: 14, weight: isSelected ? .semibold : .medium))
                         .foregroundStyle(isSelected ? LiquidGlassColors.textPrimary : LiquidGlassColors.textSecondary)
-                    
+
                     Text(subtitle)
                         .font(.system(size: 11))
                         .foregroundStyle(LiquidGlassColors.textQuaternary)
                 }
-                
+
                 Spacer()
-                
+
                 // 选中指示器
                 if isSelected {
                     Image(systemName: "checkmark.circle.fill")
@@ -235,16 +232,16 @@ private struct DisplayOptionButton: View {
 @MainActor
 class DisplaySelectorManager: ObservableObject {
     static let shared = DisplaySelectorManager()
-    
+
     @Published var isShowingSelector = false
     @Published private(set) var selectorTitle: String = ""
     @Published private(set) var selectorMessage: String = ""
     @Published private(set) var allowsBackgroundDismiss = false
-    
+
     private var completionHandler: ((NSScreen?) -> Void)?
-    
+
     private init() {}
-    
+
     /// 显示显示器选择弹窗
     /// - Parameters:
     ///   - title: 弹窗标题
@@ -262,13 +259,13 @@ class DisplaySelectorManager: ObservableObject {
         self.allowsBackgroundDismiss = allowsBackgroundDismiss
         self.isShowingSelector = true
     }
-    
+
     func handleSelection(_ screen: NSScreen?) {
         isShowingSelector = false
         completionHandler?(screen)
         completionHandler = nil
     }
-    
+
     func handleCancel() {
         isShowingSelector = false
         completionHandler = nil
@@ -297,7 +294,7 @@ extension View {
 // MARK: - 显示器选择弹窗覆盖层
 public struct DisplaySelectorOverlay: View {
     @ObservedObject private var manager = DisplaySelectorManager.shared
-    
+
     public var body: some View {
         Group {
             if manager.isShowingSelector {
@@ -337,10 +334,10 @@ private extension NSScreen {
     ZStack {
         LiquidGlassColors.deepBackground
             .ignoresSafeArea()
-        
+
         DisplaySelectorSheet(
-            title: "设置壁纸",
-            message: "检测到多个显示器，请选择要设置的显示器",
+            title: t("displaySelector.title"),
+            message: t("displaySelector.message"),
             allowsBackgroundDismiss: false,
             onSelect: { screen in
                 print("Selected screen: \(screen?.localizedName ?? "All")")

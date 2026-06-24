@@ -30,6 +30,13 @@ private let PRIMARY_CAPTURE_PATH = "/tmp/wallpaperengine-cli-capture.png"
 private let DESK_CAPTURE_PATH_0 = "/tmp/wallpaperengine-cli-desk-0.png"
 private let DESK_CAPTURE_PATH_1 = "/tmp/wallpaperengine-cli-desk-1.png"
 
+private func isDynamicLockScreenEnabledForCurrentLaunch() -> Bool {
+    let rawValue = ProcessInfo.processInfo.environment["WAIFUX_DYNAMIC_LOCK_SCREEN_ENABLED"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return rawValue == "1" || rawValue == "true" || rawValue == "yes"
+}
+
 private func dlog(_ msg: String) {
     let line = "[\(Date())] \(msg)\n"
     if let data = line.data(using: .utf8) {
@@ -92,13 +99,28 @@ private func waifuXGrayscaleThumb(from cgImage: CGImage, dimension: Int) -> [UIn
 
 // MARK: - IPC
 private enum IPCCommand: String, Codable {
-    case set, pause, resume, stop
+    case set, pause, resume, stop, applyProperties, audioControl, audioData
 }
 
 private struct IPCMessage: Codable {
     let command: IPCCommand
     let path: String?
     let screen: Int?
+    let propertiesJSON: String?
+    let muted: Bool?
+    let volume: Double?
+    /// WE 音频频谱（128 floats; 0..63 = L, 64..127 = R）；仅 `.audioData` 命令使用。
+    let spectrum: [Float]?
+
+    init(command: IPCCommand, path: String?, screen: Int?, propertiesJSON: String? = nil, muted: Bool? = nil, volume: Double? = nil, spectrum: [Float]? = nil) {
+        self.command = command
+        self.path = path
+        self.screen = screen
+        self.propertiesJSON = propertiesJSON
+        self.muted = muted
+        self.volume = volume
+        self.spectrum = spectrum
+    }
 }
 
 // MARK: - RendererBridge (from Wallpaper Engine X)
@@ -506,6 +528,36 @@ private final class RendererBridge {
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return false }
         CGImageDestinationAddImage(destination, cgImage, nil)
         return CGImageDestinationFinalize(destination)
+    }
+
+    // MARK: - Built-in Baking API (delegates to dylib)
+
+    func startBake(outputPath: String, duration: Int32, fps: Int32, bitRate: Int32, width: Int32, height: Int32) -> Bool {
+        rendererLock.lock()
+        defer { rendererLock.unlock() }
+        guard let h = handle else { return false }
+        return lw_renderer_start_bake(h, outputPath, duration, fps, bitRate, width, height, nil, nil) != 0
+    }
+
+    var isBaking: Bool {
+        rendererLock.lock()
+        defer { rendererLock.unlock() }
+        guard let h = handle else { return false }
+        return lw_renderer_is_baking(h) != 0
+    }
+
+    var bakeProgress: Float {
+        rendererLock.lock()
+        defer { rendererLock.unlock() }
+        guard let h = handle else { return 0 }
+        return lw_renderer_get_bake_progress(h)
+    }
+
+    func cancelBake() {
+        rendererLock.lock()
+        defer { rendererLock.unlock() }
+        guard let h = handle else { return }
+        lw_renderer_cancel_bake(h)
     }
 
     /// 获取动态文本 JSON（dlsym 弱引用，渲染器未实现时返回 nil）
@@ -1053,6 +1105,108 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         forMainFrameOnly: false
     )
 
+    /// documentStart 注入：包装 AudioContext / webkitAudioContext，把 ctx.destination 路由到一个
+    /// master GainNode；同时维护 window.__waifuxAudioMuted / __waifuxAudioVolume 状态，
+    /// 暴露 window.__waifuxSetAudio({muted?, volume?}) 供 native 通过 evaluateJavaScript 调用。
+    /// 静音也走这里——有效输出 = muted ? 0 : volume。绕开 WKWebView 私有 SPI _setPageMuted
+    /// （KVC 不兼容 setter=_setPageMuted: 的命名约定，setValue:forKey: 会抛 NSUnknownKeyException）。
+    private static let audioWrapperScript = WKUserScript(
+        source: """
+        (function() {
+            'use strict';
+            var ACtor = window.AudioContext || window.webkitAudioContext;
+            if (!ACtor) return;
+
+            if (typeof window.__waifuxAudioVolume !== 'number') {
+                window.__waifuxAudioVolume = 1.0;
+            }
+            if (typeof window.__waifuxAudioMuted !== 'boolean') {
+                window.__waifuxAudioMuted = false;
+            }
+            var wrappedRefs = [];
+
+            function effectiveVolume() {
+                return window.__waifuxAudioMuted ? 0 : window.__waifuxAudioVolume;
+            }
+
+            function applyAudio() {
+                var v = effectiveVolume();
+                for (var i = 0; i < wrappedRefs.length; i++) {
+                    try {
+                        var g = wrappedRefs[i].__waifuxGain;
+                        if (g && g.gain) g.gain.value = v;
+                    } catch (_) {}
+                }
+                try {
+                    document.querySelectorAll('video,audio').forEach(function(e) {
+                        e.volume = v;
+                    });
+                } catch (_) {}
+            }
+
+            function wrapContext(ctx) {
+                try {
+                    var origDest = ctx.destination;
+                    var gain = ctx.createGain();
+                    gain.connect(origDest);
+                    gain.gain.value = effectiveVolume();
+                    Object.defineProperty(ctx, '__waifuxGain', {
+                        value: gain, writable: false, configurable: false
+                    });
+                    Object.defineProperty(ctx, '__waifuxOrigDestination', {
+                        value: origDest, writable: false, configurable: false
+                    });
+                    Object.defineProperty(ctx, 'destination', {
+                        get: function() { return gain; },
+                        configurable: true
+                    });
+                    wrappedRefs.push(ctx);
+                } catch (e) {
+                    try { console.warn('[waifux] wrap AudioContext failed:', e); } catch (_) {}
+                }
+            }
+
+            function makeWrapped(Original) {
+                var Wrapped = function() {
+                    var inst;
+                    switch (arguments.length) {
+                        case 0: inst = new Original(); break;
+                        case 1: inst = new Original(arguments[0]); break;
+                        default: inst = new (Function.prototype.bind.apply(
+                            Original, [null].concat(Array.prototype.slice.call(arguments))
+                        ))();
+                    }
+                    wrapContext(inst);
+                    return inst;
+                };
+                Wrapped.prototype = Original.prototype;
+                try { Object.setPrototypeOf(Wrapped, Original); } catch (_) {}
+                return Wrapped;
+            }
+
+            if (window.AudioContext) {
+                window.AudioContext = makeWrapped(window.AudioContext);
+            }
+            if (window.webkitAudioContext) {
+                window.webkitAudioContext = makeWrapped(window.webkitAudioContext);
+            }
+
+            window.__waifuxSetAudio = function(opts) {
+                if (!opts) return;
+                if (typeof opts.muted === 'boolean') {
+                    window.__waifuxAudioMuted = opts.muted;
+                }
+                if (typeof opts.volume === 'number') {
+                    window.__waifuxAudioVolume = Math.max(0, Math.min(1, opts.volume));
+                }
+                applyAudio();
+            };
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
+
     private var window: NSWindow?
     private var webView: WKWebView?
     private var pendingCompletion: ((Bool) -> Void)?
@@ -1143,6 +1297,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         ucc.addUserScript(Self.wallpaperEngineWebAPIShim)
         ucc.addUserScript(Self.localFileCompatScript)
         ucc.addUserScript(Self.mouseEventBridgeScript)
+        ucc.addUserScript(Self.audioWrapperScript)
         config.userContentController = ucc
         if #available(macOS 14.0, *) {
             config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -1226,8 +1381,12 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         // 对齐 Wallpaper Engine：注入 project 属性 + 修正缺失背景图与全屏布局，再稍等 Spine 应用相机/缩放
         runWebWallpaperBootstrap { [weak self] in
             guard let self = self else { return }
-            self.beginSettlingFirstFrame()
-            // 首帧就绪后启动鼠标事件桥（桌面图标层会吃掉事件，需全局监听转发）
+            if isDynamicLockScreenEnabledForCurrentLaunch() {
+                dlog("[WebRendererBridge] Dynamic lock screen enabled; capture first frame for fallback only")
+                self.beginSettlingFirstFrame()
+            } else {
+                self.beginSettlingFirstFrame()
+            }
             self.startMouseEventBridge()
         }
         NSApp.setActivationPolicy(.prohibited)
@@ -1281,6 +1440,119 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         """) { _, _ in }
         startMouseEventBridge()
         NSApp.setActivationPolicy(.prohibited)
+    }
+
+    /// 设置音频控制（静音/音量），由 daemon IPC 触发。
+    ///
+    /// - 静音走 WKWebView 私有 SPI `_setPageMuted:`（直接发 selector，不走 KVC）。
+    ///   这是 page-level 静音，作用到整个 WKWebView 的 WebContent 进程，覆盖 Web Audio /
+    ///   <audio> / <video> / WebRTC / 跨域 iframe，几乎等价于"对进程做音量操作"。
+    ///   不能用 setValue:forKey:"_pageMuted"——WebKit 把 setter 名声明为 `setter=_setPageMuted:`，
+    ///   KVC 的 setValue:forKey: 按 `set<Key>:` 约定找 `set_PageMuted:` 找不到，会抛
+    ///   NSUnknownKeyException 把 daemon 弄崩（之前被踩过）。所以这里走 method_getImplementation
+    ///   + 类型化函数指针直接调 setter。
+    ///
+    /// - 音量走 documentStart 注入的 audioWrapperScript（见同文件 Self.audioWrapperScript），
+    ///   通过 master GainNode 控 Web Audio + 给 <video>/<audio>.volume 兜底。
+    ///   completion 加 dlog 错误，方便诊断壁纸侧 wrapper 失效。
+    func setAudioControl(muted: Bool?, volume: Double?) {
+        guard isLoaded, let webView else { return }
+
+        if let muted {
+            let sel = NSSelectorFromString("_setPageMuted:")
+            if let method = class_getInstanceMethod(type(of: webView), sel) {
+                typealias SetPageMutedFn = @convention(c) (NSObject, Selector, UInt) -> Void
+                let imp = method_getImplementation(method)
+                let fn = unsafeBitCast(imp, to: SetPageMutedFn.self)
+                // WKMediaMutedState 位掩码：noneMuted=0, audioMuted=1<<0, captureMuted=1<<1
+                fn(webView, sel, muted ? UInt(1) : UInt(0))
+                dlog("[WebRendererBridge] setAudioControl muted=\(muted) via SPI _setPageMuted:")
+            } else {
+                // SPI 在新 macOS 失效 → 退到 wrapper
+                let js = "if(window.__waifuxSetAudio)window.__waifuxSetAudio({muted: \(muted)});"
+                webView.evaluateJavaScript(js) { _, error in
+                    if let error {
+                        dlog("[WebRendererBridge] setAudioControl muted fallback JS error: \(error)")
+                    }
+                }
+                dlog("[WebRendererBridge] setAudioControl muted=\(muted) via wrapper fallback (SPI not found)")
+            }
+        }
+
+        if let volume {
+            let v = max(0.0, min(1.0, volume))
+            let js = """
+            (function(){
+                var v = \(v);
+                if (window.__waifuxSetAudio) {
+                    window.__waifuxSetAudio({volume: v});
+                    return '__waifuxSetAudio';
+                } else {
+                    try {
+                        var n = document.querySelectorAll('video,audio').length;
+                        document.querySelectorAll('video,audio').forEach(function(e){ e.volume = v; });
+                        return 'fallback:' + n;
+                    } catch (e) { return 'error:' + (e && e.message); }
+                }
+            })();
+            """
+            webView.evaluateJavaScript(js) { result, error in
+                if let error {
+                    dlog("[WebRendererBridge] setAudioControl volume=\(v) JS error: \(error)")
+                } else {
+                    dlog("[WebRendererBridge] setAudioControl volume=\(v) result=\(result ?? "nil")")
+                }
+            }
+        }
+    }
+
+    /// 把 WE 标准 128 frame 浮点频谱注入到 webView，
+    /// 触发壁纸侧 `wallpaperRegisterAudioListener` 回调链（与 shim 中 `__wxUpdateAudioBuf` 对接）。
+    /// fire-and-forget：失败仅 dlog；JS 异常不影响后续帧。
+    /// 调用频率上限 30fps，~1KB JS 字符串，主线程开销可忽略。
+    func pushAudioFrame(_ floats: [Float]) {
+        guard floats.count == 128 else { return }
+        guard isLoaded, let webView else { return }
+        var sb = "if(window.__wxUpdateAudioBuf)window.__wxUpdateAudioBuf(["
+        sb.reserveCapacity(1200)
+        for i in 0..<128 {
+            if i > 0 { sb.append(",") }
+            sb.append(String(format: "%.4f", floats[i]))
+        }
+        sb.append("]);")
+        let js = sb
+        DispatchQueue.main.async { [weak webView] in
+            webView?.evaluateJavaScript(js) { _, error in
+                if let error {
+                    dlog("[WebRendererBridge] pushAudioFrame JS error: \(error)")
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func applyUserProperties(jsonString: String) -> Bool {
+        injectedPropertiesJSON = jsonString
+        guard isLoaded, webView != nil else { return false }
+        let encoded = Data(jsonString.utf8).base64EncodedString()
+        let source = """
+        (function() {
+          try {
+            var props = JSON.parse(atob("\(encoded)"));
+            if (window.wallpaperPropertyListener && typeof window.wallpaperPropertyListener.applyUserProperties === 'function') {
+              window.wallpaperPropertyListener.applyUserProperties(props);
+              return true;
+            }
+          } catch (e) {
+            console.error('weweb: applyUserProperties runtime patch failed:', e);
+          }
+          return false;
+        })();
+        """
+        webView?.evaluateJavaScript(source) { result, _ in
+            dlog("[WebRendererBridge] applyUserProperties runtime patch result=\(String(describing: result))")
+        }
+        return true
     }
 
     func stop() {
@@ -1859,6 +2131,26 @@ private final class DesktopWallpaperManager {
         isPaused = false
     }
 
+    @discardableResult
+    func applyWebWallpaperProperties(_ jsonString: String) -> Bool {
+        guard isRunning, isWebMode else { return false }
+        return WebRendererBridge.shared.applyUserProperties(jsonString: jsonString)
+    }
+
+    /// 设置 Web 壁纸的音频控制（静音/音量）
+    func setWebAudioControl(muted: Bool?, volume: Double?) {
+        guard isRunning, isWebMode else { return }
+        WebRendererBridge.shared.setAudioControl(muted: muted, volume: volume)
+    }
+
+    /// 透传 WE 音频频谱给 web renderer。仅在当前壁纸为 web 时有效；否则静默丢帧。
+    /// 参数为 WE 标准 128 frame：0..63 = L, 64..127 = R。
+    func pushWebAudioFrame(_ spectrum: [Float]) {
+        guard isRunning, isWebMode else { return }
+        guard spectrum.count == 128 else { return }
+        WebRendererBridge.shared.pushAudioFrame(spectrum)
+    }
+
     func stopWallpaper() {
         if isWebMode {
             WebRendererBridge.shared.stop()
@@ -1883,6 +2175,10 @@ private final class DesktopWallpaperManager {
     /// 将主截图复制到交替路径再设为桌面图，避免系统因固定路径缓存上一张壁纸（锁屏/静态桌面不更新）
     private func applyCaptureAsDesktopWallpaper(screen: Int? = nil) {
         guard FileManager.default.fileExists(atPath: PRIMARY_CAPTURE_PATH) else { return }
+        guard !isDynamicLockScreenEnabledForCurrentLaunch() else {
+            dlog("[DesktopWallpaperManager] Dynamic lock screen enabled; skip static capture desktop apply")
+            return
+        }
         let src = URL(fileURLWithPath: PRIMARY_CAPTURE_PATH)
         desktopCaptureSlot = 1 - desktopCaptureSlot
         let dstPath = desktopCaptureSlot == 0 ? DESK_CAPTURE_PATH_0 : DESK_CAPTURE_PATH_1
@@ -2032,6 +2328,10 @@ private final class DesktopWallpaperManager {
     }
 
     private func restoreOriginalWallpaper() {
+        guard !isDynamicLockScreenEnabledForCurrentLaunch() else {
+            dlog("[DesktopWallpaperManager] Dynamic lock screen enabled; skip restoring desktop wallpaper")
+            return
+        }
         guard let data = UserDefaults.standard.data(forKey: originalWallpaperKey),
               let savedState = try? JSONDecoder().decode(SavedOriginalWallpaperState.self, from: data) else {
             print("[DesktopWallpaperManager] No original wallpaper to restore")
@@ -2196,6 +2496,8 @@ private enum Client {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return "Failed to create socket" }
         defer { close(fd) }
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: Int32((timeout - floor(timeout)) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         let size = MemoryLayout<sockaddr_un>.size
         let connected = withUnsafePointer(to: &addr) {
@@ -2213,7 +2515,7 @@ private enum Client {
 
         var responseBuf = Data(repeating: 0, count: 1024)
         let received = responseBuf.withUnsafeMutableBytes { recv(fd, $0.baseAddress, 1024, 0) }
-        guard received > 0 else { return nil }
+        guard received > 0 else { return "Daemon communication timed out" }
         return String(data: responseBuf.prefix(received), encoding: .utf8)
     }
 }
@@ -2251,6 +2553,11 @@ private final class Daemon: NSObject, NSApplicationDelegate {
     /// 收到信号后直接 `_exit(0)`，避免走 NSApp.terminate 触发 C++ 静态析构（glslang/SDL 与 AppKit
     /// 子线程交叉收尾时会在 libc++ 里 abort，触发系统"意外退出"弹窗。bake 那边也是同款处理）。
     private func installDaemonSignalHandlers() {
+        // 忽略 SIGPIPE：daemon 的 IPC server 在 sendResponse 时若对端已 close（例如 fire-and-forget
+        // 的 audioControl 调用），写入会触发 EPIPE → SIGPIPE。默认动作是终止进程，会把整个 daemon
+        // 连同正在渲染的 Web 壁纸窗口一起带走。App 一侧已经 signal(SIGPIPE, SIG_IGN)，daemon 这边
+        // 是独立子进程，必须独立设置一次。
+        signal(SIGPIPE, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
         for sig in [SIGTERM, SIGINT] {
@@ -2401,6 +2708,26 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                 case .stop:
                     DesktopWallpaperManager.shared.stopWallpaper()
                     sendResponse("OK")
+                case .applyProperties:
+                    if let propertiesJSON = msg.propertiesJSON {
+                        let applied = DesktopWallpaperManager.shared.applyWebWallpaperProperties(propertiesJSON)
+                        dlog("[Daemon] applyProperties applied=\(applied)")
+                        if applied {
+                            sendResponse("OK")
+                        } else {
+                            sendResponse("ERROR:当前没有运行中的 Web 壁纸可应用属性")
+                        }
+                    } else {
+                        sendResponse("ERROR:缺少 propertiesJSON")
+                    }
+                case .audioControl:
+                    DesktopWallpaperManager.shared.setWebAudioControl(muted: msg.muted, volume: msg.volume)
+                    sendResponse("OK")
+                case .audioData:
+                    if let spec = msg.spectrum, spec.count == 128 {
+                        DesktopWallpaperManager.shared.pushWebAudioFrame(spec)
+                    }
+                    // 不发响应：30fps 高频命令，sendResponse 会塞爆缓冲且让 App 侧每帧都要 recv。
                 }
             }
         }
@@ -2455,12 +2782,14 @@ private func sceneBakeParseConfig(_ arguments: [String]) throws -> SceneOfflineB
     var w = 1920
     var h = 1080
     var fps: Int32 = 30
-    var seconds = 8.0
-    if positional.count >= 6 {
+    var seconds = 0.0
+    if positional.count >= 5 {
         w = max(32, Int(positional[2]) ?? 1920)
         h = max(32, Int(positional[3]) ?? 1080)
         fps = Int32(max(1, min(60, Int(positional[4]) ?? 30)))
-        seconds = max(0.5, Double(positional[5]) ?? 15.0)
+        if positional.count >= 6 {
+            seconds = max(0.0, Double(positional[5]) ?? 0.0)
+        }
     }
     w = (w / 2) * 2
     h = (h / 2) * 2
@@ -2589,106 +2918,115 @@ private func sceneBakePerform(_ cfg: SceneOfflineBakeConfig) throws {
         RendererBridge.shared.hideWindow()
     }
 
-    let rw = sceneBakeOnMain { RendererBridge.shared.renderWidth }
-    let rh = sceneBakeOnMain { RendererBridge.shared.renderHeight }
-    guard rw > 0, rh > 0 else {
+    // 使用 dylib 内置烘焙引擎，它使用固定时间步长管理 g_Time，
+    // 不会受线程调度开销影响，动画速度精确匹配 video 帧率。
+    let started = sceneBakeOnMain {
+        RendererBridge.shared.startBake(
+            outputPath: cfg.outputURL.path,
+            duration: Int32(cfg.durationSeconds),
+            fps: cfg.fps,
+            bitRate: 0,    // auto
+            width: 0,       // use scene width
+            height: 0       // use scene height
+        )
+    }
+
+    guard started else {
         sceneBakeOnMain { RendererBridge.shared.destroy() }
         throw SceneOfflineBakeError.loadFailed
     }
 
-    for _ in 0 ..< 120 {
-        let ok: Bool = autoreleasepool {
-            sceneBakeOnMain { RendererBridge.shared.tickOnce() }
+    // 轮询烘焙状态，每帧调用 tick()
+    // 注意：dylib 内置烘焙使用固定时间步长，tick() 的调用时机不影响动画速度
+    var lastReportedProgress: Float = -1
+    while true {
+        var done = false
+        var progress: Float = 0
+        sceneBakeOnMain {
+            let ok = RendererBridge.shared.tickOnce()
+            progress = RendererBridge.shared.bakeProgress
+            if !ok || !RendererBridge.shared.isBaking {
+                done = true
+            }
         }
-        if !ok {
-            sceneBakeOnMain { RendererBridge.shared.destroy() }
-            throw SceneOfflineBakeError.loadFailed
+        if progress >= 0, progress <= 1,
+           progress >= lastReportedProgress + 0.005 || done || progress >= 1 {
+            lastReportedProgress = progress
+            fputs("BAKE_PROGRESS:\(String(format: "%.3f", min(max(progress, 0), 1)))\n", stderr)
+            fflush(stderr)
         }
+        if done { break }
+        usleep(1000) // 1ms polling interval
     }
 
-    let frameCount = max(1, Int(Double(cfg.fps) * cfg.durationSeconds))
-    let outSettings: [String: Any] = [
-        AVVideoCodecKey: AVVideoCodecType.h264,
-        AVVideoWidthKey: rw,
-        AVVideoHeightKey: rh,
-        AVVideoCompressionPropertiesKey: [
-            AVVideoAverageBitRateKey: rw * rh * 3,
-            AVVideoExpectedSourceFrameRateKey: cfg.fps,
-            AVVideoMaxKeyFrameIntervalKey: Int(cfg.fps) * 2
-        ] as [String: Any]
-    ]
-    let writer = try AVAssetWriter(outputURL: cfg.outputURL, fileType: .mp4)
-    let input = AVAssetWriterInput(mediaType: .video, outputSettings: outSettings)
-    input.expectsMediaDataInRealTime = false
-    let sourceAttrs: [String: Any] = [
-        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-        kCVPixelBufferWidthKey as String: rw,
-        kCVPixelBufferHeightKey as String: rh
-    ]
-    let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: sourceAttrs)
-    guard writer.canAdd(input) else {
-        sceneBakeOnMain { RendererBridge.shared.destroy() }
-        throw SceneOfflineBakeError.writerFailed("cannot add video input")
-    }
-    writer.add(input)
-    guard writer.startWriting() else {
-        sceneBakeOnMain { RendererBridge.shared.destroy() }
-        throw SceneOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "startWriting failed")
-    }
-    writer.startSession(atSourceTime: .zero)
-
-    for i in 0 ..< frameCount {
-        try autoreleasepool {
-            if !sceneBakeOnMain({ RendererBridge.shared.tickOnce() }) {
-                input.markAsFinished()
-                writer.cancelWriting()
-                sceneBakeOnMain { RendererBridge.shared.destroy() }
-                throw SceneOfflineBakeError.captureFailed
-            }
-            guard let cg = sceneBakeOnMain({ RendererBridge.shared.captureFrame() }) else {
-                input.markAsFinished()
-                writer.cancelWriting()
-                sceneBakeOnMain { RendererBridge.shared.destroy() }
-                throw SceneOfflineBakeError.captureFailed
-            }
-            let pb = try sceneBakePixelBuffer(from: cg)
-            let pts = CMTime(value: Int64(i), timescale: cfg.fps)
-            var wait = 0
-            while !input.isReadyForMoreMediaData, wait < 6000 {
-                usleep(500)
-                wait += 1
-            }
-            guard input.isReadyForMoreMediaData else {
-                input.markAsFinished()
-                writer.cancelWriting()
-                sceneBakeOnMain { RendererBridge.shared.destroy() }
-                throw SceneOfflineBakeError.writerFailed("writer not ready")
-            }
-            if !adaptor.append(pb, withPresentationTime: pts) {
-                input.markAsFinished()
-                writer.cancelWriting()
-                sceneBakeOnMain { RendererBridge.shared.destroy() }
-                throw SceneOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "append failed")
-            }
-        }
+    // ── 从 dylib 获取动态文本 JSON ────────────────────────────
+    // 在 destroy 之前调用，因为需要有效的 renderer handle。
+    let dynamicTextsJSON: String? = sceneBakeOnMain {
+        RendererBridge.shared.getDynamicTextsJson()
     }
 
-    input.markAsFinished()
-    let sem = DispatchSemaphore(value: 0)
-    var finishErr: Error?
-    writer.finishWriting {
-        if writer.status == .failed {
-            finishErr = writer.error
-        }
-        sem.signal()
-    }
-    sem.wait()
     sceneBakeOnMain { RendererBridge.shared.destroy() }
-    if let finishErr {
-        throw SceneOfflineBakeError.writerFailed(finishErr.localizedDescription)
+
+    guard FileManager.default.fileExists(atPath: cfg.outputURL.path) else {
+        throw SceneOfflineBakeError.writerFailed("bake produced no output file")
     }
-    guard writer.status == .completed else {
-        throw SceneOfflineBakeError.writerFailed("writer status \(writer.status.rawValue)")
+
+    // Renderer still produces a black lead-in for some Workshop scenes. Keep the
+    // caller-side trim so exported videos start from visible content.
+    sceneBakeTrimPrefix(url: cfg.outputURL, trimSeconds: 2.0)
+
+    // ── 保存 sidecar JSON ─────────────────────────────────────
+    if let jsonString = dynamicTextsJSON, !jsonString.isEmpty {
+        let sidecarURL = cfg.outputURL.deletingPathExtension().appendingPathExtension("json")
+        do {
+            try jsonString.write(to: sidecarURL, atomically: true, encoding: .utf8)
+            dlog("[bake] ✅ saved dynamic texts sidecar: \(sidecarURL.path)")
+        } catch {
+            dlog("[bake] ⚠️ failed to write sidecar JSON: \(error)")
+        }
+    } else {
+        dlog("[bake] no dynamic texts JSON from renderer (renderer may not support it or scene has no dynamic texts)")
+    }
+}
+
+/// 固定裁掉视频开头若干秒。
+private func sceneBakeTrimPrefix(url: URL, trimSeconds: Double) {
+    let asset = AVAsset(url: url)
+    let duration = asset.duration
+    let totalSec = CMTimeGetSeconds(duration)
+    guard totalSec > trimSeconds + 0.5 else {
+        dlog("[scene-bake-trim] video too short (\(String(format: "%.1f", totalSec))s), skip trim")
+        return
+    }
+
+    let trimStart = CMTimeMakeWithSeconds(trimSeconds, preferredTimescale: 600)
+    let tmpURL = url.deletingLastPathComponent()
+        .appendingPathComponent(url.deletingPathExtension().lastPathComponent + "_trimmed.mp4")
+
+    guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+        dlog("[scene-bake-trim] failed to create export session")
+        return
+    }
+    exporter.outputURL = tmpURL
+    exporter.outputFileType = .mp4
+    exporter.timeRange = CMTimeRange(start: trimStart, end: duration)
+
+    let sem = DispatchSemaphore(value: 0)
+    exporter.exportAsynchronously { sem.signal() }
+    sem.wait()
+
+    guard exporter.status == .completed else {
+        dlog("[scene-bake-trim] export failed: \(exporter.error?.localizedDescription ?? "unknown")")
+        try? FileManager.default.removeItem(at: tmpURL)
+        return
+    }
+
+    try? FileManager.default.removeItem(at: url)
+    do {
+        try FileManager.default.moveItem(at: tmpURL, to: url)
+        dlog("[scene-bake-trim] ✅ trimmed \(String(format: "%.1f", trimSeconds))s black prefix")
+    } catch {
+        dlog("[scene-bake-trim] replace failed: \(error)")
     }
 }
 
@@ -2738,7 +3076,7 @@ private final class SceneOfflineBakeAppDelegate: NSObject, NSApplicationDelegate
             do {
                 let cfg = try sceneBakeParseConfig(args)
                 fputs(
-                    "[bake] \(cfg.sceneRoot) → \(cfg.outputURL.path) \(cfg.width)x\(cfg.height) @\(cfg.fps)fps \(cfg.durationSeconds)s\n",
+                    "[bake] \(cfg.sceneRoot) → \(cfg.outputURL.path) resource-size @\(cfg.fps)fps \(cfg.durationSeconds)s\n",
                     stderr
                 )
                 try sceneBakePerform(cfg)
@@ -2993,7 +3331,7 @@ struct WallpaperEngineCLI {
         if command == "bake" {
             let bakeArgs = Array(remainingArgs.dropFirst())
             guard bakeArgs.count >= 2 else {
-                print("Usage: wallpaperengine-cli bake <scene_dir> <out.mp4> [width height fps seconds] [--no-dynamic-text]")
+                print("Usage: wallpaperengine-cli bake <scene_dir> <out.mp4> [width height fps [seconds]] [--no-dynamic-text]")
                 exit(1)
             }
             sceneOfflineBakeRunStandalone(arguments: bakeArgs)
@@ -3009,19 +3347,30 @@ struct WallpaperEngineCLI {
         }
 
         switch command {
-        case "set", "pause", "resume", "stop", "exit":
-
-            // 总是先清理旧 daemon 并启动新版本，避免旧版本残留导致行为不一致
-            stopDaemonIfRunning()
-            startDaemonProcess()
-            var attempts = 0
-            while !isDaemonRunning() && attempts < 30 {
-                Thread.sleep(forTimeInterval: 0.1)
-                attempts += 1
+        case "set", "pause", "resume", "stop", "exit", "apply-properties":
+            if command == "stop" || command == "exit" {
+                stopDaemonIfRunning()
+                exit(0)
             }
-            guard isDaemonRunning() else {
-                print("Failed to start daemon.")
-                exit(1)
+
+            if command == "set" {
+                // 总是先清理旧 daemon 并启动新版本，避免旧版本残留导致行为不一致
+                stopDaemonIfRunning()
+                startDaemonProcess()
+                var attempts = 0
+                while !isDaemonRunning() && attempts < 30 {
+                    Thread.sleep(forTimeInterval: 0.1)
+                    attempts += 1
+                }
+                guard isDaemonRunning() else {
+                    print("Failed to start daemon.")
+                    exit(1)
+                }
+            } else {
+                guard isDaemonRunning() else {
+                    print("Daemon not responding")
+                    exit(1)
+                }
             }
 
             let msg: IPCMessage
@@ -3039,6 +3388,13 @@ struct WallpaperEngineCLI {
                     path = setArgs.dropLast().joined(separator: " ")
                 }
                 msg = IPCMessage(command: .set, path: path, screen: screen)
+            case "apply-properties":
+                let applyArgs = Array(remainingArgs.dropFirst())
+                guard !applyArgs.isEmpty else {
+                    print("Usage: wallpaperengine-cli apply-properties <json>")
+                    exit(1)
+                }
+                msg = IPCMessage(command: .applyProperties, path: nil, screen: nil, propertiesJSON: applyArgs.joined(separator: " "))
             case "pause":
                 msg = IPCMessage(command: .pause, path: nil, screen: nil)
             case "resume":
@@ -3050,7 +3406,8 @@ struct WallpaperEngineCLI {
                 exit(1)
             }
 
-            if let err = Client.sendAndWaitForOK(msg) {
+            let responseTimeout: TimeInterval = command == "set" ? 35.0 : 5.0
+            if let err = Client.sendAndWaitForOK(msg, timeout: responseTimeout) {
                 if err == "OK" {
                     // success
                 } else if err.hasPrefix("ERROR:") {
@@ -3177,7 +3534,7 @@ struct WallpaperEngineCLI {
           exit                        Alias for stop
           preview <scene_dir> [w h] [--no-dynamic-text]
                                       Open a preview window (SIGTERM exits)
-          bake <dir> <out.mp4> [w h fps sec] [--no-dynamic-text]
+          bake <dir> <out.mp4> [w h fps [sec]] [--no-dynamic-text]
                                       Offline H.264 bake (no daemon)
         """)
     }

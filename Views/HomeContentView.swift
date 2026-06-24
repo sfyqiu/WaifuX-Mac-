@@ -109,6 +109,12 @@ fileprivate enum HeroItem: Identifiable {
     }
 }
 
+/// 轮播显示项：包装 HeroItem 并提供位置唯一的 id，避免无缝循环克隆与原项 id 重复。
+fileprivate struct HeroCarouselSlide: Identifiable {
+    let id: String
+    let item: HeroItem
+}
+
 struct HomeContentView: View {
     @ObservedObject var viewModel: WallpaperViewModel
     @ObservedObject var mediaViewModel: MediaExploreViewModel
@@ -268,6 +274,8 @@ struct HomeContentView: View {
             initialLoadTask = Task {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard !Task.isCancelled else { return }
+                // 媒体模块关闭时，不加载媒体管线与首页媒体数据
+                guard ModuleAvailability.shared.mediaEnabled else { return }
                 await mediaViewModel.initialLoadIfNeeded()
                 guard !Task.isCancelled else { return }
                 await mediaViewModel.refreshHomeItems()
@@ -283,6 +291,8 @@ struct HomeContentView: View {
             ForegroundPrefetchManager.shared.stop(namespace: HomePrefetchNamespace.mediaShelf)
         }
         .onReceive(NotificationCenter.default.publisher(for: .wallpaperDataSourceChanged)) { _ in
+            // 壁纸模块关闭时不响应数据源变更，避免触发 viewModel.refresh() 全量加载
+            guard ModuleAvailability.shared.wallpaperEnabled else { return }
             Task { @MainActor in
                 await viewModel.refresh()
             }
@@ -390,10 +400,10 @@ struct HomeContentView: View {
 
         return ZStack(alignment: .leading) {
             HStack(spacing: 0) {
-                ForEach(Array(displayItems.enumerated()), id: \.offset) { _, item in
+                ForEach(displayItems) { slide in
                     HeroSlide(
-                        item: item,
-                        isCurrent: item.id == currentHeroID && isTabActive,
+                        item: slide.item,
+                        isCurrent: slide.item.id == currentHeroID && isTabActive,
                         width: width,
                         height: height
                     )
@@ -410,29 +420,35 @@ struct HomeContentView: View {
         )
     }
 
+    @ViewBuilder
     private var contentSections: some View {
         VStack(alignment: .leading, spacing: 38) {
-            // 最新静态壁纸
-            HomeShelfSection(
-                title: t("latestWallpaper"),
-                wallpapers: recentWallpapers,
-                atmospherePrimary: atmosphereController.primary,
-                atmosphereSecondary: atmosphereController.secondary,
-                onSelect: { wallpaper in
-                    selectedWallpaper = wallpaper
-                }
-            )
+            // 最新静态壁纸（仅当壁纸模块启用时显示）
+            if ModuleAvailability.shared.wallpaperEnabled {
+                HomeShelfSection(
+                    title: t("latestWallpaper"),
+                    wallpapers: recentWallpapers,
+                    atmospherePrimary: atmosphereController.primary,
+                    atmosphereSecondary: atmosphereController.secondary,
+                    onSelect: { wallpaper in
+                        selectedWallpaper = wallpaper
+                    }
+                )
+            }
 
             // 热门动态壁纸（使用独立的首页数据，不跟随 Explore 列表变化）
-            HomeMediaSection(
-                title: t("hotDynamic"),
-                mediaItems: mediaViewModel.homeItems,
-                atmospherePrimary: atmosphereController.primary,
-                atmosphereSecondary: atmosphereController.secondary,
-                onSelect: { item in
-                    selectedMedia = item
-                }
-            )
+            // 仅当媒体模块启用时显示
+            if ModuleAvailability.shared.mediaEnabled {
+                HomeMediaSection(
+                    title: t("hotDynamic"),
+                    mediaItems: mediaViewModel.homeItems,
+                    atmospherePrimary: atmosphereController.primary,
+                    atmosphereSecondary: atmosphereController.secondary,
+                    onSelect: { item in
+                        selectedMedia = item
+                    }
+                )
+            }
         }
         .padding(.top, 18)
     }
@@ -452,8 +468,11 @@ struct HomeContentView: View {
     }
 
     private var heroItems: [HeroItem] {
-        let wallpapers = viewModel.featuredWallpapers.filter { $0.dimensionX > $0.dimensionY }
-        let mediaItems = heroMediaItems
+        // 关闭对应模块时，该模块不进 Hero 轮播（空数组自然不进合并循环，不出现空块）
+        let wallpapers = ModuleAvailability.shared.wallpaperEnabled
+            ? viewModel.featuredWallpapers.filter { $0.dimensionX > $0.dimensionY }
+            : []
+        let mediaItems = ModuleAvailability.shared.mediaEnabled ? heroMediaItems : []
 
         var result: [HeroItem] = []
         let maxCount = max(wallpapers.count, mediaItems.count)
@@ -468,16 +487,28 @@ struct HomeContentView: View {
         heroItems.map(\.id)
     }
 
-    private func carouselDisplayItems(from items: [HeroItem]) -> [HeroItem] {
+    private func carouselDisplayItems(from items: [HeroItem]) -> [HeroCarouselSlide] {
+        // 无缝循环轮播：在首尾各克隆一帧形成视觉首尾相接。
+        // 注意：克隆与原项的 HeroItem.id 相同，若直接以 \.id 作为 ForEach 的标识会出现
+        // "the ID xxx occurs multiple times" 警告并导致 SwiftUI diff 行为未定义。
+        // 这里用位置前缀（head- / real-{idx}- / tail-）保证 ForEach id 唯一。
         guard
             items.count > 1,
             let firstItem = items.first,
             let lastItem = items.last
         else {
-            return items
+            return items.enumerated().map { idx, item in
+                HeroCarouselSlide(id: "real-\(idx)-\(item.id)", item: item)
+            }
         }
 
-        return [lastItem] + items + [firstItem]
+        var result: [HeroCarouselSlide] = []
+        result.append(HeroCarouselSlide(id: "head-\(lastItem.id)", item: lastItem))
+        for (idx, item) in items.enumerated() {
+            result.append(HeroCarouselSlide(id: "real-\(idx)-\(item.id)", item: item))
+        }
+        result.append(HeroCarouselSlide(id: "tail-\(firstItem.id)", item: firstItem))
+        return result
     }
 
     private var currentHeroItem: HeroItem? {
@@ -538,6 +569,8 @@ struct HomeContentView: View {
             await MainActor.run {
                 heroMediaItems = detailedItems
             }
+        } catch is CancellationError {
+            return
         } catch {
             AppLogger.error(.general, "Failed to fetch hero media items: \(error.localizedDescription)")
         }
