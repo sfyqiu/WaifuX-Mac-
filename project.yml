@@ -37,6 +37,7 @@ settings:
     DEVELOPMENT_TEAM: H6W325NJX2
     ENABLE_HARDENED_RUNTIME: YES
     COMBINE_HIDPI_IMAGES: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
 
 targets:
   WaifuX:
@@ -157,10 +158,7 @@ targets:
           BUNDLED_RESOURCES_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources"
           if [[ -d "$BUNDLED_RESOURCES_DIR" ]]; then
             rm -rf "$BUNDLED_RESOURCES_DIR/assets"
-            rm -f "$BUNDLED_RESOURCES_DIR"/zip_data.s \
-                  "$BUNDLED_RESOURCES_DIR"/zip_data.o \
-                  "$BUNDLED_RESOURCES_DIR"/zip_accessor.c \
-                  "$BUNDLED_RESOURCES_DIR"/zip_accessor.o
+            rm -f "$BUNDLED_RESOURCES_DIR"/zip_data.s                   "$BUNDLED_RESOURCES_DIR"/zip_data.o                   "$BUNDLED_RESOURCES_DIR"/zip_accessor.c                   "$BUNDLED_RESOURCES_DIR"/zip_accessor.o
           fi
 
           sign_file_if_present() {
@@ -175,8 +173,7 @@ targets:
             local entitlements="${SRCROOT}/WallpaperRenderer.entitlements"
             if [[ -f "$f" ]]; then
               if [[ -f "$entitlements" ]]; then
-                codesign --force --options runtime --entitlements "$entitlements" -s - "$f" 2>/dev/null || \
-                  codesign --force -s - "$f" 2>/dev/null || true
+                codesign --force --options runtime --entitlements "$entitlements" -s - "$f" 2>/dev/null ||                   codesign --force -s - "$f" 2>/dev/null || true
               else
                 codesign --force -s - "$f" 2>/dev/null || true
               fi
@@ -185,9 +182,7 @@ targets:
 
           # Xcode folder reference 可能复制为 Contents/Resources/Resources/...；
           # 本地 Run 也要覆盖扁平与嵌套两种布局，避免只有打包脚本签名成功。
-          for DXC_BIN in \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/dxc" \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/dxc"; do
+          for DXC_BIN in             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/dxc"             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/dxc"; do
             if [[ -f "$DXC_BIN" ]]; then
               install_name_tool -add_rpath "@loader_path/lib" "$DXC_BIN" 2>/dev/null || true
               install_name_tool -add_rpath "@loader_path/../lib" "$DXC_BIN" 2>/dev/null || true
@@ -195,22 +190,15 @@ targets:
             fi
           done
 
-          for WGPU_BIN in \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaper-wgpu" \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaper-wgpu"; do
+          for WGPU_BIN in             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaper-wgpu"             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaper-wgpu"; do
             sign_wgpu_if_present "$WGPU_BIN"
           done
 
-          for CLI_BIN in \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaperengine-cli" \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaperengine-cli" \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/wallpaperengine-cli"; do
+          for CLI_BIN in             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaperengine-cli"             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaperengine-cli"             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/wallpaperengine-cli"; do
             sign_file_if_present "$CLI_BIN"
           done
 
-          for DXC_LIB in \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/lib/libdxcompiler.dylib" \
-            "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib/libdxcompiler.dylib"; do
+          for DXC_LIB in             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/lib/libdxcompiler.dylib"             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib/libdxcompiler.dylib"; do
             sign_file_if_present "$DXC_LIB"
           done
     entitlements:
