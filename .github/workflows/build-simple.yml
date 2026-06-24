@@ -9,11 +9,16 @@ jobs:
       - run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer 2>/dev/null || echo "default"
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
-      - run: sed -i "" "s/SWIFT_STRICT_CONCURRENCY = complete/SWIFT_STRICT_CONCURRENCY = minimal/" WaifuX.xcodeproj/project.pbxproj 2>/dev/null || true
-      - run: xcodebuild -scheme WaifuX -configuration Release -derivedDataPath build CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO OTHER_SWIFT_FLAGS="-Xfrontend -disable-actor-data-race-checks" ONLY_ACTIVE_ARCH=NO build 2>&1
+      - run: |
+          xcodebuild -target WaifuX -configuration Release -derivedDataPath build \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO build 2>&1
       - run: |
           APP="build/Build/Products/Release/WaifuX.app"
           if [ -d "$APP" ]; then
             hdiutil create -volname "WaifuX" -srcfolder "$(dirname "$APP")" -ov -format UDZO build/WaifuX.dmg
             gh release create v1.0 build/WaifuX.dmg --repo ${{ github.repository }} --title "WaifuX v1.0" --notes "首次编译，开启成人分类"
+          else
+            echo "App not built!"
+            find build -name "*.app" 2>/dev/null
           fi
