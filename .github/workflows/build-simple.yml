@@ -1,7 +1,5 @@
 name: Build WaifuX
 on: workflow_dispatch
-env:
-  SWIFT_STRICT_CONCURRENCY: minimal
 jobs:
   build:
     runs-on: macos-14
@@ -11,5 +9,6 @@ jobs:
       - run: xcodebuild -version
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
-      - run: chmod +x ./scripts/package.sh && ./scripts/package.sh 2>&1
+      - run: mkdir -p build
+      - run: xcodebuild -scheme WaifuX -configuration Release clean archive SWIFT_STRICT_CONCURRENCY=minimal CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO DEBUG_INFORMATION_FORMAT=dwarf MACOSX_DEPLOYMENT_TARGET=14.4 -archivePath build/WaifuX.xcarchive 2>&1 || true
       - run: gh release create v1.0 build/WaifuX.dmg --repo sfyqiu/WaifuX-Mac- --title "WaifuX v1.0" --notes "首次编译，开启成人分类" 2>&1 || true
