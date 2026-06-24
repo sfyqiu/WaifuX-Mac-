@@ -4,11 +4,13 @@ jobs:
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceaa73d27597364c9af683
+        with:
+          fetch-depth: 0
       - run: brew install xcodegen create-dmg || true
       - run: xcodegen generate
       - run: chmod +x ./scripts/package.sh && ./scripts/package.sh 2>&1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@65c4c4a1d7b6e3c9b9c6c8a2b5c3d4e5f6a7b8c9
         with:
           name: WaifuX-build
           path: build/WaifuX.dmg
