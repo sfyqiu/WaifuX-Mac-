@@ -230,7 +230,7 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
 
     // MARK: - Lifecycle
 
-    func acquire(withId id: Any?, request: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+    nonisolated(unsafe) func acquire(withId id: Any?, request: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
         extLog("=== ACQUIRE ===")
 
         let wallpaperIDString = Self.extractWallpaperContextIdentifier(from: id)
@@ -836,7 +836,7 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
         extLog("[Commands] ✅ 已热切换显示器 \(displayID) 到静态图: \(sourceID) (\(allContexts.count) 个 context)")
     }
 
-    func update(withId id: Any?, request: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func update(withId id: Any?, request: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         let wallpaperIDString = Self.extractWallpaperContextIdentifier(from: id)
         let geometry = Self.requestDisplayGeometry(from: request)
         Self.applyDisplayGeometryUpdate(
@@ -913,7 +913,7 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
         reply(nil)
     }
 
-    func invalidate(withId id: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func invalidate(withId id: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         let identifier = Self.extractWallpaperContextIdentifier(from: id)
         var cleanedCount = 0
         if let identifier {
@@ -933,7 +933,7 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
         reply(nil)
     }
 
-    func snapshot(withId _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+    nonisolated(unsafe) func snapshot(withId _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
         extLog("=== SNAPSHOT ===")
         var currentTime: CMTime?
         WallpaperState.shared.forEachRenderer { renderer in
@@ -1024,19 +1024,19 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
 
     // MARK: - Stubs
 
-    func provideSettingsViewModels(withContentTypes _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+    nonisolated(unsafe) func provideSettingsViewModels(withContentTypes _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
         Task {
             let result = await buildSettingsViewModelsXPC()
             reply(result ?? makeEmptyGroupsResponse(), nil)
         }
     }
 
-    func addChoiceRequest(withChoiceRequest request: Any?, onBehalfOfProcess _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+    nonisolated(unsafe) func addChoiceRequest(withChoiceRequest request: Any?, onBehalfOfProcess _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
         extLog("=== ADD CHOICE REQUEST ===")
         reply(nil, nil)
     }
 
-    func removeChoiceRequest(withChoiceRequest request: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func removeChoiceRequest(withChoiceRequest request: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         extLog("=== REMOVE CHOICE REQUEST ===")
 
         // 显示器实例不支持从扩展侧移除；这里只做日志并返回成功。
@@ -1055,7 +1055,7 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
         reply(nil)
     }
 
-    func selectedChoicesDidChange(for id: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func selectedChoicesDidChange(for id: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         extLog("=== SELECTED CHOICES DID CHANGE ===")
 
         // 从 WallpaperChoiceID 中提取 choice identifier
@@ -1086,13 +1086,13 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
         reply(nil)
     }
 
-    func invokeContextMenuAction(withMenuItemID menuItemID: Any?, groupItemID _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func invokeContextMenuAction(withMenuItemID menuItemID: Any?, groupItemID _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         let identifier = (menuItemID as? String) ?? String(describing: menuItemID ?? "nil")
         extLog("=== CONTEXT MENU ACTION === identifier: \(identifier)")
         reply(nil)
     }
 
-    func isChoiceDownloaded(with _: Any?, reply: @escaping @Sendable (Bool, (any Error)?) -> Void) {
+    nonisolated(unsafe) func isChoiceDownloaded(with _: Any?, reply: @escaping @Sendable (Bool, (any Error)?) -> Void) {
         extLog("isChoiceDownloaded")
         reply(true, nil)
     }
@@ -1103,36 +1103,36 @@ final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensi
         return nil
     }
 
-    func pauseDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
-    func cancelDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
-    func resumeDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
-    func removeDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
-    func migrateSelectedChoice(for _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+    nonisolated(unsafe) func pauseDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
+    nonisolated(unsafe) func cancelDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
+    nonisolated(unsafe) func resumeDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
+    nonisolated(unsafe) func removeDownload(for _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) { reply(nil) }
+    nonisolated(unsafe) func migrateSelectedChoice(for _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
         extLog("migrateSelectedChoice")
         reply(nil, nil)
     }
 
-    func migrate(from _: Any?, to _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func migrate(from _: Any?, to _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         extLog("migrate")
         reply(nil)
     }
 
-    func skipShuffledContent(withId _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func skipShuffledContent(withId _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         extLog("skipShuffledContent")
         reply(nil)
     }
 
-    func canSkipShuffledContent(withId _: Any?, reply: @escaping @Sendable (Bool, (any Error)?) -> Void) {
+    nonisolated(unsafe) func canSkipShuffledContent(withId _: Any?, reply: @escaping @Sendable (Bool, (any Error)?) -> Void) {
         extLog("canSkipShuffledContent")
         reply(false, nil)
     }
 
-    func handleDebugRequest(for _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+    nonisolated(unsafe) func handleDebugRequest(for _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
         extLog("handleDebugRequest")
         reply(nil, nil)
     }
 
-    func handleNotification(withNamed _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+    nonisolated(unsafe) func handleNotification(withNamed _: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
         reply(nil)
     }
     private func createRemoteContextXPC(contextId: UInt32) -> AnyObject? {
