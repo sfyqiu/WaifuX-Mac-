@@ -1,3 +1,4 @@
+@preconcurrency import ObjectiveC
 //  XPC handler implementing WallpaperExtensionXPCProtocol
 
 @preconcurrency import AppKit
@@ -10,7 +11,7 @@ import QuartzCore
 extension CALayer: @unchecked @retroactive Sendable {}
 extension CAContext: @unchecked @retroactive Sendable {}
 
-final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
+final class WallpaperXPCHandler: NSObject, @unchecked Sendable, WallpaperExtensionXPCProtocol {
     var agentProxy: (any WallpaperExtensionProxyXPCProtocol)?
     private var previousPresentationMode = "default"
     /// 上次收到 presentationMode == "locked" 的时间。用于防止 screenIsUnlocked
